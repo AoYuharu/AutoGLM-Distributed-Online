@@ -1,0 +1,136 @@
+@startuml WebSocket Message Flow
+
+skinparam backgroundColor #FEFEFE
+skinparam activityShape rect
+skinparam noteBackgroundColor #FFFFCC
+
+title WebSocket & HTTP Message Processing Flow
+
+|===**Client Side**===
+
+|#EEEBDC| **Client (Python)** |
+start
+:Connect to ws://host/ws?device_id=xxx;
+:WebSocket connected;
+
+|#EEEBDC| **Server Side (FastAPI)** |
+:ws_endpoint receives connection;
+if (device_id missing?) then (Yes)
+    :Close with code 4000;
+    stop
+else (No)
+    :ws_hub.connect(websocket);
+    :ws_hub.register_device(connection_id, device_id);
+    :device_status_manager.set_idle(device_id);
+    :Send {"type": "connected", "accepted": True};
+endif
+
+|#EEEBDC| **Client (Python)** |
+:Receive connected message;
+note right: Ready to send/receive messages
+
+|===**Heartbeat Flow**===
+
+|#EEEBDC| **Client** |
+:Send heartbeat;
+note right: {"type": "heartbeat", "msg_id": "xxx"}
+
+|#EEEBDC| **Server** |
+:receive_text() → handle_ws_message();
+if (msg_type == "heartbeat") then (Yes)
+    :ws_hub.update_heartbeat(connection_id);
+    :device_status_manager.set_idle(device_id);
+    :Send heartbeat_ack;
+else (No)
+    :Ignore/Log unknown type;
+endif
+
+|===**Action Command Flow (Server → Client)**===
+
+|#EEEBDC| **Server - Scheduler** |
+:scheduler.run_one_cycle(device_id);
+:task.execute_reason();
+note right: Calls AI model, gets action
+
+|#EEEBDC| **Server - ActionRouter** |
+:action_router.send_action() → PendingAction;
+:ws_hub.send_to_device(device_id, action_cmd);
+note right: {"type": "action_cmd", "msg_id": "xxx", **}
+
+|#EEEBDC| **Server - WebSocketHub** |
+:Look up connection_id by device_id;
+:websocket.send_json(message);
+note right: Connection found?
+
+|#EEEBDC| **Client** |
+:Receive action_cmd via WebSocket;
+:Execute action on device;
+:Send ack via WebSocket;
+note right: {"type": "ack", "ref_msg_id": "xxx", "accepted": true}
+
+|#EEEBDC| **Server - ActionRouter** |
+:action_router.handle_ack(msg);
+note right: Update PendingAction status → ACKNOWLEDGED
+
+|===**Observe Result Flow (Client → Server)**===
+
+|#EEEBDC| **Client** |
+:Execute action on device;
+:Capture screenshot;
+:Send observe_result via HTTP POST;
+note right: POST /api/v1/tasks/observe
+note right: {"type": "observe_result", "payload": {...}}
+
+|#EEEBDC| **Server - Tasks API** |
+:receive_observe_result(message);
+note right: Endpoint: POST /observe
+
+|#EEEBDC| **Server - ActionRouter** |
+:action_router.handle_observe_result(payload);
+note right: Find PendingAction by task_id + step_number
+:Update PendingAction.result;
+note right: Set future result, notify waiter
+
+|#EEEBDC| **Server - Scheduler** |
+:wait_for_result() returns;
+:Continue ReAct loop;
+note right: Proceed to next step
+
+|===**Disconnect Flow**===
+
+|#EEEBDC| **Client** |
+:WebSocket disconnected;
+
+|#EEEBDC| **Server** |
+:WebSocketDisconnect exception;
+:device_status_manager.set_offline(device_id);
+:ws_hub.disconnect(connection_id);
+stop
+
+|===**Key Data Structures**===
+
+|#EEEBDC| **PendingAction** |
+note top
+- action_id: str
+- sent_msg_id: str
+- task_id: str
+- device_id: str
+- status: PENDING → ACKNOWLEDGED → COMPLETED
+- result: dict
+end note
+
+|#EEEBDC| **ActionRouter** |
+note top
+- _pending_actions: Dict[action_id, PendingAction]
+- _pending_actions_by_msg_id: Dict[sent_msg_id, PendingAction]
+- _action_futures: Dict[action_id, asyncio.Future]
+end note
+
+|#EEEBDC| **WebSocketHub** |
+note top
+- connections: Dict[connection_id, WebSocket]
+- connection_states: Dict[connection_id, ConnectionState]
+- _device_connections: Dict[device_id, connection_id]
+end note
+
+@enduml

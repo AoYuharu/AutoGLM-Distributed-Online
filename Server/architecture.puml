@@ -1,0 +1,136 @@
+@startuml Open-AutoGLM Server Architecture
+
+skinparam backgroundColor #FEFEFE
+skinparam componentStyle uml2
+
+title Open-AutoGLM Distributed Server Architecture
+
+package "API Layer (FastAPI Routers)" {
+    [devices.py] as devices
+    [tasks.py] as tasks
+    [ws.py] as ws_endpoint
+    [logs.py] as logs
+    [clients.py] as clients
+    [agent.py] as agent
+    [chat.py] as chat
+    [context.py] as context
+}
+
+package "Services Layer" {
+    [WebSocketHub] as ws_hub
+    [ActionRouter] as action_router
+    [ReActScheduler] as scheduler
+    [TaskRegistry] as task_registry
+    [DeviceStatusManager] as device_status_mgr
+    [DeviceContext] as device_ctx
+    [Agent Service] as agent_svc
+    [Callbacks] as callbacks
+}
+
+package "Models Layer (SQLAlchemy)" {
+    [Client] as client_model
+    [Device] as device_model
+    [PendingDevice] as pending_device_model
+    [Task] as task_model
+    [TaskStep] as taskstep_model
+    [Screenshot] as screenshot_model
+    [LogEntry] as logentry_model
+    [ChatMessage] as chatmsg_model
+}
+
+package "Schemas Layer (Pydantic)" {
+    [DeviceResponse] as dev_resp
+    [TaskResponse] as task_resp
+    [HealthResponse] as health_resp
+    [DeviceStatusMessage] as dev_status_msg
+    [ObserveResultMessage] as observe_msg
+}
+
+package "Core" {
+    [FastAPI App] as app
+    [Config] as config
+    [Database] as db
+    [Logging Config] as log_config
+}
+
+' Relationships
+app --> devices : includes
+app --> tasks : includes
+app --> ws_endpoint : includes
+app --> logs : includes
+app --> clients : includes
+app --> agent : includes
+app --> chat : includes
+app --> context : includes
+
+ws_hub --> ws_endpoint : used by
+action_router --> ws_hub : sends via
+scheduler --> action_router : uses
+task_registry --> ws_hub : uses
+
+devices --> client_model : queries
+devices --> device_model : queries
+tasks --> task_model : queries
+tasks --> device_model : queries
+
+devices --> dev_resp : returns
+tasks --> task_resp : returns
+
+dev_resp --> device_model : serializes
+task_resp --> task_model : serializes
+dev_status_msg --> device_model : from
+observe_msg --> task_model : from
+
+app --> config : uses
+app --> db : uses
+app --> log_config : uses
+
+' Service interactions
+action_router ..> action_router : singleton
+ws_hub ..> ws_hub : singleton
+scheduler ..> scheduler : singleton
+
+' Database relationships
+client_model --> device_model : "1:N"
+device_model --> task_model : "1:N"
+task_model --> taskstep_model : "1:N"
+task_model --> screenshot_model : "1:N"
+device_model --> logentry_model : "1:N"
+device_model --> chatmsg_model : "1:N"
+
+note top of ws_hub
+  Manages WebSocket connections
+  - connect/disconnect
+  - send_to_device
+  - register_device
+end note
+
+note top of action_router
+  Routes actions to clients
+  - send_action
+  - wait_for_result
+  - handle_ack
+  - handle_observe_result
+end note
+
+note top of scheduler
+  ThreadPoolExecutor-based
+  ReAct loop scheduler
+  - submit_task
+  - run_one_cycle
+  - DeviceTask per device
+end note
+
+note top of device_model
+  Fields: device_id, platform, model,
+  os_version, screen_size, status,
+  capabilities, current_task_id
+end note
+
+note top of task_model
+  Fields: task_id, instruction,
+  status, mode, max_steps,
+  current_step, result
+end note
+
+@enduml

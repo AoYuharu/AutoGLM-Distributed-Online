@@ -1,0 +1,22 @@
+# Open-AutoGLM Distributed Server Storage Configuration
+
+storage:
+  # Screenshots directory
+  screenshots_path: "./data/screenshots"
+
+  # Chat history directory
+  chat_history_path: "./data/chat_history"
+
+  # Logs directory
+  logs_path: "./data/logs"
+
+# Retention settings
+retention:
+  # Maximum number of chat rounds to keep per device
+  max_chat_rounds: 10
+
+  # Maximum number of screenshots to keep per device
+  max_screenshots: 10
+
+  # Maximum number of log entries to keep per device
+  max_log_entries: 1000
