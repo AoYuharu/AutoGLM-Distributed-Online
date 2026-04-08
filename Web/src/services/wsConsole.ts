@@ -60,9 +60,13 @@ export interface WsConsoleMessage {
 
 // Message types from Web -> Server
 export interface WsConsoleSendMessage {
-  type: 'subscribe' | 'unsubscribe' | 'sync' | 'confirm_phase';
+  type: 'subscribe' | 'unsubscribe' | 'sync' | 'confirm_phase' | 'create_task' | 'interrupt_task';
   device_id?: string;
   approved?: boolean;
+  instruction?: string;
+  mode?: string;
+  max_steps?: number;
+  task_id?: string;
 }
 
 type MessageCallback = (message: WsConsoleMessage) => void;
@@ -355,6 +359,42 @@ class WsConsoleService {
       wsConsoleLogger.debug('[sendConfirmPhase] Phase confirmation sent', { deviceId, approved, consoleId: this.consoleId });
     } else {
       wsConsoleLogger.warn('[sendConfirmPhase] Cannot send confirm phase, not connected');
+    }
+  }
+
+  /**
+   * Send create_task message to server
+   */
+  sendCreateTask(deviceId: string, instruction: string, mode: string = 'normal', maxSteps: number = 100): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      const message: WsConsoleSendMessage = {
+        type: 'create_task',
+        device_id: deviceId,
+        instruction,
+        mode,
+        max_steps: maxSteps,
+      };
+      this.ws.send(JSON.stringify(message));
+      wsConsoleLogger.debug('[sendCreateTask] Create task sent', { deviceId, instruction: instruction.substring(0, 50), consoleId: this.consoleId });
+    } else {
+      wsConsoleLogger.warn('[sendCreateTask] Cannot send create task, not connected');
+    }
+  }
+
+  /**
+   * Send interrupt_task message to server
+   */
+  sendInterruptTask(deviceId: string, taskId: string): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      const message: WsConsoleSendMessage = {
+        type: 'interrupt_task',
+        device_id: deviceId,
+        task_id: taskId,
+      };
+      this.ws.send(JSON.stringify(message));
+      wsConsoleLogger.debug('[sendInterruptTask] Interrupt task sent', { deviceId, taskId, consoleId: this.consoleId });
+    } else {
+      wsConsoleLogger.warn('[sendInterruptTask] Cannot send interrupt task, not connected');
     }
   }
 

@@ -207,6 +207,7 @@ async def test_scheduler_reason_failed_marks_task_failed_without_execute_act(mon
     task.initialize()
     scheduler_instance._device_tasks["device-1"] = task
 
+
     update_calls = []
     idle_calls = []
     removed = []

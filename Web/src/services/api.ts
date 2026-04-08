@@ -71,7 +71,8 @@ export const deviceApi = {
   },
 
   /** Register device */
-  register: async (deviceId: string, data: {
+  // NOTE: No such endpoint on server — client registration happens via WebSocket /status.
+  register: async (_deviceId: string, _data: {
     platform: string;
     model?: string;
     os_version?: string;
@@ -79,21 +80,21 @@ export const deviceApi = {
     screen_height?: number;
     capabilities?: Record<string, any>;
   }) => {
-    const response = await api.post(`/api/v1/devices/${deviceId}/register`, {
-      device_id: deviceId,
-      ...data,
-    });
-    return response.data;
+    console.warn('[deviceApi.register] Endpoint not implemented on server');
+    throw new Error('deviceApi.register is not implemented');
   },
 
   /** Device heartbeat */
-  heartbeat: async (deviceId: string) => {
-    const response = await api.post(`/api/v1/devices/${deviceId}/heartbeat`);
-    return response.data;
+  // NOTE: No such endpoint on server — heartbeats go through WebSocket.
+  heartbeat: async (_deviceId: string) => {
+    console.warn('[deviceApi.heartbeat] Endpoint not implemented on server');
+    throw new Error('deviceApi.heartbeat is not implemented');
   },
 
   /** Update device status */
-  updateStatus: async (deviceId: string, data: {
+  // NOTE: Server uses POST /api/v1/devices/status (device_id in body), not /devices/{id}/status.
+  // This endpoint is not called from UI; stubbed to prevent accidental use.
+  updateStatus: async (_deviceId: string, _data: {
     status: string;
     device_info?: {
       model?: string;
@@ -103,8 +104,8 @@ export const deviceApi = {
     };
     current_task_id?: string;
   }) => {
-    const response = await api.post(`/api/v1/devices/${deviceId}/status`, data);
-    return response.data;
+    console.warn('[deviceApi.updateStatus] Endpoint not implemented on server (device_id in body, not path)');
+    throw new Error('deviceApi.updateStatus is not implemented — use WebSocket for status updates');
   },
 
   /** Update device remark */

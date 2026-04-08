@@ -19,6 +19,7 @@ from src.schemas.schemas import (
     DeviceStatusMessage,
     DeviceResponse,
     DeviceListResponse,
+    DeviceRemarkUpdate,
 )
 from src.logging_config import get_api_logger, get_network_logger
 from src.services.device_status_manager import device_status_manager, DeviceStatus
@@ -339,3 +340,32 @@ async def delete_device(
     api_logger.info(f"[delete_device] Device deleted: {device_id}")
 
     return ApiResponse(success=True, message=f"Device {device_id} deleted")
+
+
+# === HTTP-based Device Remark Update Endpoint ===
+
+@router.patch("/{device_id}/remark", response_model=ApiResponse)
+async def update_device_remark(
+    device_id: str,
+    payload: DeviceRemarkUpdate,
+    db: Session = Depends(get_db),
+):
+    """
+    Update device remark (name/alias).
+
+    Web UI uses this to let users set a friendly name for a device.
+    """
+    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
+    if not device:
+        return ApiResponse(success=False, message=f"Device {device_id} not found")
+
+    device.remark = payload.remark
+    db.commit()
+
+    api_logger.info(f"[update_remark] Device {device_id} remark updated to: {payload.remark}")
+
+    return ApiResponse(
+        success=True,
+        message=f"Device {device_id} remark updated",
+        data={"device_id": device_id, "remark": payload.remark},
+    )

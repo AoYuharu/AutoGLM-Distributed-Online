@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { wsConsoleApi } from './wsConsole';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
 const ACTIVE_TASK_STATUSES = new Set(['pending', 'running']);
@@ -225,50 +226,25 @@ async function getDeviceById(deviceId: string): Promise<BackendDeviceResponse | 
   return devices.find((device) => device.device_id === deviceId) || null;
 }
 
-async function getLatestTaskForDevice(deviceId: string): Promise<TaskResponse | null> {
-  const response = await api.get('/api/v1/tasks', {
-    params: {
-      device_id: deviceId,
-      limit: 1,
-      offset: 0,
-    },
-  });
-
-  const tasks = (response.data?.tasks || []) as TaskResponse[];
-  return tasks[0] || null;
+// NOTE: GET /api/v1/tasks does not exist on server.
+// Task info comes from GET /api/v1/devices/{deviceId}/session via getLatestDeviceSnapshot.
+async function getLatestTaskForDevice(_deviceId: string): Promise<TaskResponse | null> {
+  return null;
 }
 
-async function getTaskDetail(taskId: string): Promise<TaskDetailResponse | null> {
-  if (!taskId) {
-    return null;
-  }
-
-  try {
-    const response = await api.get(`/api/v1/tasks/${taskId}`);
-    return response.data as TaskDetailResponse;
-  } catch (error: any) {
-    if (error?.response?.status === 404) {
-      return null;
-    }
-    throw error;
-  }
+// NOTE: GET /api/v1/tasks/{taskId} does not exist on server.
+// Task step details are embedded in DeviceTaskSessionResponse.chat_history.
+async function getTaskDetail(_taskId: string): Promise<TaskDetailResponse | null> {
+  return null;
 }
 
+// NOTE: Both getTaskDetail and getLatestTaskForDevice now return null
+// because the server has no REST endpoints for task list/detail.
+// resolveTaskDetail is kept for compatibility but always returns null.
 async function resolveTaskDetail(
-  preferredTaskId: string | null,
-  fallbackTaskId: string | null,
+  _preferredTaskId: string | null,
+  _fallbackTaskId: string | null,
 ): Promise<TaskDetailResponse | null> {
-  if (preferredTaskId) {
-    const preferredTask = await getTaskDetail(preferredTaskId);
-    if (preferredTask) {
-      return preferredTask;
-    }
-  }
-
-  if (fallbackTaskId && fallbackTaskId !== preferredTaskId) {
-    return getTaskDetail(fallbackTaskId);
-  }
-
   return null;
 }
 
@@ -362,16 +338,15 @@ export const agentApi = {
     max_steps?: number;
     max_parse_retries?: number;
   }): Promise<{ task_id: string; status: string }> {
-    const response = await api.post('/api/v1/tasks', {
-      device_id: deviceId,
-      instruction: params.instruction,
-      mode: params.mode || 'normal',
-      max_steps: params.max_steps || 100,
-    });
+    // Send task creation via WebSocket - server will respond with task_created message
+    wsConsoleApi.sendCreateTask(deviceId, params.instruction, params.mode || 'normal', params.max_steps || 100);
 
+    // The actual task_id will come back via WebSocket task_created message
+    // For now, return a placeholder that will be updated when the message arrives
+    // The agentStore handles the task_created message to update currentTaskId
     return {
-      task_id: response.data.task_id,
-      status: response.data.status,
+      task_id: '',  // Will be updated via WebSocket
+      status: 'pending',
     };
   },
 
@@ -381,32 +356,6 @@ export const agentApi = {
 
   async executeStepStream(_deviceId: string): Promise<ReadableStream> {
     throw new Error('Streaming API not available - task execution is driven by WebSocket');
-  },
-
-  async confirmAction(_deviceId: string, _params: {
-    step_number: number;
-    decision: 'confirm' | 'reject' | 'skip';
-  }): Promise<void> {
-    console.warn('confirmAction is not supported by the current backend');
-  },
-
-  async interrupt(taskId: string): Promise<void> {
-    if (!taskId) {
-      throw new Error('taskId is required for interrupt');
-    }
-    await api.post(`/api/v1/tasks/${taskId}/interrupt`);
-  },
-
-  async resume(_deviceId: string): Promise<void> {
-    throw new Error('Resume is not supported by the current backend');
-  },
-
-  async continueTask(_deviceId: string, _additionalSteps: number = 50): Promise<{ max_steps: number }> {
-    throw new Error('Continue is not supported by the current backend');
-  },
-
-  async getHistory(deviceId: string): Promise<AgentSessionResponse> {
-    return this.getSession(deviceId);
   },
 
   async getAllSessions(): Promise<Record<string, AgentSessionResponse>> {
@@ -421,39 +370,45 @@ export const agentApi = {
 
   async getLatestDeviceSnapshot(deviceId: string): Promise<DeviceSessionSnapshot> {
     try {
-      const response = await api.get(`/api/v1/tasks/devices/${deviceId}/session`);
+      // Use correct endpoint: /api/v1/devices/{deviceId}/session
+      const response = await api.get(`/api/v1/devices/${deviceId}/session`);
       const session = response.data;
-      const task = session.task_id ? await getTaskDetail(session.task_id) : null;
 
       return {
         device_id: deviceId,
         task_id: session.task_id || null,
         instruction: session.instruction || null,
-        mode: normalizeMode(task?.mode),
+        mode: normalizeMode(),
         status: session.status || 'idle',
         current_step: session.current_step || 0,
         max_steps: session.max_steps || 100,
         current_screenshot: session.latest_screenshot || null,
-        current_app: typeof task?.result?.current_app === 'string' ? task.result.current_app : '未知',
+        current_app: '未知',
         has_active_task: Boolean(session.interruptible && session.task_id),
         can_interrupt: Boolean(session.interruptible && session.task_id),
         can_resume: false,
-        latest_task: task,
+        latest_task: null, // Server session endpoint does not provide full task steps
       };
     } catch (error: any) {
-      if (error?.response?.status !== 404) {
-        throw error;
+      if (error?.response?.status === 404) {
+        // Device not found — return empty snapshot
+        return {
+          device_id: deviceId,
+          task_id: null,
+          instruction: null,
+          mode: 'normal',
+          status: 'offline',
+          current_step: 0,
+          max_steps: 100,
+          current_screenshot: null,
+          current_app: '未知',
+          has_active_task: false,
+          can_interrupt: false,
+          can_resume: false,
+          latest_task: null,
+        };
       }
-
-      const [device, latestTask] = await Promise.all([
-        getDeviceById(deviceId),
-        getLatestTaskForDevice(deviceId),
-      ]);
-
-      const preferredTaskId = device?.current_task_id || latestTask?.task_id || null;
-      const task = await resolveTaskDetail(preferredTaskId, latestTask?.task_id || null);
-
-      return buildSnapshotFromTask(deviceId, task, preferredTaskId);
+      throw error;
     }
   },
 
@@ -465,32 +420,18 @@ export const agentApi = {
   }): Promise<BatchAgentTaskResponse> {
     const mode = params.mode_policy === 'force_cautious' ? 'cautious' : 'normal';
 
-    const results = await Promise.all(
-      params.device_ids.map(async (device_id) => {
-        try {
-          const response = await api.post('/api/v1/tasks', {
-            device_id,
-            instruction: params.instruction,
-            mode,
-            max_steps: params.max_steps || 100,
-          });
+    // Send task creation via WebSocket for each device
+    params.device_ids.forEach((device_id) => {
+      wsConsoleApi.sendCreateTask(device_id, params.instruction, mode, params.max_steps || 100);
+    });
 
-          return {
-            device_id,
-            status: 'started' as const,
-            task_id: response.data.task_id,
-            mode,
-          };
-        } catch (error: any) {
-          return {
-            device_id,
-            status: 'error' as const,
-            message: error?.response?.data?.detail || error?.message || 'Failed to start task',
-            mode,
-          };
-        }
-      }),
-    );
+    // Return pending status - actual results come via WebSocket messages
+    const results = params.device_ids.map((device_id) => ({
+      device_id,
+      status: 'started' as const,
+      task_id: '',  // Will be updated via WebSocket
+      mode,
+    }));
 
     return { results };
   },
@@ -501,10 +442,9 @@ export const agentApi = {
     total: number;
   }> {
     try {
-      const response = await api.get(`/api/v1/tasks/devices/${deviceId}/chat`, {
+      const response = await api.get(`/api/v1/devices/${deviceId}/chat`, {
         params: {
           limit,
-          task_id: taskId,
         },
       });
 
@@ -540,21 +480,20 @@ export const agentApi = {
     action_params?: Record<string, any>;
     screenshot_path?: string;
   }): Promise<{ id: string; created_at: string }> {
-    const response = await api.post(`/api/v1/tasks/devices/${deviceId}/chat`, message);
+    const response = await api.post(`/api/v1/devices/${deviceId}/chat`, message);
     return response.data?.data || { id: `msg_${Date.now()}`, created_at: new Date().toISOString() };
   },
 
   async clearChatHistory(deviceId: string): Promise<{ success: boolean }> {
-    await api.delete(`/api/v1/tasks/devices/${deviceId}/chat`);
+    await api.delete(`/api/v1/devices/${deviceId}/chat`);
     return { success: true };
   },
 
   async uploadScreenshot(_deviceId: string, _screenshot: string): Promise<{
     success: boolean;
-    path: string;
-    filename: string;
+    message: string;
   }> {
-    return { success: true, path: '', filename: '' };
+    return { success: false, message: '截图通过 WebSocket 实时推送，暂不支持手动上传' };
   },
 };
 

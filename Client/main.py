@@ -318,19 +318,30 @@ class DistributedClient:
                 self._executed_versions = set(list(self._executed_versions)[-500:])
                 logger.debug(f"Cleaned up _executed_versions, new size={len(self._executed_versions)}")
 
-            logger.info(f"Executing action: task_id={task_id}, device_id={device_id}, step={step_number}, version={round_version}")
+            logger.info(f"[DEBUG] Step 1/4 - Starting action execution: task_id={task_id}, device_id={device_id}, step={step_number}, version={round_version}, action={action}")
 
             # 执行 action
             adapter = self.device_adapters[device_id]
-            try:
-                result = adapter.execute_action(action)
-                logger.info(
-                    f"Action execution finished: task_id={task_id}, device_id={device_id}, "
-                    f"step={step_number}, version={round_version}, result={str(result)[:200]}"
-                )
-                screenshot = adapter.get_screenshot()
 
-                # 发送 observe_result
+            try:
+                logger.info(f"[DEBUG] Step 2/4 - adapter.execute_action() starting...")
+                result = adapter.execute_action(action)
+                logger.info(f"[DEBUG] Step 2/4 - adapter.execute_action() DONE: result.success={result.success}, result.message={result.message}")
+            except Exception as e:
+                logger.error(f"[DEBUG] Step 2/4 - adapter.execute_action() EXCEPTION: {e}")
+                raise
+
+            try:
+                logger.info(f"[DEBUG] Step 3/4 - adapter.get_screenshot() starting...")
+                screenshot = adapter.get_screenshot()
+                logger.info(f"[DEBUG] Step 3/4 - adapter.get_screenshot() DONE: has_screenshot={screenshot is not None}, size={len(screenshot) if screenshot else 0}")
+            except Exception as e:
+                logger.error(f"[DEBUG] Step 3/4 - adapter.get_screenshot() EXCEPTION: {e}")
+                raise
+
+            # 发送 observe_result
+            try:
+                logger.info(f"[DEBUG] Step 4/4 - Calling send_observe_result()...")
                 await self.send_observe_result(
                     task_id=task_id,
                     device_id=device_id,
@@ -341,16 +352,15 @@ class DistributedClient:
                     error=None if result.success else result.message,
                     version=round_version,
                 )
+                logger.info(f"[DEBUG] Step 4/4 - send_observe_result() DONE")
             except Exception as e:
-                logger.error(f"Action execution failed: {e}")
-                await self.send_observe_result(
-                    task_id=task_id,
-                    device_id=device_id,
-                    step_number=step_number,
-                    success=False,
-                    error=str(e),
-                    version=round_version,
-                )
+                logger.error(f"[DEBUG] Step 4/4 - send_observe_result() EXCEPTION: {e}")
+                raise
+
+            logger.info(
+                f"Action execution finished: task_id={task_id}, device_id={device_id}, "
+                f"step={step_number}, version={round_version}, result={str(result)[:200]}"
+            )
 
         except Exception as e:
             logger.error(f"Failed to handle action_cmd: {e}")

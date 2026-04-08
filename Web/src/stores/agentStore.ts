@@ -401,6 +401,27 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           state._handleSessionReleased(message);
         }
         break;
+
+      case 'task_created':
+        if (message.device_id === deviceId) {
+          agentStoreLogger.info('[handleTaskCreated] Task created via WebSocket', {
+            taskId: message.task_id,
+            deviceId: message.device_id,
+          });
+          set({
+            currentTaskId: message.task_id,
+            isRunning: true,
+            status: 'running',
+            currentStepNum: 0,
+            history: [],
+            currentStep: null,
+            currentScreenshot: null,
+            currentApp: '未知',
+            canInterrupt: true,
+            canResume: false,
+          });
+        }
+        break;
     }
   },
 
@@ -829,6 +850,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     wsConsoleApi.sendConfirmPhase(state.currentDeviceId, approved);
 
     set({
+      pendingAction: null,
       waitingForConfirm: false,
       waitingConfirmPhase: null,
       isRunning: approved,  // Continue running if approved
@@ -841,87 +863,28 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }
   },
 
-  confirmAction: async () => {
-    const state = get();
-    if (!state.currentDeviceId || !state.pendingAction) return;
-
-    try {
-      const stepNumber = state.pendingAction.step.step_number || state.currentStepNum;
-      await agentApi.confirmAction(state.currentDeviceId, {
-        step_number: stepNumber,
-        decision: 'confirm',
-      });
-
-      set({ pendingAction: null, isRunning: true });
-
-      // 添加确认消息
-      state.addAgentMessage(`用户确认执行动作: ${state.pendingAction.step.action?.description || '未知动作'}`);
-
-      // Continue is driven by WebSocket
-
-    } catch (error: any) {
-      console.error('Failed to confirm action:', error);
-      set({ error: error.message });
-    }
+  confirmAction: () => {
+    get().confirmPhase(true);
   },
 
-  rejectAction: async () => {
-    const state = get();
-    if (!state.currentDeviceId || !state.pendingAction) return;
-
-    try {
-      const stepNumber = state.pendingAction.step.step_number || state.currentStepNum;
-      await agentApi.confirmAction(state.currentDeviceId, {
-        step_number: stepNumber,
-        decision: 'reject',
-      });
-
-      set({ pendingAction: null });
-
-      // 添加拒绝消息
-      state.addAgentMessage(`用户拒绝执行动作: ${state.pendingAction.step.action?.description || '未知动作'}`);
-
-      // Continue driven by WebSocket
-
-    } catch (error: any) {
-      console.error('Failed to reject action:', error);
-      set({ error: error.message });
-    }
+  rejectAction: () => {
+    get().confirmPhase(false);
   },
 
-  skipAction: async () => {
-    const state = get();
-    if (!state.currentDeviceId || !state.pendingAction) return;
-
-    try {
-      const stepNumber = state.pendingAction.step.step_number || state.currentStepNum;
-      await agentApi.confirmAction(state.currentDeviceId, {
-        step_number: stepNumber,
-        decision: 'skip',
-      });
-
-      set({ pendingAction: null });
-
-      // 添加跳过消息
-      state.addAgentMessage(`用户跳过动作: ${state.pendingAction.step.action?.description || '未知动作'}`);
-
-      // Continue driven by WebSocket
-
-    } catch (error: any) {
-      console.error('Failed to skip action:', error);
-      set({ error: error.message });
-    }
+  skipAction: () => {
+    get().confirmPhase(false);
   },
 
   interrupt: async () => {
     const state = get();
-    if (!state.currentTaskId) {
-      set({ error: 'No active task to interrupt' });
+    if (!state.currentDeviceId) {
+      set({ error: 'No device selected' });
       return;
     }
 
     try {
-      await agentApi.interrupt(state.currentTaskId);
+      // Send interrupt via WebSocket
+      wsConsoleApi.sendInterruptTask(state.currentDeviceId, state.currentTaskId || '');
 
       // 添加中断消息
       state.addAgentMessage('用户中断了任务执行');
@@ -940,47 +903,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
 
   resume: async () => {
-    const state = get();
-    if (!state.currentDeviceId) return;
-
-    try {
-      await agentApi.resume(state.currentDeviceId);
-
-      // 添加恢复消息
-      state.addAgentMessage('任务已恢复执行');
-
-      set({
-        isRunning: true,
-        status: 'running',
-      });
-
-      // Resume is driven by WebSocket
-
-    } catch (error: any) {
-      console.error('Failed to resume:', error);
-      set({ error: error.message });
-    }
+    throw new Error('resume 功能暂未实现，请重新发送指令');
   },
 
-  continueTask: async (additionalSteps = 50) => {
-    const state = get();
-    if (!state.currentDeviceId) return;
-
-    try {
-      const result = await agentApi.continueTask(state.currentDeviceId, additionalSteps);
-
-      // 添加继续执行消息
-      state.addAgentMessage(`用户选择继续执行，已增加 ${additionalSteps} 步`);
-
-      // 更新 maxSteps
-      set({ maxSteps: result.max_steps, isRunning: true, status: 'running' });
-
-      // Continue driven by WebSocket
-
-    } catch (error: any) {
-      console.error('Failed to continue task:', error);
-      set({ error: error.message });
-    }
+  continueTask: async (_additionalSteps = 50) => {
+    throw new Error('continueTask 功能暂未实现，请重新发送指令');
   },
 }));
 
