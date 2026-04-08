@@ -13,7 +13,7 @@ import structlog
 
 from src.config import settings
 from src.database import init_db
-from src.api import devices, tasks, ws, logs
+from src.api import devices, tasks, ws  # logs暂时跳过 - 依赖已删除的模型
 from src.services.websocket import ws_hub
 from src.services.react_scheduler import scheduler
 from src.services.action_router import action_router
@@ -123,7 +123,8 @@ app.add_middleware(
 # Include routers
 app.include_router(devices.router)
 app.include_router(tasks.router)
-app.include_router(logs.router)
+# logs router暂时跳过 - 依赖已删除的模型
+# app.include_router(logs.router)
 app.include_router(ws.router)
 
 

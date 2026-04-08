@@ -105,6 +105,7 @@ class ActionRouter:
             if success:
                 network_logger.info(f"[_send_to_device] Sent directly to device_id={device_id}")
                 return True
+            network_logger.warning(f"[_send_to_device] send_to_device returned False for device_id={device_id}")
 
         client_id = await self._get_client_id_for_device(device_id)
         if client_id:
@@ -120,10 +121,19 @@ class ActionRouter:
                     f"[_send_to_device] Failed to send via client_id={client_id}"
                 )
             else:
+                # Fallback: try all registered client connections
                 network_logger.warning(
                     f"[_send_to_device] client_id={client_id} not in _client_connections, "
-                    f"keys={list(self._ws_hub._client_connections.keys())}"
+                    f"trying all registered connections, keys={list(self._ws_hub._client_connections.keys())}"
                 )
+                for conn_client_id, conn_id in self._ws_hub._client_connections.items():
+                    success = await self._ws_hub.send_to_connection(conn_id, message)
+                    if success:
+                        network_logger.info(
+                            f"[_send_to_device] Sent via fallback client_id={conn_client_id} to device_id={device_id}"
+                        )
+                        return True
+                network_logger.warning(f"[_send_to_device] All fallback attempts failed for device_id={device_id}")
         else:
             network_logger.warning(f"[_send_to_device] No client_id found for device_id={device_id}")
 
@@ -250,10 +260,14 @@ class ActionRouter:
         action: dict,
         reasoning: str = "",
         step_number: int = 0,
-        round_version: int = 0,
+        round_version: Optional[int] = None,
         ack_timeout_seconds: float = 15.0,
         observe_timeout_seconds: float = 30.0,
     ) -> PendingAction:
+        if round_version is None:
+            raise ValueError("round_version is required for send_action")
+        round_version = int(round_version)
+
         from src.network.message_types import create_action_cmd
 
         action_id = str(uuid.uuid4())
@@ -413,18 +427,6 @@ class ActionRouter:
             step_number=pending.step_number,
             version=pending.round_version,
             success=success,
-        )
-
-        await self._push_agent_step(
-            task_id=pending.task_id,
-            device_id=pending.device_id,
-            step_number=pending.step_number,
-            action=pending.action,
-            reasoning=pending.reasoning,
-            result=result,
-            screenshot=screenshot,
-            success=success,
-            error=error,
         )
 
         self._finalize_pending(pending, observe_result)
@@ -589,10 +591,22 @@ class ActionRouter:
         action: dict,
         reasoning: str = "",
         step_number: int = 0,
-        round_version: int = 0,
+        round_version: Optional[int] = None,
         ack_timeout_seconds: float = 15.0,
         observe_timeout_seconds: float = 30.0,
     ) -> dict:
+        if round_version is None:
+            raise ValueError("round_version is required for execute_action")
+
+        logger.info(
+            "Executing action through ActionRouter",
+            task_id=task_id,
+            device_id=device_id,
+            step_number=step_number,
+            version=round_version,
+            action=action,
+        )
+
         pending = await self.send_action(
             task_id=task_id,
             device_id=device_id,

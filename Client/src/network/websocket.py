@@ -240,9 +240,12 @@ class WebSocketClient:
                 msg_type = data.get("type", "unknown")
                 msg_id = data.get("msg_id", "N/A")
 
-                logger.debug(f"[_receive_loop] Received message: type={msg_type}, msg_id={msg_id}")
+                logger.info(f"[_receive_loop] Received message: type={msg_type}, msg_id={msg_id}")
 
-                if msg_type == "ack":
+                if msg_type == "action_cmd":
+                    logger.info(f"[_receive_loop] ACTION_CMD RECEIVED!: {data}")
+                    self.on_message(data)
+                elif msg_type == "ack":
                     # 处理 ACK
                     ref_id = data.get("ref_msg_id")
                     logger.debug(f"[_receive_loop] ACK for ref_id={ref_id}")

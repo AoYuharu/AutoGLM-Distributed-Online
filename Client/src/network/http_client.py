@@ -44,8 +44,15 @@ class HttpClient:
         """获取或创建 HTTP Session"""
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self.timeout)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            connector = aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True)
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self._session
+
+    async def _reset_session(self) -> None:
+        """关闭当前 Session，强制下次请求重建连接"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
     async def close(self) -> None:
         """关闭 HTTP Session"""
@@ -83,43 +90,58 @@ class HttpClient:
         data["timestamp"] = datetime.now().isoformat() + "Z"
         data["client_id"] = self.client_id
 
-
         url = f"{self.base_url}{endpoint}"
+        msg_type = data.get("type", "unknown")
+        allow_retry = endpoint == "/api/v1/observe"
 
-        try:
-            session = await self._get_session()
-            msg_type = data.get("type", "unknown")
-            logger.debug(f"[post_json] Posting to {url}: type={msg_type}, msg_id={msg_id}")
+        for attempt in range(2 if allow_retry else 1):
+            try:
+                session = await self._get_session()
+                logger.debug(f"[post_json] Posting to {url}: type={msg_type}, msg_id={msg_id}, attempt={attempt + 1}")
 
-            # 网络消息归档日志
-            logger.info(f"[network_outgoing] HTTP POST to {url}: type={msg_type}, msg_id={msg_id}")
+                # 网络消息归档日志
+                logger.info(f"[network_outgoing] HTTP POST to {url}: type={msg_type}, msg_id={msg_id}")
 
-            async with session.post(
-                url,
-                json=data,
-                headers=self._create_headers(msg_id),
-            ) as response:
-                if response.status >= 400:
-                    error_text = await response.text()
-                    logger.error(f"[post_json] HTTP {response.status} from {url}: {error_text}")
-                    return None
+                async with session.post(
+                    url,
+                    json=data,
+                    headers=self._create_headers(msg_id),
+                ) as response:
+                    if response.status >= 400:
+                        error_text = await response.text()
+                        logger.error(f"[post_json] HTTP {response.status} from {url}: {error_text}")
+                        return None
 
-                if wait_response:
-                    result = await response.json()
-                    logger.debug(f"[post_json] Response: {result}")
-                    return result
-                else:
-                    return {"success": True}
+                    if wait_response:
+                        result = await response.json()
+                        logger.debug(f"[post_json] Response: {result}")
+                        return result
+                    else:
+                        return {"success": True}
 
-        except asyncio.TimeoutError:
-            logger.error(f"[post_json] Timeout posting to {url}")
-            return None
-        except aiohttp.ClientError as e:
-            logger.error(f"[post_json] Client error posting to {url}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"[post_json] Error posting to {url}: {e}")
-            return None
+            except asyncio.TimeoutError:
+                logger.error(f"[post_json] Timeout posting to {url}")
+                if allow_retry and attempt == 0:
+                    await self._reset_session()
+                    logger.warning(f"[post_json] Retrying after timeout for {url}")
+                    continue
+                return None
+            except aiohttp.ClientError as e:
+                logger.error(f"[post_json] Client error posting to {url}: {e}")
+                if allow_retry and attempt == 0:
+                    await self._reset_session()
+                    logger.warning(f"[post_json] Retrying after client error for {url}")
+                    continue
+                return None
+            except Exception as e:
+                logger.error(f"[post_json] Error posting to {url}: {e}")
+                if allow_retry and attempt == 0:
+                    await self._reset_session()
+                    logger.warning(f"[post_json] Retrying after unexpected error for {url}")
+                    continue
+                return None
+
+        return None
 
     # === 特定消息发送方法 ===
 
@@ -187,7 +209,11 @@ class HttpClient:
         if version is not None:
             data["version"] = str(version)
             data["payload"]["version"] = version
-        return await self.post_json("/api/v1/tasks/observe", data)
+        logger.info(
+            f"[send_observe_result] task_id={task_id}, device_id={device_id}, "
+            f"step={step_number}, version={version}, success={success}, has_screenshot={bool(screenshot)}"
+        )
+        return await self.post_json("/api/v1/observe", data)
 
     async def send_device_offline(self, device_id: str) -> Optional[dict]:
         """

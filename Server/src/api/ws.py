@@ -227,8 +227,17 @@ async def handle_console_message(console_id: str, message: dict):
         max_steps = message.get("max_steps", 100)
 
         ws_console_logger.info(
-            f"[ws_console_create_task] Creating task: device={device_id}, "
-            f"instruction={instruction[:50] if instruction else 'None'}..."
+            f"[ws_console_create_task] Creating task: console={console_id}, device={device_id}, "
+            f"instruction={instruction[:50] if instruction else 'None'}..., max_steps={max_steps}, mode={mode}"
+        )
+
+        logger.info(
+            "Console create_task received",
+            console_id=console_id,
+            device_id=device_id,
+            instruction=instruction,
+            max_steps=max_steps,
+            mode=mode,
         )
 
         if not device_id or not instruction:
@@ -240,9 +249,6 @@ async def handle_console_message(console_id: str, message: dict):
 
         try:
             import uuid
-            from src.database import get_db_session
-            from sqlalchemy import select
-            from src.models.models import Device, Client, Task
             from src.services.react_scheduler import scheduler
 
             task_id = f"task_{uuid.uuid4().hex[:12]}"
@@ -259,40 +265,23 @@ async def handle_console_message(console_id: str, message: dict):
                     )
                 return
 
-            try:
-                with get_db_session() as db:
-                    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
-                    if not device:
-                        raise ValueError(f"Device {device_id} not found")
-
-                    client = db.execute(select(Client).where(Client.id == device.client_id)).scalar_one_or_none()
-                    if not client:
-                        raise ValueError("Client not found")
-
-                    new_task = Task(
-                        task_id=task_id,
-                        device_id=device.id,
-                        client_id=client.id,
-                        instruction=instruction,
-                        mode=mode,
-                        max_steps=max_steps,
-                        status="pending",
-                    )
-                    db.add(new_task)
-                    db.flush()
-
-                    scheduler.submit_task(
-                        device_id=device_id,
-                        task_id=task_id,
-                        instruction=instruction,
-                        mode=mode,
-                        max_steps=max_steps,
-                    )
-            except Exception:
-                await device_status_manager.set_idle(device_id)
-                raise
+            scheduler.submit_task(
+                device_id=device_id,
+                task_id=task_id,
+                instruction=instruction,
+                mode=mode,
+                max_steps=max_steps,
+            )
 
             ws_console_logger.info(f"[ws_console_create_task] Task created: {task_id}")
+            logger.info(
+                "Console task created",
+                console_id=console_id,
+                task_id=task_id,
+                device_id=device_id,
+                instruction=instruction,
+                max_steps=max_steps,
+            )
             if console_id in ws_hub._web_consoles:
                 await ws_hub._web_consoles[console_id].send_json(
                     {
@@ -318,20 +307,7 @@ async def handle_console_message(console_id: str, message: dict):
         )
 
         try:
-            from src.database import get_db_session
-            from sqlalchemy import select
-            from src.models.models import Device, Task
             from src.services.react_scheduler import scheduler
-
-            with get_db_session() as db:
-                device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
-                if device and task_id:
-                    task = db.execute(select(Task).where(Task.task_id == task_id)).scalar_one_or_none()
-                    if task:
-                        from datetime import datetime
-
-                        task.status = "interrupted"
-                        task.finished_at = datetime.utcnow()
 
             await scheduler.interrupt_task(device_id)
 

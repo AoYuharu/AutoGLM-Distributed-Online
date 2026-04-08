@@ -1,6 +1,14 @@
 """
 ReAct 线程池调度器
-基于设计文档: react_scheduler_design.md
+基于设计文档: docs/MAIN.md
+
+完整 ReAct 流程实现:
+1. AI 调用重试（最多 3 次，10s 超时）
+2. ActionParse 校验和自重构（最多 3 次）
+3. 设备状态检查
+4. ACK 重试（3 次，15s 间隔）
+5. 完整的 WAIT_FOR_PUSH / WAIT_OBSERVATION / FINISHED 状态机
+6. 类型安全的回调接口
 """
 import asyncio
 import json
@@ -13,15 +21,43 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from threading import Lock
-from typing import Optional, Callable, Any
-
-from sqlalchemy import select
+from typing import Optional, Callable, Any, TYPE_CHECKING
 
 from openai import OpenAI
 
 from src.config import settings
-from src.database import get_db_session
-from src.models.models import Device, Task
+
+# 导入新增的类型和回调
+from src.services.react_types import SessionStatus, ReActErrorType
+from src.services.react_callbacks import ReActCallback, ReActStepEvent, ReActTaskEvent
+
+
+# ==================== Token 计数工具 ====================
+
+def _count_tokens(text: str) -> int:
+    """
+    估算文本的 token 数量。
+    优先尝试 tiktoken（精确），否则用字符数 / 4 估算（中英混合文本的粗略估计）。
+    """
+    try:
+        import tiktoken
+        enc = tiktoken.encoding_for_model("gpt-4o")
+        return len(enc.encode(text))
+    except Exception:
+        return len(text) // 4
+
+
+def _count_message_tokens(msg: dict) -> int:
+    """估算单条消息的 token 数量（含 role + content）。"""
+    content = msg.get("content", "")
+    role = msg.get("role", "")
+    if isinstance(content, list):
+        # 多模态消息：text 部分估算，image_url 占少量 token
+        text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
+        text = "\n".join(text_parts)
+        image_count = sum(1 for part in content if part.get("type") == "image_url")
+        return _count_tokens(f"{role}\n{text}") + image_count * 85
+    return _count_tokens(f"{role}\n{content}")
 
 
 # ==================== 日志配置 ====================
@@ -69,6 +105,46 @@ class TaskStatus(Enum):
     INTERRUPTED = "interrupted"   # 被中断
 
 
+# ==================== 异常类 ====================
+
+class ReActException(Exception):
+    """ReAct 基础异常"""
+    def __init__(self, error_type: ReActErrorType, message: str):
+        self.error_type = error_type
+        self.message = message
+        super().__init__(message)
+
+
+class RemoteAPIException(ReActException):
+    """远程 API 调用异常"""
+    def __init__(self, error_type: ReActErrorType, message: str):
+        super().__init__(error_type, message)
+
+
+class ActionParseException(ReActException):
+    """Action 解析异常"""
+    def __init__(self, error_type: ReActErrorType, message: str):
+        super().__init__(error_type, message)
+
+
+class DeviceStatusException(ReActException):
+    """设备状态异常"""
+    def __init__(self, error_type: ReActErrorType, message: str):
+        super().__init__(error_type, message)
+
+
+class DispatchException(ReActException):
+    """下发任务异常"""
+    def __init__(self, error_type: ReActErrorType, message: str):
+        super().__init__(error_type, message)
+
+
+class ObserveException(ReActException):
+    """观察结果异常"""
+    def __init__(self, error_type: ReActErrorType, message: str):
+        super().__init__(error_type, message)
+
+
 # ==================== 数据类 ====================
 
 @dataclass
@@ -84,10 +160,31 @@ class DeviceTaskContext:
         else:
             self.messages.append({"role": role, "content": content})
 
-    def truncate(self, keep_last: int = 10):
-        """截断旧消息，保留最近N条"""
-        if len(self.messages) > keep_last:
-            self.messages = [self.messages[0]] + self.messages[-keep_last:]
+    def truncate(self, max_tokens: int = 20000):
+        """
+        按 token 总数截断上下文（不含 system_prompt）。
+        从最旧的消息开始丢弃，直到 assistant 消息总 token <= max_tokens。
+        至少保留最近 1 条消息。
+        """
+        if not self.messages:
+            return
+
+        # 先估算 system_prompt 的 token 数（不截断，但计入上限）
+        system_tokens = _count_tokens(self.system_prompt)
+
+        def total_tokens(msgs: list[dict]) -> int:
+            return system_tokens + sum(_count_message_tokens(m) for m in msgs)
+
+        original_count = len(self.messages)
+        # 从最旧的消息开始丢弃（第0条是历史遗留，优先丢弃）
+        while len(self.messages) > 1 and total_tokens(self.messages) > max_tokens:
+            self.messages.pop(0)
+
+        if original_count != len(self.messages):
+            scheduler_logger.debug(
+                f"[CONTEXT] Truncated from {original_count} to {len(self.messages)} messages, "
+                f"total_tokens≈{total_tokens(self.messages)}, max={max_tokens}"
+            )
 
     def to_api_format(self) -> list[dict]:
         """转换为API格式"""
@@ -128,6 +225,12 @@ class DeviceTask:
     phase: TaskPhase = TaskPhase.IDLE
     status: TaskStatus = TaskStatus.PENDING
 
+    # 会话状态 (新增)
+    session_status: SessionStatus = SessionStatus.WAIT_FOR_PUSH
+
+    # 回调列表 (新增)
+    callbacks: list = field(default_factory=list)
+
     # 进度
     current_step: int = 0
     max_steps: int = 100
@@ -147,6 +250,9 @@ class DeviceTask:
 
     # AI客户端 (不使用field,直接在property中初始化)
     _model_client: Optional[Any] = None
+
+    # 反思提示词（action解析失败时注入给下一轮AI）
+    reflection_prompt: str = ""
 
     # 时间戳
     created_at: float = field(default_factory=time.time)
@@ -222,6 +328,9 @@ do(action="操作类型", ...)
 1. 打开应用必须用 Launch 动作
 2. 坐标范围是 0-999
 3. 当前屏幕截图会作为图片提供给你分析
+4. 如果屏幕上的明确文本已经表明用户要求的目标已完成，必须立即输出 do(action="finish", message="任务已完成")
+5. 对于设置类任务，如果界面明确显示目标值已经等于用户要求的值，则任务已经完成，不要继续点击、滑动或进入其他页面
+6. 只有在屏幕上没有出现明确完成证据时，才继续导航查找相关设置
 
 用户指令: {self.instruction}"""
 
@@ -232,12 +341,13 @@ do(action="操作类型", ...)
         self.current_step = 0
         self.phase = TaskPhase.REASON
         self.status = TaskStatus.PENDING
+        self.session_status = SessionStatus.WAIT_FOR_PUSH
         self.last_active_at = time.time()
 
-    async def execute_reason(self) -> tuple[str, dict]:
+    async def execute_reason(self) -> tuple[str, dict, str]:
         """
         执行 Reason 阶段 - 调用AI模型获取思考和动作
-        Returns: (reasoning, action_dict)
+        Returns: (reasoning, action_dict, raw_model_output)
         """
         print(f"[DEBUG] execute_reason START for {self.device_id}, {self.task_id}", flush=True)
         self.phase = TaskPhase.REASON
@@ -247,12 +357,17 @@ do(action="操作类型", ...)
         scheduler_logger.debug(f"[REASON] calling model: device={self.device_id}, task={self.task_id}, context_len={len(self.context.messages)}, has_screenshot={bool(self.react_records and self.react_records[-1].screenshot)}")
 
         try:
-            # 构建消息
+            # 构建用户消息文本，追加反思提示词（如有）
+            user_text = f"用户指令: {self.instruction}\n请分析屏幕内容，决定下一步动作。"
+            if self.reflection_prompt:
+                user_text = f"{self.reflection_prompt}\n\n{user_text}"
+                self.reflection_prompt = ""  # 使用后清空
+
             user_message = {
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self.react_records[-1].screenshot}"}} if self.react_records else {"type": "text", "text": "请分析屏幕内容"},
-                    {"type": "text", "text": f"用户指令: {self.instruction}\n请分析屏幕内容，决定下一步动作。"}
+                    {"type": "text", "text": user_text}
                 ]
             }
 
@@ -283,33 +398,47 @@ do(action="操作类型", ...)
 
             scheduler_logger.info(f"[REASON] model response: device={self.device_id}, task={self.task_id}, latency={latency:.1f}s, content_len={len(content)}, preview={content[:100]}")
 
-            return reasoning, action_dict
+            return reasoning, action_dict, content
 
         except asyncio.TimeoutError:
             print(f"[DEBUG] execute_reason TIMEOUT for {self.device_id}, {self.task_id}", flush=True)
             scheduler_logger.warning(f"[REASON] model timeout: device={self.device_id}, task={self.task_id}, timeout={settings.PHONE_AGENT_TIMEOUT}")
-            return "AI模型响应超时", {"action": "error", "message": "model_timeout"}
+            raise RemoteAPIException(
+                ReActErrorType.REMOTE_API_TIMEOUT,
+                f"AI call timeout after {settings.PHONE_AGENT_TIMEOUT}s"
+            )
         except Exception as e:
             print(f"[ERROR] execute_reason EXCEPTION for {self.device_id}: {e}", flush=True)
             import traceback
             traceback.print_exc()
             scheduler_logger.error(f"[REASON] model error: device={self.device_id}, task={self.task_id}, error={e}")
-            return f"Error: {str(e)}", {"action": "error", "message": str(e)}
+            raise RemoteAPIException(
+                ReActErrorType.REMOTE_API_TIMEOUT,
+                f"AI call error: {str(e)}"
+            )
 
-    async def execute_act(self, action: dict) -> str:
+    async def execute_act(self, action: dict, reasoning: str, round_version: int) -> dict:
         """
         执行 Act 阶段 - 发送动作到客户端并等待结果
-        Returns: action_result
+        Returns: ActionRouter result dict
         """
         self.phase = TaskPhase.ACT
         self.last_active_at = time.time()
 
-        scheduler_logger.info(f"[ACT] executing: device={self.device_id}, task={self.task_id}, action={action.get('action')}, params={action}")
+        scheduler_logger.info(
+            f"[ACT] executing: device={self.device_id}, task={self.task_id}, "
+            f"step={self.current_step}, version={round_version}, action={action.get('action')}, params={action}"
+        )
 
         # 检查是否是finish动作
         action_type = action.get("action", "").lower()
         if action_type in ["finish", "stop", "done"]:
-            return "_finish_"
+            return {
+                "success": True,
+                "result": "_finish_",
+                "version": round_version,
+                "step_number": self.current_step,
+            }
 
         # 使用ActionRouter发送动作到客户端并等待结果
         try:
@@ -319,9 +448,11 @@ do(action="操作类型", ...)
                     task_id=self.task_id,
                     device_id=self.device_id,
                     action=action,
-                    reasoning="",  # reasoning already shown in step
+                    reasoning=reasoning,
                     step_number=self.current_step,
-                    timeout_seconds=30.0,
+                    round_version=round_version,
+                    ack_timeout_seconds=15.0,
+                    observe_timeout_seconds=30.0,
                 )
 
                 scheduler_logger.info(
@@ -329,24 +460,69 @@ do(action="操作类型", ...)
                     f"success={result.get('success', False)}, result_preview={str(result.get('result', ''))[:200]}"
                 )
 
+                # 检查结果中的错误类型
+                error_type = result.get("error_type")
+                if error_type == "ack_timeout":
+                    raise DispatchException(
+                        ReActErrorType.ACK_TIMEOUT,
+                        "ACK timeout"
+                    )
+                elif error_type == "ack_rejected":
+                    raise DispatchException(
+                        ReActErrorType.ACK_REJECTED,
+                        result.get("error", "Action rejected by client")
+                    )
+                elif error_type == "observe_timeout":
+                    raise ObserveException(
+                        ReActErrorType.OBSERVE_TIMEOUT,
+                        "Observation timeout"
+                    )
+                elif error_type == "observe_error":
+                    raise ObserveException(
+                        ReActErrorType.OBSERVE_ERROR,
+                        result.get("error", "Observation error")
+                    )
+
                 # 如果成功获取了截图，更新到react_records
                 if result.get("screenshot"):
                     if self.react_records:
                         self.react_records[-1].screenshot = result.get("screenshot")
 
-                return result.get("result", str(result))
+                return result
             else:
                 scheduler_logger.warning("[ACT] ActionRouter not available, using legacy executor")
                 if self.action_executor:
-                    result = await asyncio.to_thread(self.action_executor, self.device_id, action)
-                    return result.get("message", str(result))
-                return "No executor configured"
+                    legacy_result = await asyncio.to_thread(self.action_executor, self.device_id, action)
+                    return {
+                        "success": True,
+                        "result": legacy_result.get("message", str(legacy_result)),
+                        "version": round_version,
+                        "step_number": self.current_step,
+                    }
+                return {
+                    "success": False,
+                    "result": "",
+                    "error": "No executor configured",
+                    "error_type": "send_failed",
+                    "version": round_version,
+                    "step_number": self.current_step,
+                }
+        except DispatchException:
+            raise
+        except ObserveException:
+            raise
         except asyncio.TimeoutError:
             scheduler_logger.error(f"[ACT] timeout: device={self.device_id}, task={self.task_id}, timeout=30.0")
-            return "_observe_timeout_"  # 观察超时，等待截图无响应
+            raise ObserveException(
+                ReActErrorType.OBSERVE_TIMEOUT,
+                "ACT execution timeout"
+            )
         except Exception as e:
             scheduler_logger.error(f"[ACT] error: device={self.device_id}, task={self.task_id}, error={e}")
-            return f"Action error: {str(e)}"
+            raise DispatchException(
+                ReActErrorType.OBSERVE_ERROR,
+                f"Action error: {str(e)}"
+            )
 
     def set_observe(self, screenshot: str, observation: str = ""):
         """设置观察结果"""
@@ -356,6 +532,23 @@ do(action="操作类型", ...)
 
         self.phase = TaskPhase.OBSERVE
         self.last_active_at = time.time()
+        self.session_status = SessionStatus.WAIT_OBSERVATION
+
+        # Save screenshot and update react record in file storage
+        try:
+            from src.services.file_storage import file_storage
+            if screenshot and self.react_records:
+                step = self.react_records[-1].step_number
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                screenshot_path = file_storage.save_screenshot(self.device_id, step, ts, screenshot)
+                file_storage.append_react_record(self.device_id, {
+                    "step_number": step,
+                    "screenshot": screenshot_path,
+                    "observation": observation,
+                    "phase": "observe",
+                })
+        except Exception as e:
+            scheduler_logger.warning(f"[OBSERVE] Failed to save screenshot: {e}")
 
     def complete_reason(self, reasoning: str, action: dict):
         """完成Reason阶段，记录ReAct"""
@@ -375,14 +568,42 @@ do(action="操作类型", ...)
             f"reasoning_preview={reasoning[:200] if reasoning else ''}"
         )
 
+        # Save react record to file storage
+        try:
+            from src.services.file_storage import file_storage
+            file_storage.append_react_record(self.device_id, {
+                "step_number": record.step_number,
+                "reasoning": reasoning,
+                "action": action,
+                "phase": "reason",
+            })
+        except Exception as e:
+            scheduler_logger.warning(f"[REASON] Failed to save react record: {e}")
+
     def complete_act(self, result: str):
         """完成Act阶段"""
         if self.react_records:
             self.react_records[-1].action_result = result
+            if result and not self.react_records[-1].observation:
+                self.react_records[-1].observation = result
         self.phase = TaskPhase.OBSERVE
         self.last_active_at = time.time()
+        self.session_status = SessionStatus.WAIT_OBSERVATION
 
         scheduler_logger.debug(f"[ACT] act completed: device={self.device_id}, task={self.task_id}, result={result[:100] if result else ''}")
+
+        # Update react record in file storage with action result
+        try:
+            from src.services.file_storage import file_storage
+            if self.react_records:
+                file_storage.append_react_record(self.device_id, {
+                    "step_number": self.react_records[-1].step_number,
+                    "action_result": result,
+                    "observation": self.react_records[-1].observation,
+                    "phase": "act",
+                })
+        except Exception as e:
+            scheduler_logger.warning(f"[ACT] Failed to update react record: {e}")
 
     def _parse_action(self, content: str) -> tuple[str, str]:
         """解析模型响应，分离思考和动作"""
@@ -560,13 +781,26 @@ do(action="操作类型", ...)
 class ReActScheduler:
     """
     ReAct 线程池调度器
-    基于设计文档: react_scheduler_design.md
+    基于设计文档: docs/MAIN.md
 
     核心逻辑:
     1. 线程池执行各device的一轮ReAct
     2. 每轮完成后放回队列尾部，公平轮转
     3. 通过WebSocket推送进度给客户端
+
+    完整 ReAct 流程:
+    1. AI 调用重试（最多 3 次，10s 超时）
+    2. ActionParse 校验和自重构（最多 3 次）
+    3. 设备状态检查
+    4. ACK 重试（3 次，15s 间隔）
+    5. 完整的 WAIT_FOR_PUSH / WAIT_OBSERVATION / FINISHED 状态机
     """
+
+    # 重试配置
+    MAX_AI_RETRIES = 3
+    AI_TIMEOUT = 10.0
+    MAX_ACK_RETRIES = 3
+    ACK_RETRY_INTERVAL = 15.0
 
     def __init__(
         self,
@@ -624,7 +858,8 @@ class ReActScheduler:
         max_steps: int = 100,
         action_executor: Optional[Callable] = None,
         status_callback: Optional[Callable] = None,
-        step_callback: Optional[Callable] = None
+        step_callback: Optional[Callable] = None,
+        callbacks: Optional[list] = None,
     ) -> DeviceTask:
         """提交新任务到队列尾部"""
         scheduler_logger.info(f"[SUBMIT] device={device_id}, task={task_id}, instruction={instruction[:30]}...")
@@ -637,7 +872,8 @@ class ReActScheduler:
             max_steps=max_steps,
             action_executor=action_executor,
             status_callback=status_callback,
-            step_callback=step_callback
+            step_callback=step_callback,
+            callbacks=callbacks or [],
         )
         task.initialize()
 
@@ -652,6 +888,24 @@ class ReActScheduler:
                 # 清空队列状态记录，因为队列不再为空
                 self._last_queue_state = None
                 scheduler_logger.info(f"[SUBMIT] Added to queue, queue_size={len(self._task_queue)}")
+
+        # Save initial context to file storage
+        try:
+            from src.services.file_storage import file_storage
+            context_data = {
+                "system_prompt": task.context.system_prompt,
+                "messages": task.context.messages,
+            }
+            file_storage.save_context(device_id, context_data)
+            # Initialize chat history with user instruction
+            file_storage.save_chat_history(device_id, [{
+                "id": f"msg_{task_id}_user",
+                "role": "user",
+                "content": instruction,
+                "created_at": datetime.now().isoformat(),
+            }])
+        except Exception as e:
+            scheduler_logger.warning(f"[SUBMIT] Failed to save initial context: {e}")
 
         return task
 
@@ -685,8 +939,8 @@ class ReActScheduler:
         with self._queue_lock:
             task = self._device_tasks.get(device_id)
             if task and task.is_active:
-                # 截断过长的上下文
-                task.context.truncate(10)
+                # 截断过长的上下文（按 token 总数不超过 20000）
+                task.context.truncate(max_tokens=20000)
                 self._task_queue.append(device_id)
                 # 清空队列状态记录，因为队列不再为空
                 self._last_queue_state = None
@@ -711,10 +965,246 @@ class ReActScheduler:
         """获取所有任务"""
         return self._device_tasks.copy()
 
+    # ==================== 重试方法 ====================
+
+    async def _reason_with_retry(self, task: DeviceTask) -> tuple[str, dict, str]:
+        """
+        AI 推理重试 - 最多 3 次，每次 10s 超时
+        Raises:
+            RemoteAPIException: 当所有重试都失败时
+        """
+        for attempt in range(self.MAX_AI_RETRIES):
+            try:
+                scheduler_logger.info(
+                    f"[REASON_RETRY] attempt {attempt + 1}/{self.MAX_AI_RETRIES} "
+                    f"for device={task.device_id}, task={task.task_id}"
+                )
+                return await asyncio.wait_for(
+                    task.execute_reason(),
+                    timeout=self.AI_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                scheduler_logger.warning(
+                    f"[REASON_RETRY] timeout on attempt {attempt + 1}/{self.MAX_AI_RETRIES} "
+                    f"for device={task.device_id}, task={task.task_id}"
+                )
+                if attempt == self.MAX_AI_RETRIES - 1:
+                    raise RemoteAPIException(
+                        ReActErrorType.REMOTE_API_RETRIES_EXCEEDED,
+                        f"AI call failed after {self.MAX_AI_RETRIES} retries"
+                    )
+            except RemoteAPIException:
+                raise
+            except Exception as e:
+                scheduler_logger.error(
+                    f"[REASON_RETRY] error on attempt {attempt + 1}/{self.MAX_AI_RETRIES} "
+                    f"for device={task.device_id}: {e}"
+                )
+                if attempt == self.MAX_AI_RETRIES - 1:
+                    raise RemoteAPIException(
+                        ReActErrorType.REMOTE_API_RETRIES_EXCEEDED,
+                        f"AI call failed after {self.MAX_AI_RETRIES} retries: {str(e)}"
+                    )
+
+    async def _action_parse_with_retry(self, task: DeviceTask, reasoning: str, raw_output: str):
+        """
+        Action 解析重试 - 最多 3 次，包含自重构
+        Returns: ActionParseResult
+        """
+        from src.services.action_parser import ActionParser, ActionParseResult
+
+        action_parser = ActionParser(task.model_client)
+        return await action_parser.parse_and_validate(
+            reasoning=reasoning,
+            raw_model_output=raw_output,
+            device_type="android",
+            attempt=1,
+        )
+
+    async def _check_device_status(self, task: DeviceTask):
+        """
+        设备状态检查
+        Raises:
+            DeviceStatusException: 当设备状态非 OK 时
+        """
+        try:
+            from src.services.device_status_manager import device_status_manager
+
+            status = await device_status_manager.get_status(task.device_id)
+            if status.value != "idle":
+                raise DeviceStatusException(
+                    ReActErrorType.DEVICE_STATUS_UNEXPECTED,
+                    f"Device status is {status}, expected idle"
+                )
+        except DeviceStatusException:
+            raise
+        except Exception as e:
+            scheduler_logger.warning(f"[DEVICE_STATUS] check failed for {task.device_id}: {e}")
+            # 设备状态管理器可能不存在，忽略错误
+
+    async def _dispatch_with_retry(self, task: DeviceTask, action: dict, reasoning: str, round_version: int) -> dict:
+        """
+        下发任务重试 - ActionRouter 内部已有重试逻辑
+        Raises:
+            DispatchException: 当 ACK 超时或被拒绝时
+            ObserveException: 当观察结果超时或错误时
+        """
+        try:
+            return await task.execute_act(action, reasoning, round_version)
+        except (DispatchException, ObserveException):
+            raise
+        except Exception as e:
+            raise DispatchException(
+                ReActErrorType.OBSERVE_ERROR,
+                f"Dispatch error: {str(e)}"
+            )
+
+    # ==================== 回调方法 ====================
+
+    async def _emit_phase_start(self, device_id: str, task_id: str, phase: str, step: int):
+        """发送阶段开始事件"""
+        task = self._device_tasks.get(device_id)
+        if task:
+            for cb in task.callbacks:
+                try:
+                    if hasattr(cb, 'on_phase_start'):
+                        await cb.on_phase_start(device_id, task_id, phase, step)
+                except Exception as e:
+                    scheduler_logger.warning(f"[CALLBACK] on_phase_start error: {e}")
+
+        if self._ws_hub:
+            await self._ws_hub.broadcast_agent_phase_start(
+                device_id=device_id,
+                task_id=task_id,
+                phase=phase,
+                step_number=step,
+            )
+
+    async def _emit_step(self, task: DeviceTask, reasoning: str, action: dict, result: str, screenshot: str = ""):
+        """发送步骤完成事件"""
+        event = ReActStepEvent(
+            device_id=task.device_id,
+            task_id=task.task_id,
+            step_number=task.current_step,
+            phase=task.phase.value,
+            reasoning=reasoning,
+            action=action,
+            result=result,
+            screenshot=screenshot or (task.react_records[-1].screenshot if task.react_records else None),
+            success=True,
+            error=None,
+            error_type=None,
+        )
+
+        for cb in task.callbacks:
+            try:
+                if hasattr(cb, 'on_step'):
+                    await cb.on_step(event)
+            except Exception as e:
+                scheduler_logger.warning(f"[CALLBACK] on_step error: {e}")
+
+        if self._ws_hub:
+            await self._ws_hub.broadcast_agent_step(
+                task_id=task.task_id,
+                device_id=task.device_id,
+                step=event.__dict__,
+                step_type="agent_step",
+            )
+
+    async def _emit_complete(self, task: DeviceTask, final_reasoning: str):
+        """发送任务完成事件"""
+        task.status = TaskStatus.COMPLETED
+        task.session_status = SessionStatus.FINISHED
+
+        event = ReActTaskEvent(
+            device_id=task.device_id,
+            task_id=task.task_id,
+            status="completed",
+            message="Task completed",
+            final_reasoning=final_reasoning,
+            error_type=None,
+        )
+
+        for cb in task.callbacks:
+            try:
+                if hasattr(cb, 'on_task_complete'):
+                    await cb.on_task_complete(event)
+            except Exception as e:
+                scheduler_logger.warning(f"[CALLBACK] on_task_complete error: {e}")
+
+        if self._ws_hub:
+            await self._ws_hub.broadcast_agent_status(
+                device_id=task.device_id,
+                session_id=task.task_id,
+                status="completed",
+                message="Task completed",
+                data={
+                    "task_id": task.task_id,
+                    "final_reasoning": final_reasoning,
+                },
+            )
+
+        # 将设备状态重置为 idle
+        from src.services.device_status_manager import device_status_manager
+        await device_status_manager.set_idle(task.device_id)
+
+        # 从调度器内存中移除任务
+        self.remove_task(task.device_id)
+
+    async def _emit_failed(self, task: DeviceTask, message: str, error_type: ReActErrorType, final_reasoning: str = ""):
+        """发送任务失败事件"""
+        task.status = TaskStatus.COMPLETED  # 标记为完成（结束）
+        task.session_status = SessionStatus.FINISHED
+
+        event = ReActTaskEvent(
+            device_id=task.device_id,
+            task_id=task.task_id,
+            status="failed",
+            message=message,
+            final_reasoning=final_reasoning,
+            error_type=error_type.value if error_type else None,
+        )
+
+        for cb in task.callbacks:
+            try:
+                if hasattr(cb, 'on_task_failed'):
+                    await cb.on_task_failed(event)
+            except Exception as e:
+                scheduler_logger.warning(f"[CALLBACK] on_task_failed error: {e}")
+
+        if self._ws_hub:
+            await self._ws_hub.broadcast_agent_status(
+                device_id=task.device_id,
+                session_id=task.task_id,
+                status="failed",
+                message=message,
+                data={
+                    "task_id": task.task_id,
+                    "error_type": error_type.value if error_type else None,
+                    "final_reasoning": final_reasoning,
+                },
+            )
+
+        # 将设备状态重置为 idle
+        from src.services.device_status_manager import device_status_manager
+        await device_status_manager.set_idle(task.device_id)
+
+        # 从调度器内存中移除任务
+        self.remove_task(task.device_id)
+
+    # ==================== 主循环 ====================
+
     async def run_one_cycle(self, device_id: str) -> bool:
         """
-        执行一个ReAct循环
+        执行一个完整的 ReAct 循环
         Returns: True=任务完成/需切换, False=继续当前任务
+
+        完整流程:
+        1. REASON: AI 推理重试（最多 3 次，10s 超时）
+        2. ActionParse: 校验和自重构（最多 3 次）
+        3. 设备状态检查
+        4. ACT: 下发任务（ACK 重试 3 次，15s 间隔）
+        5. OBSERVE: 等待观察结果
         """
         task = self._device_tasks.get(device_id)
         if not task or not task.is_active:
@@ -728,97 +1218,211 @@ class ReActScheduler:
             f"queue_size={len(self._task_queue)}, total_records={len(task.react_records)}"
         )
 
-        # === Phase 1: REASON ===
-        scheduler_logger.debug(f"[CYCLE] device={device_id} ENTER REASON phase")
-        reasoning, action = await task.execute_reason()
+        try:
+            next_step_number = task.current_step + 1
 
-        # REASON 阶段完成记录
-        scheduler_logger.info(
-            f"[REASON] reason phase completed: device={device_id}, task={task.task_id}, "
-            f"action_type={action.get('action')}, reasoning_preview={reasoning[:300] if reasoning else ''}"
-        )
-
-        # 检查是否完成
-        if task._is_finish_action(action):
-            task.status = TaskStatus.COMPLETED
-            scheduler_logger.info(f"[CYCLE] finished (finish action): device={device_id}, task={task.task_id}, steps={task.current_step}, records={len(task.react_records)}")
-            await self._broadcast_complete(device_id, reasoning)
-            return True
-
-        # 记录ReAct
-        task.complete_reason(reasoning, action)
-
-        # === 容错检查: action 是否有效 ===
-        action_type = action.get("action", "").lower()
-        if action_type == "unknown" or not action.get("action"):
-            # 动作无法解析，将错误信息作为观察结果反馈给agent，重新reason
-            scheduler_logger.warning(f"[CYCLE] action parse failed: device={device_id}, task={task.task_id}, action={action.get('raw', '')[:50]}")
-
-            # 将解析失败的信息作为观察添加到上下文，让agent重新思考
-            parse_error_msg = f"[动作解析失败] 无法解析上一步的输出内容: {action.get('raw', '')[:100]}...请重新分析屏幕并输出正确的动作。"
-            task.set_observe(
-                screenshot=task.react_records[-1].screenshot if task.react_records else "",
-                observation=parse_error_msg
+            # === Phase 1: REASON ===
+            await self._emit_phase_start(device_id, task.task_id, "reason", next_step_number)
+            reasoning, action, raw_output = await self._reason_with_retry(task)
+            scheduler_logger.info(
+                f"[CYCLE] reason completed: device={device_id}, task={task.task_id}, "
+                f"step={next_step_number}, action_guess={action.get('action')}, reasoning_preview={reasoning[:120] if reasoning else ''}"
             )
 
-            # 广播错误步骤
-            if task.react_records:
-                await self._broadcast_step(device_id, task.react_records[-1])
+            # 检查是否完成
+            if task._is_finish_action(action):
+                scheduler_logger.info(
+                    f"[CYCLE] finish action detected: device={device_id}, task={task.task_id}, step={next_step_number}"
+                )
+                await self._emit_complete(task, reasoning)
+                return True
 
-            # 直接放回队列，重新reason（不执行act）
+            # === ActionParse: 校验 action 是否有效 ===
+            parse_result = await self._action_parse_with_retry(task, reasoning, raw_output)
+            scheduler_logger.info(
+                f"[CYCLE] parse completed: device={device_id}, task={task.task_id}, "
+                f"step={next_step_number}, parse_success={parse_result.success}, parsed_action={parse_result.action}"
+            )
+
+            # 如果 action 解析失败且是 unknown 类型的错误，尝试重新推理
+            action_type = action.get("action", "").lower()
+            if action_type == "unknown" or not action.get("action"):
+                scheduler_logger.warning(
+                    f"[CYCLE] action parse failed: device={device_id}, task={task.task_id}, "
+                    f"action={action.get('raw', '')[:50]}"
+                )
+                parse_error_msg = f"[动作解析失败] 无法解析上一步的输出内容: {action.get('raw', '')[:100]}...请重新分析屏幕并输出正确的动作。"
+                task.set_observe(
+                    screenshot=task.react_records[-1].screenshot if task.react_records else "",
+                    observation=parse_error_msg
+                )
+                task.reflection_prompt = parse_error_msg  # 注入给下一轮 AI
+                await self._emit_step(task, reasoning, action, parse_error_msg)
+                self.requeue_task(device_id)
+                return False
+
+            if not parse_result.success:
+                await self._emit_failed(
+                    task,
+                    parse_result.error or "Action parse failed",
+                    parse_result.error_type or ReActErrorType.ACTION_PARSE_FAILED,
+                    reasoning,
+                )
+                return True
+
+            task.complete_reason(reasoning, parse_result.action)
+
+            from src.services.device_status_manager import device_status_manager
+            round_version = await device_status_manager.increment_version(device_id)
+
+            # === Phase 2: ACT ===
+            await self._emit_phase_start(device_id, task.task_id, "act", task.current_step)
+            scheduler_logger.info(
+                f"[CYCLE] dispatching action: device={device_id}, task={task.task_id}, "
+                f"step={task.current_step}, version={round_version}, action={parse_result.action}"
+            )
+            dispatch_result = await self._dispatch_with_retry(task, parse_result.action, reasoning, round_version)
+            result_text = dispatch_result.get("result", "")
+            screenshot_b64 = dispatch_result.get("screenshot") or ""
+
+            if result_text == "_finish_":
+                await self._emit_complete(task, reasoning)
+                return True
+
+            # === Phase 4: OBSERVE ===
+            task.complete_act(result_text)
+            await self._emit_phase_start(device_id, task.task_id, "observe", task.current_step)
+
+            # 广播步骤
+            await self._emit_step(
+                task,
+                reasoning,
+                parse_result.action,
+                result_text,
+                screenshot_b64,
+            )
+
+            # 检查最大步数
+            if task.current_step >= task.max_steps:
+                await self._emit_complete(task, "达到最大步数限制")
+                return True
+
+            # 放回队列继续下一轮
+            task.session_status = SessionStatus.WAIT_FOR_PUSH
+            scheduler_logger.info(
+                f"[CYCLE] cycle completed: device={device_id}, task={task.task_id}, "
+                f"completed_step={task.current_step}, version={round_version}, "
+                f"queue_size={len(self._task_queue)}"
+            )
             self.requeue_task(device_id)
             return False
 
-        # === Phase 2: ACT ===
-        scheduler_logger.debug(f"[CYCLE] device={device_id} ENTER ACT phase, action={action}")
-        result = await task.execute_act(action)
-
-        # ACT 阶段完成记录
-        scheduler_logger.info(f"[ACT] completed: device={device_id}, task={task.task_id}, action={action.get('action')}, result={result[:100] if result else ''}")
-
-        if result == "_finish_":
-            task.status = TaskStatus.COMPLETED
-            scheduler_logger.info(f"[CYCLE] finished (_finish_): device={device_id}, task={task.task_id}, steps={task.current_step}, records={len(task.react_records)}")
-            await self._broadcast_complete(device_id, reasoning)
+        # ==================== 异常处理 ====================
+        except RemoteAPIException as e:
+            scheduler_logger.error(
+                f"[CYCLE] RemoteAPIException: device={device_id}, task={task.task_id}, "
+                f"error_type={e.error_type}, message={e.message}"
+            )
+            await self._emit_failed(task, e.message, e.error_type)
             return True
 
-        # 处理观察超时
-        if result == "_observe_timeout_":
-            await self._handle_observe_timeout(device_id, task)
+        except ActionParseException as e:
+            scheduler_logger.error(
+                f"[CYCLE] ActionParseException: device={device_id}, task={task.task_id}, "
+                f"error_type={e.error_type}, message={e.message}"
+            )
+            await self._emit_failed(task, e.message, e.error_type)
             return True
 
-        task.complete_act(result)
-
-        # 检查是否达到最大步数
-        if task.current_step >= task.max_steps:
-            task.status = TaskStatus.COMPLETED
-            scheduler_logger.info(f"[CYCLE] finished (max_steps): device={device_id}, task={task.task_id}, steps={task.current_step}/{task.max_steps}, records={len(task.react_records)}")
-            await self._broadcast_complete(device_id, "达到最大步数限制")
+        except DeviceStatusException as e:
+            scheduler_logger.error(
+                f"[CYCLE] DeviceStatusException: device={device_id}, task={task.task_id}, "
+                f"error_type={e.error_type}, message={e.message}"
+            )
+            await self._emit_failed(task, e.message, e.error_type)
             return True
 
-        # === Phase 3: OBSERVE (获取截图) ===
-        # 由于截图由Client返回，这里暂时标记等待
-        # TODO: 需要通过WebSocket向Client请求截图
-        scheduler_logger.debug(f"[CYCLE] device={device_id} ENTER OBSERVE phase (placeholder)")
-        task.set_observe("", "等待Client返回截图...")
+        except DispatchException as e:
+            scheduler_logger.error(
+                f"[CYCLE] DispatchException: device={device_id}, task={task.task_id}, "
+                f"error_type={e.error_type}, message={e.message}"
+            )
+            await self._emit_failed(task, e.message, e.error_type)
+            return True
 
-        # 广播进度
-        if task.react_records:
-            await self._broadcast_step(device_id, task.react_records[-1])
+        except ObserveException as e:
+            scheduler_logger.error(
+                f"[CYCLE] ObserveException: device={device_id}, task={task.task_id}, "
+                f"error_type={e.error_type}, message={e.message}"
+            )
+            await self._emit_failed(task, e.message, e.error_type)
+            return True
 
-        # 一轮完成，放回队列
-        scheduler_logger.info(
-            f"[CYCLE] cycle completed: device={device_id}, task={task.task_id}, "
-            f"completed_step={task.current_step}, queue_size={len(self._task_queue)}"
-        )
-        self.requeue_task(device_id)
-        return False
+        except Exception as e:
+            scheduler_logger.error(
+                f"[CYCLE] Unexpected exception: device={device_id}, task={task.task_id}, error={e}",
+                exc_info=True,
+            )
+            await self._emit_failed(task, str(e), ReActErrorType.OBSERVE_ERROR)
+            return True
 
-    async def set_observe_result(self, device_id: str, screenshot: str, observation: str):
-        """设置Observe结果（由设备管理器调用）"""
+    async def set_observe_result(
+        self,
+        device_id: str,
+        screenshot: str,
+        observation: str,
+        *,
+        step_number: Optional[int] = None,
+        round_version: Optional[int] = None,
+        screenshot_path: Optional[str] = None,
+        success: bool = True,
+        error: Optional[str] = None,
+    ):
+        """设置 Observe 结果，允许在 ACT 等待阶段提前写入当前 step。"""
         task = self._device_tasks.get(device_id)
-        if task and task.phase == TaskPhase.OBSERVE:
-            task.set_observe(screenshot, observation)
+        if not task or not task.is_active or not task.react_records:
+            scheduler_logger.info(
+                f"[OBSERVE] skip update: device={device_id}, has_task={bool(task)}, "
+                f"active={task.is_active if task else False}, records={len(task.react_records) if task else 0}, "
+                f"step={step_number}, version={round_version}"
+            )
+            return
+
+        record = None
+        if step_number is not None:
+            for candidate in reversed(task.react_records):
+                if candidate.step_number == step_number:
+                    record = candidate
+                    break
+        if record is None:
+            record = task.react_records[-1]
+
+        if screenshot:
+            record.screenshot = screenshot
+        if observation:
+            record.observation = observation
+        record.success = success and not error
+        task.last_active_at = time.time()
+
+        scheduler_logger.info(
+            f"[OBSERVE] stored result: device={device_id}, task={task.task_id}, "
+            f"step={record.step_number}, version={round_version}, success={record.success}, "
+            f"has_screenshot={bool(screenshot)}, phase={task.phase.value}"
+        )
+
+        try:
+            from src.services.file_storage import file_storage
+            file_storage.append_react_record(device_id, {
+                "step_number": record.step_number,
+                "screenshot": screenshot_path,
+                "observation": observation,
+                "success": record.success,
+                "error": error,
+                "phase": "observe",
+                "version": round_version,
+            })
+        except Exception as e:
+            scheduler_logger.warning(f"[OBSERVE] Failed to save observe record: {e}")
 
     async def interrupt_task(self, device_id: str):
         """中断任务"""
@@ -827,24 +1431,9 @@ class ReActScheduler:
             return
 
         task.status = TaskStatus.INTERRUPTED
+        task.session_status = SessionStatus.FINISHED
 
-        # 更新数据库中的任务状态
-        try:
-            with get_db_session() as db:
-                device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
-                if device:
-                    db_task = db.execute(
-                        select(Task)
-                        .where(Task.device_id == device.id)
-                        .order_by(Task.created_at.desc())
-                    ).scalars().first()
-                    if db_task:
-                        db_task.status = "interrupted"
-                        db_task.finished_at = datetime.now()
-                        scheduler_logger.info(f"[DB] Task {db_task.task_id} marked as interrupted in database")
-        except Exception as e:
-            scheduler_logger.error(f"[DB] Failed to update task status on interrupt: {e}")
-
+        # Cancel pending action
         try:
             from src.services.action_router import action_router
 
@@ -853,7 +1442,34 @@ class ReActScheduler:
         except Exception as e:
             scheduler_logger.warning(f"[INTERRUPT] cancel failed: device={device_id}, task={task.task_id}, error={e}")
 
+        # Clear context from file storage
+        try:
+            from src.services.file_storage import file_storage
+            file_storage.clear_context(device_id)
+        except Exception as e:
+            scheduler_logger.warning(f"[INTERRUPT] Failed to clear context: {e}")
+
+        # 发送中断事件
+        event = ReActTaskEvent(
+            device_id=task.device_id,
+            task_id=task.task_id,
+            status="interrupted",
+            message="Task interrupted by user",
+            final_reasoning=None,
+            error_type=None,
+        )
+        for cb in task.callbacks:
+            try:
+                if hasattr(cb, 'on_task_failed'):
+                    await cb.on_task_failed(event)
+            except Exception as e:
+                scheduler_logger.warning(f"[CALLBACK] on_task_failed error: {e}")
+
         self.remove_task(device_id)
+
+        # 将设备状态重置为 idle
+        from src.services.device_status_manager import device_status_manager
+        await device_status_manager.set_idle(device_id)
 
     async def cleanup_disconnected_device(self, device_id: str) -> bool:
         """设备断开连接后的权威清理。"""
@@ -870,38 +1486,15 @@ class ReActScheduler:
         except Exception as e:
             scheduler_logger.warning(f"[DISCONNECT] cancel failed: device={device_id}, task={active_task_id}, error={e}")
 
-        db_task_updated = False
-        with get_db_session() as db:
-            device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
-            if device:
-                task_row = None
-                if active_task_id:
-                    task_row = db.execute(select(Task).where(Task.task_id == active_task_id)).scalar_one_or_none()
-                if task_row is None and device.current_task_id:
-                    task_row = db.execute(select(Task).where(Task.task_id == device.current_task_id)).scalar_one_or_none()
-
-                if task_row and task_row.status in {"pending", "running"}:
-                    now = datetime.utcnow()
-                    task_row.status = "interrupted"
-                    task_row.finished_at = now
-                    task_row.error_message = "device_disconnected"
-                    task_row.result = {
-                        "success": False,
-                        "error": "device_disconnected",
-                        "message": "Device disconnected during task execution",
-                    }
-                    db_task_updated = True
-
-                device.current_task_id = None
-                device.status = "offline"
-
         if task:
             task.status = TaskStatus.INTERRUPTED
+            task.session_status = SessionStatus.FINISHED
+
         self.remove_task(device_id)
 
-        from src.services.device_status_manager import device_status_manager
-
-        await device_status_manager.set_offline(device_id)
+        # Note: Don't mark device as offline here - let HTTP device_status control the status
+        # The device might be reconnecting via WebSocket. If it actually goes offline,
+        # the offline checker will mark it as offline based on missed heartbeats.
 
         if self._ws_hub:
             await self._ws_hub.broadcast_agent_status(
@@ -912,48 +1505,22 @@ class ReActScheduler:
             )
 
         scheduler_logger.info(
-            f"[DISCONNECT] cleanup completed: device={device_id}, task={active_task_id}, db_task_updated={db_task_updated}"
+            f"[DISCONNECT] cleanup completed: device={device_id}, task={active_task_id}"
         )
-        return bool(active_task_id or db_task_updated)
-
-    async def _handle_observe_timeout(self, device_id: str, task: DeviceTask) -> None:
-        """
-        观察超时的处理策略:
-        1. 检查设备连接状态
-        2. 如果设备离线，标记任务为等待设备状态
-        3. 如果设备在线，尝试重新请求截图
-        """
-        # 检查设备是否仍然连接
-        if self._ws_hub and not self._ws_hub.is_device_connected(device_id):
-            # 设备离线，任务进入等待状态
-            task.status = TaskStatus.WAITING_CONFIRMATION  # 复用等待状态
-            scheduler_logger.info(f"Task {task.task_id} waiting for device {device_id} to reconnect")
-            # 不放回执行队列，等待设备重连
-            if self._ws_hub:
-                await self._ws_hub.broadcast_agent_status(
-                    device_id=device_id,
-                    session_id="",
-                    status="waiting_device",
-                    message=f"设备已离线，等待重连..."
-                )
-        else:
-            # 设备在线但超时，可能是网络抖动，尝试重新获取截图
-            scheduler_logger.warning(f"Observe timeout but device {device_id} still connected, will retry")
-            task.set_observe("", "观察超时，正在重试...")
-            # 重新放回队列尾部，下一轮重新尝试
-            self.requeue_task(device_id)
+        return bool(active_task_id)
 
     async def _broadcast_step(self, device_id: str, step: ReActRecord):
-        """广播步骤完成"""
+        """广播步骤完成（兼容旧接口）"""
         if self._ws_hub:
             await self._ws_hub.broadcast_agent_step(
+                task_id="",
                 device_id=device_id,
                 step=step.__dict__,
                 step_type="agent_step"
             )
 
     async def _broadcast_complete(self, device_id: str, message: str):
-        """广播任务完成"""
+        """广播任务完成（兼容旧接口）"""
         if self._ws_hub:
             await self._ws_hub.broadcast_agent_status(
                 device_id=device_id,
@@ -961,24 +1528,7 @@ class ReActScheduler:
                 message=message
             )
 
-        # 更新数据库中的任务状态
-        try:
-            with get_db_session() as db:
-                device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
-                if device:
-                    task = db.execute(
-                        select(Task)
-                        .where(Task.device_id == device.id)
-                        .order_by(Task.created_at.desc())
-                    ).scalars().first()
-                    if task:
-                        task.status = "completed"
-                        task.finished_at = datetime.now()
-                        scheduler_logger.info(f"[DB] Task {task.task_id} marked as completed in database")
-        except Exception as e:
-            scheduler_logger.error(f"[DB] Failed to update task status: {e}")
-
-        # 从调度器内存中移除任务，确保 get_task() 返回 None
+        # 从调度器内存中移除任务
         self.remove_task(device_id)
         scheduler_logger.info(f"[SCHEDULER] Task removed from memory for device={device_id}")
 

@@ -1,202 +1,56 @@
 """
-Task API routes - Simplified
+Device Sessions API - Simplified
 
 Contains:
-- POST /observe: Receive observe results from clients
-- GET /tasks: List all tasks
-- POST /tasks: Create a new task
-- GET /tasks/{task_id}: Get task details
-- POST /tasks/{task_id}/interrupt: Interrupt a task
+- POST /observe: Receive observe results from clients (refactored)
+- GET /api/v1/devices/{device_id}/session: Get device session from memory
+- GET /api/v1/devices/{device_id}/chat: Get chat history from file storage
+- POST /api/v1/devices/{device_id}/chat: Add chat message to file storage
+- DELETE /api/v1/devices/{device_id}/chat: Clear chat history from file storage
+- GET /api/v1/devices/{device_id}/history: Get ReAct records
+- POST /api/v1/devices/{device_id}/interrupt: Interrupt device task
 """
 
 import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.database import get_db
-from src.models.models import Task, Device, Client, TaskStep, ChatMessage
+from src.models.models import Device
 from src.schemas.schemas import (
     ApiResponse,
     DeviceChatHistoryResponse,
     DeviceTaskSessionResponse,
     ObserveResultMessage,
-    TaskCreate,
-    TaskResponse,
-    TaskDetailResponse,
-    TaskListResponse,
-    TaskStepResponse,
 )
 from src.logging_config import get_api_logger, get_network_logger
 from src.services.react_scheduler import scheduler
 from src.services.device_status_manager import device_status_manager
+from src.services.file_storage import file_storage
 import structlog
 
 api_logger = get_api_logger()
 network_logger = get_network_logger()
 logger = structlog.get_logger()
-router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
+router = APIRouter(prefix="/api/v1", tags=["device_sessions"])
 
 
-def _get_latest_screenshot(task: Optional[Task], steps: list[TaskStep]) -> Optional[str]:
-    for step in reversed(steps):
-        if step.screenshot_url:
-            return step.screenshot_url
-
-    if task and isinstance(task.result, dict):
-        final_screenshot = task.result.get("final_screenshot")
-        if isinstance(final_screenshot, str) and final_screenshot:
-            return final_screenshot
-
-    return None
-
-
-def _build_synthesized_chat_history(task: Optional[Task], steps: list[TaskStep]) -> list[ChatMessage]:
-    messages: list[ChatMessage] = []
-    if not task:
-        return messages
-
-    messages.append(
-        ChatMessage(
-            id=f"{task.task_id}_user",
-            device_id=task.device_id,
-            role="user",
-            content=task.instruction,
-            created_at=task.created_at,
-        )
-    )
-
-    for step in steps:
-        if step.error:
-            content = f"步骤 {step.step_number} 失败: {step.error}"
-        else:
-            action_type = step.action_type or "observe"
-            params = step.action_params or {}
-            content = (
-                f"步骤 {step.step_number}: {action_type} - {params}"
-                if params else f"步骤 {step.step_number}: {action_type}"
-            )
-
-        messages.append(
-            ChatMessage(
-                id=step.id,
-                device_id=task.device_id,
-                role="agent",
-                content=content,
-                thinking=step.thinking,
-                action_type=step.action_type,
-                action_params=step.action_params,
-                screenshot_path=step.screenshot_url,
-                created_at=step.created_at,
-            )
-        )
-
-    final_message = None
-    if task.status == "completed":
-        result = task.result if isinstance(task.result, dict) else {}
-        final_message = result.get("finish_message") or result.get("message") or "任务已完成"
-    elif task.status == "failed":
-        result = task.result if isinstance(task.result, dict) else {}
-        final_message = result.get("error") or result.get("message") or task.error_message or "任务执行失败"
-    elif task.status == "interrupted":
-        result = task.result if isinstance(task.result, dict) else {}
-        final_message = result.get("message") or task.error_message or "任务已中断"
-
-    if final_message:
-        messages.append(
-            ChatMessage(
-                id=f"{task.task_id}_final_{task.status}",
-                device_id=task.device_id,
-                role="agent",
-                content=final_message,
-                screenshot_path=_get_latest_screenshot(task, steps),
-                created_at=task.finished_at or task.started_at or task.created_at,
-            )
-        )
-
-    return messages
-
-
-def _resolve_task_for_device(db: Session, device: Device) -> Optional[Task]:
-    active_scheduler_task = scheduler.get_task(device.device_id)
-    active_task_id = (
-        active_scheduler_task.task_id if active_scheduler_task and active_scheduler_task.is_active else None
-    )
-
-    if active_task_id:
-        task = db.execute(select(Task).where(Task.task_id == active_task_id)).scalar_one_or_none()
-        if task:
-            return task
-
-    return db.execute(
-        select(Task)
-        .where(Task.device_id == device.id)
-        .order_by(Task.created_at.desc())
-    ).scalars().first()
-
-
-def _get_task_steps(db: Session, task: Optional[Task]) -> list[TaskStep]:
-    if task is None:
-        return []
-
-    return db.execute(
-        select(TaskStep).where(TaskStep.task_id == task.id).order_by(TaskStep.step_number)
-    ).scalars().all()
-
-
-def _build_chat_message_response(message: ChatMessage):
+def _build_chat_message_response(message: dict):
     return {
-        "id": message.id,
-        "role": message.role,
-        "content": message.content,
-        "thinking": message.thinking,
-        "action_type": message.action_type,
-        "action_params": message.action_params,
-        "screenshot_path": message.screenshot_path,
-        "created_at": message.created_at,
+        "id": message.get("id", ""),
+        "role": message.get("role", ""),
+        "content": message.get("content", ""),
+        "thinking": message.get("thinking"),
+        "action_type": message.get("action_type"),
+        "action_params": message.get("action_params"),
+        "screenshot_path": message.get("screenshot_path"),
+        "created_at": message.get("created_at"),
     }
-
-
-def _upsert_task_step_from_observe(
-    db: Session,
-    task_row: Task,
-    *,
-    step_number: int,
-    screenshot: Optional[str],
-    success: bool,
-    error: Optional[str],
-):
-    if step_number <= 0:
-        return
-
-    step = db.execute(
-        select(TaskStep).where(
-            TaskStep.task_id == task_row.id,
-            TaskStep.step_number == step_number,
-        )
-    ).scalar_one_or_none()
-
-    if step is None:
-        step = TaskStep(
-            task_id=task_row.id,
-            device_id=task_row.device_id,
-            step_number=step_number,
-            action_type="",
-            action_params={},
-            thinking="",
-            success=success,
-            error=error,
-            screenshot_url=screenshot,
-        )
-        db.add(step)
-        return
-
-    step.success = success
-    step.error = error
-    step.screenshot_url = screenshot
 
 
 @router.post("/observe", response_model=ApiResponse)
@@ -236,38 +90,46 @@ async def handle_observe_result_http(message: dict, db: Session) -> dict:
         f"step={step_number}, version={round_version}, success={success}"
     )
 
-    task_row = db.execute(select(Task).where(Task.task_id == task_id)).scalar_one_or_none()
-    if task_row:
-        if task_row.started_at is None:
-            task_row.started_at = datetime.utcnow()
+    screenshot_path = None
 
-        _upsert_task_step_from_observe(
-            db,
-            task_row,
-            step_number=step_number or 0,
-            screenshot=screenshot,
+    # Save screenshot to file storage if provided
+    if screenshot and device_id and step_number is not None:
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            screenshot_path = file_storage.save_screenshot(device_id, step_number, ts, screenshot)
+            api_logger.info(f"[observe_result] Screenshot saved: {screenshot_path}")
+        except Exception as e:
+            api_logger.error(f"[observe_result] Failed to save screenshot: {e}")
+
+    if device_id:
+        try:
+            file_storage.append_adb_log(device_id, {
+                "type": "observe_result",
+                "task_id": task_id,
+                "step_number": step_number,
+                "version": round_version,
+                "success": success,
+                "error": error,
+                "result": result,
+                "screenshot": screenshot_path,
+            })
+        except Exception as e:
+            api_logger.error(f"[observe_result] Failed to append adb log: {e}")
+
+    # Update scheduler with observe result
+    if device_id:
+        await scheduler.set_observe_result(
+            device_id,
+            screenshot or "",
+            result or error or "",
+            step_number=step_number,
+            round_version=round_version,
+            screenshot_path=screenshot_path,
             success=success,
             error=error,
         )
 
-        if (step_number or 0) > 0:
-            task_row.current_step = max(task_row.current_step or 0, step_number)
-
-        if success:
-            if task_row.status not in {"completed", "failed", "interrupted"}:
-                task_row.status = "running"
-        else:
-            task_row.status = "failed"
-            task_row.error_message = error or result or "observe_error"
-            task_row.finished_at = datetime.utcnow()
-            task_row.result = {
-                "success": False,
-                "error": error,
-                "result": result,
-                "version": round_version,
-                "step_number": step_number,
-            }
-
+    # Let action router handle the observe result
     handled = False
     if action_router and round_version is not None and device_id:
         handled = await action_router.handle_observe_result(
@@ -277,202 +139,10 @@ async def handle_observe_result_http(message: dict, db: Session) -> dict:
             }
         )
 
-    if screenshot and device_id:
-        await scheduler.set_observe_result(device_id, screenshot, result or "")
-        scheduler.requeue_task(device_id)
-        handled = True
-
-    db.commit()
-
     return {
         "success": True,
         "message": "Observe result received" if handled else "Observe result recorded",
     }
-
-
-@router.post("", response_model=TaskResponse)
-async def create_task(
-    task_data: TaskCreate,
-    db: Session = Depends(get_db),
-):
-    device_id = task_data.device_id
-    platform = task_data.platform
-
-    device = None
-    if device_id:
-        device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
-    elif platform:
-        devices_with_platform = db.execute(
-            select(Device).where(Device.platform == platform)
-        ).scalars().all()
-        for d in devices_with_platform:
-            if await device_status_manager.is_device_ok(d.device_id):
-                device = d
-                break
-
-    if not device:
-        raise HTTPException(status_code=404, detail="No available device found")
-
-    client = db.execute(select(Client).where(Client.id == device.client_id)).scalar_one_or_none()
-    if not client:
-        raise HTTPException(status_code=404, detail="Client not found")
-
-    task_id = f"task_{uuid.uuid4().hex[:12]}"
-    acquired = await device_status_manager.try_acquire_task(device.device_id, task_id)
-    if not acquired:
-        memory_entry = await device_status_manager.get_entry(device.device_id)
-        current_status = memory_entry.status.value if memory_entry else "unknown"
-        raise HTTPException(
-            status_code=400,
-            detail=f"Device {device.device_id} is not available (status: {current_status})",
-        )
-
-    try:
-        new_task = Task(
-            task_id=task_id,
-            device_id=device.id,
-            client_id=client.id,
-            instruction=task_data.instruction,
-            mode=task_data.mode,
-            max_steps=task_data.max_steps,
-            priority=task_data.priority,
-            status="pending",
-        )
-        db.add(new_task)
-        db.flush()
-
-        scheduler.submit_task(
-            device_id=device.device_id,
-            task_id=task_id,
-            instruction=task_data.instruction,
-            mode=task_data.mode,
-            max_steps=task_data.max_steps,
-        )
-
-        db.commit()
-        db.refresh(new_task)
-    except Exception:
-        await device_status_manager.set_idle(device.device_id)
-        db.rollback()
-        raise
-
-    api_logger.info(f"[create_task] Task created - task_id={task_id}, device_id={device.device_id}")
-
-    return TaskResponse(
-        id=new_task.id,
-        task_id=new_task.task_id,
-        device_id=device.device_id,
-        instruction=new_task.instruction,
-        status=new_task.status,
-        mode=new_task.mode,
-        max_steps=new_task.max_steps,
-        current_step=new_task.current_step,
-        created_at=new_task.created_at,
-        started_at=new_task.started_at,
-        finished_at=new_task.finished_at,
-        result=new_task.result,
-    )
-
-
-@router.get("", response_model=TaskListResponse)
-async def list_tasks(
-    status: Optional[str] = None,
-    device_id: Optional[str] = None,
-    limit: int = 100,
-    offset: int = 0,
-    db: Session = Depends(get_db),
-):
-    query = select(Task)
-
-    if status:
-        query = query.where(Task.status == status)
-
-    if device_id:
-        device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
-        if device:
-            query = query.where(Task.device_id == device.id)
-        else:
-            return TaskListResponse(tasks=[], total=0)
-
-    query = query.order_by(Task.created_at.desc())
-    total = len(db.execute(query).scalars().all())
-    query = query.limit(limit).offset(offset)
-    tasks = db.execute(query).scalars().all()
-
-    task_list = []
-    for task in tasks:
-        device = db.execute(select(Device).where(Device.id == task.device_id)).scalar_one_or_none()
-        device_id_str = device.device_id if device else ""
-
-        task_list.append(
-            TaskResponse(
-                id=task.id,
-                task_id=task.task_id,
-                device_id=device_id_str,
-                instruction=task.instruction,
-                status=task.status,
-                mode=task.mode,
-                max_steps=task.max_steps,
-                current_step=task.current_step,
-                created_at=task.created_at,
-                started_at=task.started_at,
-                finished_at=task.finished_at,
-                result=task.result,
-            )
-        )
-
-    return TaskListResponse(tasks=task_list, total=total)
-
-
-@router.get("/{task_id}", response_model=TaskDetailResponse)
-async def get_task(
-    task_id: str,
-    db: Session = Depends(get_db),
-):
-    task = db.execute(select(Task).where(Task.task_id == task_id)).scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    device = db.execute(select(Device).where(Device.id == task.device_id)).scalar_one_or_none()
-    device_id_str = device.device_id if device else ""
-
-    steps = db.execute(
-        select(TaskStep).where(TaskStep.task_id == task.id).order_by(TaskStep.step_number)
-    ).scalars().all()
-
-    from src.schemas.schemas import TaskStepResponse
-
-    step_responses = [
-        TaskStepResponse(
-            id=step.id,
-            step_number=step.step_number,
-            action_type=step.action_type,
-            action_params=step.action_params,
-            thinking=step.thinking,
-            duration_ms=step.duration_ms,
-            success=step.success,
-            error=step.error,
-            screenshot_url=step.screenshot_url,
-            created_at=step.created_at,
-        )
-        for step in steps
-    ]
-
-    return TaskDetailResponse(
-        id=task.id,
-        task_id=task.task_id,
-        device_id=device_id_str,
-        instruction=task.instruction,
-        status=task.status,
-        mode=task.mode,
-        max_steps=task.max_steps,
-        current_step=task.current_step,
-        created_at=task.created_at,
-        started_at=task.started_at,
-        finished_at=task.finished_at,
-        result=task.result,
-        steps=step_responses,
-    )
 
 
 @router.get("/devices/{device_id}/session", response_model=DeviceTaskSessionResponse)
@@ -480,40 +150,49 @@ async def get_device_task_session(
     device_id: str,
     db: Session = Depends(get_db),
 ):
+    """Get device task session from memory (scheduler)"""
     device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    task = _resolve_task_for_device(db, device)
-    steps = _get_task_steps(db, task)
+    # Get active task from scheduler
+    active_task = scheduler.get_task(device_id)
 
-    persisted_messages = db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.device_id == device.id)
-        .order_by(ChatMessage.created_at.asc())
-    ).scalars().all()
+    if active_task and active_task.is_active:
+        # Load chat history from file storage
+        chat_history = file_storage.load_chat_history(device_id)
+        latest_screenshot = None
 
-    chat_history = persisted_messages or _build_synthesized_chat_history(task, steps)
-    active_scheduler_task = scheduler.get_task(device.device_id)
-    has_active_task = bool(active_scheduler_task and active_scheduler_task.is_active)
+        # Get latest screenshot
+        screenshots = file_storage.get_screenshots(device_id)
+        if screenshots:
+            latest_screenshot = f"screenshots/{screenshots[-1]}"
 
-    latest_error_reason = None
-    if task:
-        if isinstance(task.result, dict):
-            latest_error_reason = task.result.get("error") or task.result.get("message")
-        latest_error_reason = latest_error_reason or task.error_message
+        return DeviceTaskSessionResponse(
+            device_id=device_id,
+            task_id=active_task.task_id,
+            status=active_task.status.value,
+            instruction=active_task.instruction,
+            current_step=active_task.current_step,
+            max_steps=active_task.max_steps,
+            latest_screenshot=latest_screenshot,
+            interruptible=True,
+            latest_error_reason=None,
+            chat_history=[_build_chat_message_response(msg) for msg in chat_history[-50:]],
+        )
 
+    # No active task, return idle state
     return DeviceTaskSessionResponse(
-        device_id=device.device_id,
-        task_id=task.task_id if task else None,
-        status=task.status if task else None,
-        instruction=task.instruction if task else None,
-        current_step=task.current_step if task else 0,
-        max_steps=task.max_steps if task else 0,
-        latest_screenshot=_get_latest_screenshot(task, steps),
-        interruptible=has_active_task,
-        latest_error_reason=latest_error_reason,
-        chat_history=[_build_chat_message_response(message) for message in chat_history],
+        device_id=device_id,
+        task_id=None,
+        status="idle",
+        instruction=None,
+        current_step=0,
+        max_steps=0,
+        latest_screenshot=None,
+        interruptible=False,
+        latest_error_reason=None,
+        chat_history=[],
     )
 
 
@@ -521,65 +200,22 @@ async def get_device_task_session(
 async def get_device_chat_history(
     device_id: str,
     limit: int = 50,
-    task_id: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
+    """Get chat history from file storage"""
     device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    task = None
-    if task_id:
-        task = db.execute(select(Task).where(Task.task_id == task_id)).scalar_one_or_none()
-    else:
-        task = _resolve_task_for_device(db, device)
-
-    persisted_messages = db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.device_id == device.id)
-        .order_by(ChatMessage.created_at.asc())
-    ).scalars().all()
-
-    if persisted_messages:
-        messages = persisted_messages[-max(limit, 1):]
-        total = len(persisted_messages)
-    else:
-        synthesized_messages = _build_synthesized_chat_history(task, _get_task_steps(db, task))
-        total = len(synthesized_messages)
-        messages = synthesized_messages[-max(limit, 1):]
+    messages = file_storage.load_chat_history(device_id)
+    total = len(messages)
+    messages = messages[-max(limit, 1):]
 
     return DeviceChatHistoryResponse(
-        device_id=device.device_id,
-        task_id=task.task_id if task else None,
+        device_id=device_id,
+        task_id=None,
         messages=[_build_chat_message_response(message) for message in messages],
         total=total,
-    )
-
-
-@router.post("/{task_id}/interrupt", response_model=ApiResponse)
-async def interrupt_task(
-    task_id: str,
-    db: Session = Depends(get_db),
-):
-    task = db.execute(select(Task).where(Task.task_id == task_id)).scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    device = db.execute(select(Device).where(Device.id == task.device_id)).scalar_one_or_none()
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
-
-    task.status = "interrupted"
-    task.finished_at = datetime.utcnow()
-    task.error_message = task.error_message or "user_interrupted"
-    db.commit()
-
-    api_logger.info(f"[interrupt_task] Task interrupted - task_id={task_id}")
-    await scheduler.interrupt_task(device.device_id)
-
-    return ApiResponse(
-        success=True,
-        message=f"Task {task_id} interrupted",
     )
 
 
@@ -589,27 +225,28 @@ async def add_chat_message(
     payload: dict,
     db: Session = Depends(get_db),
 ):
+    """Add a chat message to file storage"""
     device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    message = ChatMessage(
-        device_id=device.id,
-        role=payload.get("role", "agent"),
-        content=payload.get("content", ""),
-        thinking=payload.get("thinking"),
-        action_type=payload.get("action_type"),
-        action_params=payload.get("action_params"),
-        screenshot_path=payload.get("screenshot_path"),
-    )
-    db.add(message)
-    db.commit()
-    db.refresh(message)
+    message = {
+        "id": f"msg_{uuid.uuid4().hex[:12]}",
+        "role": payload.get("role", "agent"),
+        "content": payload.get("content", ""),
+        "thinking": payload.get("thinking"),
+        "action_type": payload.get("action_type"),
+        "action_params": payload.get("action_params"),
+        "screenshot_path": payload.get("screenshot_path"),
+        "created_at": datetime.now().isoformat(),
+    }
+
+    file_storage.append_chat_message(device_id, message)
 
     return ApiResponse(
         success=True,
         message="Chat message stored",
-        data={"id": message.id, "created_at": message.created_at},
+        data={"id": message["id"], "created_at": message["created_at"]},
     )
 
 
@@ -618,14 +255,166 @@ async def clear_device_chat_history(
     device_id: str,
     db: Session = Depends(get_db),
 ):
+    """Clear chat history from file storage"""
     device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    messages = db.execute(select(ChatMessage).where(ChatMessage.device_id == device.id)).scalars().all()
-    for message in messages:
-        db.delete(message)
-    db.commit()
+    file_storage.save_chat_history(device_id, [])
 
     return ApiResponse(success=True, message="Chat history cleared")
 
+
+@router.get("/devices/{device_id}/history")
+async def get_device_history(
+    device_id: str,
+    db: Session = Depends(get_db),
+):
+    """Get ReAct records and react history for a device"""
+    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    react_records = file_storage.get_react_records(device_id)
+    chat_history = file_storage.load_chat_history(device_id)
+    screenshots = file_storage.get_screenshots(device_id)
+
+    return {
+        "device_id": device_id,
+        "react_records": react_records,
+        "chat_history": chat_history,
+        "screenshots": screenshots,
+    }
+
+
+@router.get("/devices/{device_id}/artifacts")
+async def get_device_artifacts(
+    device_id: str,
+    db: Session = Depends(get_db),
+):
+    """List archived artifact files for a device."""
+    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    latest_screenshot = file_storage.get_latest_screenshot_path(device_id)
+    latest_log = file_storage.get_log_file_path(device_id)
+    react_records_file = file_storage.get_react_records_file_path(device_id)
+    chat_history_file = file_storage.get_chat_history_file_path(device_id)
+
+    return {
+        "device_id": device_id,
+        "screenshots": file_storage.get_screenshots(device_id),
+        "latest_screenshot": latest_screenshot.name if latest_screenshot else None,
+        "latest_screenshot_download": f"/api/v1/devices/{device_id}/artifacts/screenshot/latest" if latest_screenshot else None,
+        "latest_log_download": f"/api/v1/devices/{device_id}/artifacts/logs/latest" if latest_log else None,
+        "react_records_download": f"/api/v1/devices/{device_id}/artifacts/react-records" if react_records_file else None,
+        "chat_history_download": f"/api/v1/devices/{device_id}/artifacts/chat-history" if chat_history_file else None,
+    }
+
+
+@router.get("/devices/{device_id}/artifacts/file")
+async def download_device_artifact_file(
+    device_id: str,
+    path: str = Query(..., description="Relative device artifact path, e.g. screenshots/step_1_xxx.png"),
+    db: Session = Depends(get_db),
+):
+    """Download a device artifact file by relative path."""
+    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    artifact_path = file_storage.get_device_file(device_id, path)
+    if not artifact_path.exists() or not artifact_path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    return FileResponse(artifact_path, filename=artifact_path.name)
+
+
+@router.get("/devices/{device_id}/artifacts/screenshot/latest")
+async def download_latest_screenshot(
+    device_id: str,
+    db: Session = Depends(get_db),
+):
+    """Download the latest screenshot for a device."""
+    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    path = file_storage.get_latest_screenshot_path(device_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Latest screenshot not found")
+    return FileResponse(path, filename=path.name)
+
+
+@router.get("/devices/{device_id}/artifacts/logs/latest")
+async def download_latest_log(
+    device_id: str,
+    db: Session = Depends(get_db),
+):
+    """Download the latest adb log jsonl file for a device."""
+    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    path = file_storage.get_log_file_path(device_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Latest log not found")
+    return FileResponse(path, filename=path.name, media_type="application/json")
+
+
+@router.get("/devices/{device_id}/artifacts/react-records")
+async def download_react_records(
+    device_id: str,
+    db: Session = Depends(get_db),
+):
+    """Download react_records.jsonl for a device."""
+    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    path = file_storage.get_react_records_file_path(device_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="react_records.jsonl not found")
+    return FileResponse(path, filename=path.name, media_type="application/json")
+
+
+@router.get("/devices/{device_id}/artifacts/chat-history")
+async def download_chat_history(
+    device_id: str,
+    db: Session = Depends(get_db),
+):
+    """Download chat_history.json for a device."""
+    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    path = file_storage.get_chat_history_file_path(device_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="chat_history.json not found")
+    return FileResponse(path, filename=path.name, media_type="application/json")
+
+
+@router.post("/devices/{device_id}/interrupt", response_model=ApiResponse)
+async def interrupt_device_task(
+    device_id: str,
+    db: Session = Depends(get_db),
+):
+    """Interrupt the active task on a device"""
+    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    active_task = scheduler.get_task(device_id)
+    task_id = active_task.task_id if active_task else None
+
+    await scheduler.interrupt_task(device_id)
+    await device_status_manager.set_idle(device_id)
+
+    api_logger.info(f"[interrupt_device] Task interrupted - device_id={device_id}, task_id={task_id}")
+
+    return ApiResponse(
+        success=True,
+        message=f"Task on device {device_id} interrupted",
+        data={"device_id": device_id, "task_id": task_id},
+    )

@@ -147,7 +147,7 @@ class WebSocketHub:
 
         try:
             await self.connections[connection_id].send_json(message)
-            logger.debug(f"[ws_send_to_device] Message sent to device {device_id}: type={msg_type}")
+            logger.info(f"[ws_send_to_device] Message sent to device {device_id}: type={msg_type}, conn={connection_id}")
             return True
         except Exception as e:
             logger.error(f"[ws_send_to_device] Failed to send to device {device_id}: {e}", error=str(e), device_id=device_id, msg_type=msg_type)
@@ -201,6 +201,12 @@ class WebSocketHub:
             connection_id=connection_id,
             capabilities=capabilities,
         )
+
+        # Also update device_status_manager to set device as idle
+        if device_id:
+            from src.services.device_status_manager import device_status_manager
+            # Schedule async update to avoid blocking
+            asyncio.create_task(device_status_manager.set_idle(device_id))
 
     def unregister_device(self, device_id: str):
         """

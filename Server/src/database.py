@@ -66,7 +66,7 @@ event.listen(engine, "after_cursor_execute", _after_cursor_execute)
 def init_db() -> None:
     """Initialize database tables"""
     # Import models to register them with Base
-    from src.models.models import Client, Device, Task, TaskStep, Screenshot, LogEntry, ChatMessage, PendingDevice
+    from src.models.models import Client, Device, PendingDevice
     Base.metadata.create_all(bind=engine)
     if db_logger:
         db_logger.info("[db_init] Database tables initialized")

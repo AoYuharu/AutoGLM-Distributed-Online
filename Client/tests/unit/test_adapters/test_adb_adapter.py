@@ -266,6 +266,79 @@ class TestADBAdapterActions:
         assert result.should_finish is True
         assert result.message == "任务完成"
 
+    def test_execute_tap_action_with_top_level_coordinates(self):
+        """执行服务端 x/y 坐标 payload"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, 'tap') as mock_tap:
+            mock_tap.return_value = None
+            result = adapter.execute_action({
+                "action": "tap",
+                "x": 165,
+                "y": 495,
+            })
+
+            mock_tap.assert_called_once_with(165, 495)
+            assert result.success is True
+            assert result.should_finish is False
+
+    def test_execute_long_press_with_top_level_coordinates(self):
+        """执行服务端 x/y 长按 payload"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, 'long_press') as mock_long_press:
+            mock_long_press.return_value = None
+            result = adapter.execute_action({
+                "action": "long_press",
+                "x": 100,
+                "y": 200,
+                "duration": 1500,
+            })
+
+            mock_long_press.assert_called_once_with(100, 200, 1500)
+            assert result.success is True
+
+    def test_execute_wait_action_with_numeric_duration(self):
+        """执行服务端数值 wait payload"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch('src.adapters.adb_adapter.time.sleep') as mock_sleep:
+            result = adapter.execute_action({
+                "action": "wait",
+                "duration": 1,
+            })
+
+            mock_sleep.assert_called_once_with(1.0)
+            assert result.success is True
+            assert result.should_finish is False
+
+    def test_execute_swipe_action_with_top_level_coordinates(self):
+        """执行服务端 x1/y1/x2/y2 滑动 payload"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, 'swipe') as mock_swipe:
+            mock_swipe.return_value = None
+            result = adapter.execute_action({
+                "action": "swipe",
+                "x1": 499,
+                "y1": 799,
+                "x2": 499,
+                "y2": 350,
+                "duration": 500,
+            })
+
+            mock_swipe.assert_called_once_with(499, 799, 499, 350, 500)
+            assert result.success is True
+            assert result.should_finish is False
+
     def test_execute_unknown_action_returns_error(self):
         """未知动作返回错误"""
         from src.adapters.adb_adapter import ADBAdapter

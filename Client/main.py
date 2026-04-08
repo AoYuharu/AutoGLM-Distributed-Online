@@ -135,6 +135,33 @@ class DistributedClient:
                 asyncio.run(coro)
             threading.Thread(target=run_async, daemon=True).start()
 
+    async def _reconnect_websocket_with_device_id(self, device_id: str) -> None:
+        """使用真实的 device_id 重新连接 WebSocket"""
+        if not self.ws_client:
+            return
+
+        logger.info(f"Reconnecting WebSocket with device_id={device_id}")
+
+        # 断开旧连接
+        await self.ws_client.disconnect()
+
+        # 创建新的 WebSocket 客户端，使用真实的 device_id
+        self.ws_client = WebSocketClient(
+            server_url=self.server_url,
+            client_id=self.client_id,
+            device_id=device_id,
+            on_message=self._on_ws_message,
+            on_connect=self._on_ws_connect,
+            on_disconnect=self._on_ws_disconnect,
+        )
+
+        # 连接
+        connected = await self.ws_client.connect()
+        if connected:
+            logger.info(f"WebSocket reconnected with device_id={device_id}")
+        else:
+            logger.error(f"Failed to reconnect WebSocket with device_id={device_id}")
+
     # === 设备管理 ===
 
     def _on_device_found(self, device_id: str, device_info: dict) -> None:
@@ -159,6 +186,12 @@ class DistributedClient:
         self.device_adapters[device_id] = adapter
         logger.info(f"Device found: {device_id} ({platform})")
         self.logger.log_device_connected(device_id, platform)
+
+        # 如果 WebSocket 使用的 device_id 是 client_id（而非真实设备ID），则重新连接
+        # 这发生在首次启动时，WebSocket 在设备被发现前就连接了
+        if self.ws_client and self.ws_client.device_id == self.client_id:
+            logger.info(f"WebSocket using fallback device_id={self.client_id}, reconnecting with real device_id={device_id}")
+            self._schedule_async(self._reconnect_websocket_with_device_id(device_id))
 
     def _on_device_lost(self, device_id: str) -> None:
         """设备丢失回调"""
@@ -229,14 +262,22 @@ class DistributedClient:
             round_version = int(version) if str(version).isdigit() else None
 
             if round_version is None:
-                logger.warning(f"Ignoring action_cmd without numeric version: task_id={task_id}, version={version}")
+                logger.warning(f"Ignoring action_cmd without numeric version: task_id={task_id}, device_id={device_id}, step={step_number}, version={version}")
                 return
+
+            logger.info(
+                f"Received action_cmd: task_id={task_id}, device_id={device_id}, step={step_number}, "
+                f"version={round_version}, action={action.get('action')}"
+            )
 
             version_key = f"{device_id}:{round_version}"
 
             # 幂等性检查：已执行的 version 直接返回 ack
             if version_key in self._executed_versions:
-                logger.info(f"Duplicate action_cmd ignored: version={round_version}, task_id={task_id}")
+                logger.info(
+                    f"Duplicate action_cmd ignored: task_id={task_id}, device_id={device_id}, "
+                    f"step={step_number}, version={round_version}"
+                )
                 await self._send_ack(
                     ref_msg_id=msg_id,
                     accepted=True,
@@ -264,6 +305,10 @@ class DistributedClient:
                 device_id=device_id,
                 version=round_version,
             )
+            logger.info(
+                f"ACK sent: ref_msg_id={msg_id}, task_id={task_id}, device_id={device_id}, "
+                f"step={step_number}, version={round_version}, accepted=True"
+            )
 
             # 记录版本
             self._executed_versions.add(version_key)
@@ -279,6 +324,10 @@ class DistributedClient:
             adapter = self.device_adapters[device_id]
             try:
                 result = adapter.execute_action(action)
+                logger.info(
+                    f"Action execution finished: task_id={task_id}, device_id={device_id}, "
+                    f"step={step_number}, version={round_version}, result={str(result)[:200]}"
+                )
                 screenshot = adapter.get_screenshot()
 
                 # 发送 observe_result
@@ -288,7 +337,8 @@ class DistributedClient:
                     step_number=step_number,
                     screenshot=base64.b64encode(screenshot).decode() if screenshot else None,
                     result=str(result),
-                    success=True,
+                    success=result.success,
+                    error=None if result.success else result.message,
                     version=round_version,
                 )
             except Exception as e:
@@ -343,6 +393,9 @@ class DistributedClient:
     ) -> None:
         """发送 ACK via WebSocket"""
         if self.ws_client and self.ws_client.is_connected:
+            logger.info(
+                f"Preparing ACK: ref_msg_id={ref_msg_id}, device_id={device_id}, version={version}, accepted={accepted}"
+            )
             ack = AckMessage.create(
                 ref_msg_id=ref_msg_id,
                 accepted=accepted,
@@ -367,6 +420,10 @@ class DistributedClient:
     ) -> None:
         """发送观察结果 via HTTP"""
         if self.http_client:
+            logger.info(
+                f"Sending observe_result: task_id={task_id}, device_id={device_id}, "
+                f"step={step_number}, version={version}, success={success}, has_screenshot={bool(screenshot)}"
+            )
             await self.http_client.send_observe_result(
                 task_id=task_id,
                 device_id=device_id,

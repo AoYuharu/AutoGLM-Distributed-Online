@@ -428,41 +428,66 @@ class ADBAdapter(DeviceAdapterBase):
                 message=f"Action failed: {e}"
             )
 
+    def _resolve_point(self, action: dict) -> Optional[dict]:
+        """解析点击类动作坐标，兼容 element 和顶层 x/y。"""
+        element = action.get("element")
+        if element:
+            return element
+
+        if "x" in action and "y" in action:
+            return {"x": action.get("x"), "y": action.get("y")}
+
+        return None
+
+    def _resolve_swipe_points(self, action: dict) -> tuple[Optional[dict], Optional[dict]]:
+        """解析滑动坐标，兼容 start/end 和顶层 x1/y1/x2/y2。"""
+        start = action.get("start")
+        end = action.get("end")
+        if start and end:
+            return start, end
+
+        if all(key in action for key in ("x1", "y1", "x2", "y2")):
+            return (
+                {"x": action.get("x1"), "y": action.get("y1")},
+                {"x": action.get("x2"), "y": action.get("y2")},
+            )
+
+        return None, None
+
     def _handle_tap(self, action: dict) -> ActionResult:
         """处理点击"""
-        element = action.get("element")
-        if not element:
+        point = self._resolve_point(action)
+        if not point:
             return ActionResult(False, False, "No element coordinates")
 
-        x, y = self._convert_coords(element)
+        x, y = self._convert_coords(point)
         self.tap(x, y)
         return ActionResult(True, False)
 
     def _handle_double_tap(self, action: dict) -> ActionResult:
         """处理双击"""
-        element = action.get("element")
-        if not element:
+        point = self._resolve_point(action)
+        if not point:
             return ActionResult(False, False, "No element coordinates")
 
-        x, y = self._convert_coords(element)
+        x, y = self._convert_coords(point)
         self.double_tap(x, y)
         return ActionResult(True, False)
 
     def _handle_long_press(self, action: dict) -> ActionResult:
         """处理长按"""
-        element = action.get("element")
-        if not element:
+        point = self._resolve_point(action)
+        if not point:
             return ActionResult(False, False, "No element coordinates")
 
-        x, y = self._convert_coords(element)
+        x, y = self._convert_coords(point)
         duration = action.get("duration", 3000)
         self.long_press(x, y, duration)
         return ActionResult(True, False)
 
     def _handle_swipe(self, action: dict) -> ActionResult:
         """处理滑动"""
-        start = action.get("start")
-        end = action.get("end")
+        start, end = self._resolve_swipe_points(action)
         if not start or not end:
             return ActionResult(False, False, "Missing swipe coordinates")
 
@@ -502,7 +527,11 @@ class ADBAdapter(DeviceAdapterBase):
 
     def _handle_wait(self, action: dict) -> ActionResult:
         """处理等待"""
-        duration = float(action.get("duration", "1").replace("seconds", "").strip())
+        raw_duration = action.get("duration", 1)
+        if isinstance(raw_duration, str):
+            duration = float(raw_duration.replace("seconds", "").strip())
+        else:
+            duration = float(raw_duration)
         time.sleep(duration)
         return ActionResult(True, False)
 

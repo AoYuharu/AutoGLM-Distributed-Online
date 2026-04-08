@@ -19,7 +19,7 @@ logger = structlog.get_logger()
 class DeviceStatus(str, Enum):
     """Device status enum"""
 
-    OK = "idle"
+    IDLE = "idle"
     BUSY = "busy"
     OFFLINE = "offline"
     ERROR = "error"
@@ -122,8 +122,10 @@ class DeviceStatusManager:
             if entry is None:
                 entry = DeviceStatusEntry(device_id=device_id, status=DeviceStatus.OFFLINE)
                 self._devices[device_id] = entry
+                logger.info(f"[try_acquire] Created new entry with OFFLINE for {device_id}")
 
-            if entry.status != DeviceStatus.OK or entry.current_task_id:
+            if entry.status != DeviceStatus.IDLE or entry.current_task_id:
+                logger.info(f"[try_acquire] Failed for {device_id}: status={entry.status}, current_task_id={entry.current_task_id}")
                 return False
 
             entry.status = DeviceStatus.BUSY
@@ -133,7 +135,7 @@ class DeviceStatusManager:
             return True
 
     async def set_idle(self, device_id: str):
-        await self.update_status(device_id, DeviceStatus.OK, clear_task=True)
+        await self.update_status(device_id, DeviceStatus.IDLE, clear_task=True)
         logger.info("Device set idle", device_id=device_id)
 
     async def set_offline(self, device_id: str):
@@ -142,7 +144,7 @@ class DeviceStatusManager:
 
     async def is_device_ok(self, device_id: str) -> bool:
         status = await self.get_status(device_id)
-        return status == DeviceStatus.OK
+        return status == DeviceStatus.IDLE
 
     async def is_device_offline(self, device_id: str) -> bool:
         status = await self.get_status(device_id)
@@ -193,7 +195,7 @@ class DeviceStatusManager:
                 if device_id not in self._devices:
                     self._devices[device_id] = DeviceStatusEntry(
                         device_id=device_id,
-                        status=DeviceStatus.OK,
+                        status=DeviceStatus.IDLE,
                     )
                     changed.append(device_id)
                     logger.info("Device added as idle (sync)", device_id=device_id)
@@ -210,7 +212,7 @@ class DeviceStatusManager:
                 else:
                     if entry.current_task_id is not None:
                         entry.current_task_id = None
-                    desired_status = DeviceStatus.OK
+                    desired_status = DeviceStatus.IDLE
                 if entry.status != desired_status:
                     entry.status = desired_status
                     changed.append(device_id)

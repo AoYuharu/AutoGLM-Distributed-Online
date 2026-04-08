@@ -102,6 +102,19 @@ class TestWDAAdapter:
         assert result.should_finish is True
         assert result.message == "Task completed"
 
+    def test_execute_action_tap_with_top_level_coordinates(self, adapter):
+        """测试服务端 x/y 坐标 payload"""
+        with patch.object(adapter, 'tap') as mock_tap:
+            result = adapter.execute_action({
+                "action": "tap",
+                "x": 165,
+                "y": 495,
+            })
+
+            assert result.success is True
+            assert result.should_finish is False
+            mock_tap.assert_called_once_with(165, 495)
+
     def test_execute_action_unknown_type(self, adapter):
         """测试未知动作类型"""
         result = adapter.execute_action({
@@ -184,6 +197,22 @@ class TestWDAAdapter:
         assert result.success is False
         assert "Missing swipe coordinates" in result.message
 
+    def test_execute_action_swipe_with_top_level_coordinates(self, adapter):
+        """测试服务端 x1/y1/x2/y2 滑动 payload"""
+        with patch.object(adapter, 'swipe') as mock_swipe:
+            result = adapter.execute_action({
+                "action": "swipe",
+                "x1": 499,
+                "y1": 799,
+                "x2": 499,
+                "y2": 350,
+                "duration": 500,
+            })
+
+            assert result.success is True
+            assert result.should_finish is False
+            mock_swipe.assert_called_once_with(499, 799, 499, 350, 500)
+
     def test_execute_action_type(self, adapter):
         """测试输入文本动作"""
         with patch.object(adapter, 'type_text') as mock_type:
@@ -220,13 +249,27 @@ class TestWDAAdapter:
 
     def test_execute_action_wait(self, adapter):
         """测试等待动作"""
-        result = adapter.execute_action({
-            "_metadata": "do",
-            "action": "wait",
-            "duration": "2"
-        })
+        with patch('src.adapters.wda_adapter.time.sleep') as mock_sleep:
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "wait",
+                "duration": "2"
+            })
 
-        assert result.success is True
+            mock_sleep.assert_called_once_with(2.0)
+            assert result.success is True
+
+    def test_execute_action_wait_with_numeric_duration(self, adapter):
+        """测试服务端数值 wait payload"""
+        with patch('src.adapters.wda_adapter.time.sleep') as mock_sleep:
+            result = adapter.execute_action({
+                "action": "wait",
+                "duration": 1,
+            })
+
+            mock_sleep.assert_called_once_with(1.0)
+            assert result.success is True
+            assert result.should_finish is False
 
     def test_execute_action_unknown_action(self, adapter):
         """测试未知动作"""

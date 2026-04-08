@@ -171,12 +171,14 @@ async def handle_device_status_http(message: dict, db: Session) -> dict:
             await device_status_manager.set_offline(status_device_id)
         elif status == "busy":
             await device_status_manager.set_busy(status_device_id, preserved_task_id)
-        elif preserved_task_id:
+        elif preserved_task_id and active_task_id:
+            # Only preserve busy status if there's an ACTIVE task in the scheduler
             api_logger.info(
                 f"[device_status_http] Preserving busy status for active task: {status_device_id}, task={preserved_task_id}"
             )
             await device_status_manager.set_busy(status_device_id, preserved_task_id)
         else:
+            # For idle status or no active task, set to idle and clear task
             await device_status_manager.set_idle(status_device_id)
         api_logger.info(f"[device_status_http] Device {status_device_id} status set complete")
 
