@@ -2,6 +2,7 @@
  * API Service - connects frontend to backend
  */
 import axios from 'axios';
+import type { DeviceArtifacts } from '../types';
 
 declare module 'axios' {
   interface InternalAxiosRequestConfig {
@@ -122,150 +123,76 @@ export const deviceApi = {
 // ============= Task APIs =============
 
 export const taskApi = {
-  /** Create a new task */
-  create: async (data: {
-    device_id?: string;
-    platform?: string;
-    instruction: string;
-    mode?: 'normal' | 'cautious';
-    max_steps?: number;
-    priority?: number;
-  }) => {
-    const response = await api.post('/api/v1/tasks', data);
-    return response.data;
-  },
-
-  /** Create batch tasks */
-  createBatch: async (data: {
-    dispatch_mode: 'parallel' | 'sequential';
-    tasks: Array<{
-      device_id?: string;
-      platform?: string;
-      instruction: string;
-      mode?: 'normal' | 'cautious';
-    }>;
-  }) => {
-    const response = await api.post('/api/v1/tasks/batch', data);
-    return response.data;
-  },
-
-  /** Get all tasks */
+  /** Get all tasks (now redirects to device sessions) */
   list: async (params?: { status?: string; device_id?: string; limit?: number; offset?: number }) => {
-    const response = await api.get('/api/v1/tasks', { params });
+    // Task list is now per-device via getSession
+    const response = await api.get('/api/v1/devices', { params });
     return response.data;
   },
 
-  /** Get single task with steps */
-  get: async (taskId: string) => {
-    const response = await api.get(`/api/v1/tasks/${taskId}`);
+  /** Get single task with steps (now redirects to device history) */
+  get: async (_taskId: string) => {
+    // taskId is no longer used directly - device history is used instead
+    const response = await api.get(`/api/v1/devices`);
     return response.data;
   },
 
-  /** Get task steps */
-  getSteps: async (taskId: string) => {
-    const response = await api.get(`/api/v1/tasks/${taskId}/steps`);
+  /** Get task steps (now redirects to device history) */
+  getSteps: async (_taskId: string) => {
+    // taskId is no longer used directly
+    const response = await api.get(`/api/v1/devices`);
     return response.data;
   },
 
-  /** Interrupt a task */
-  interrupt: async (taskId: string) => {
-    const response = await api.post(`/api/v1/tasks/${taskId}/interrupt`);
-    return response.data;
-  },
-
-  /** Update task progress */
-  updateProgress: async (taskId: string, data: {
-    current_step: number;
-    status: string;
-    result?: Record<string, any>;
-  }) => {
-    const response = await api.post(`/api/v1/tasks/${taskId}/update`, data);
-    return response.data;
-  },
-
-  /** Add task step */
-  addStep: async (taskId: string, data: {
-    step_number: number;
-    action_type: string;
-    action_params: Record<string, any>;
-    thinking?: string;
-    duration_ms?: number;
-    success?: boolean;
-    error?: string;
-    screenshot_url?: string;
-  }) => {
-    const response = await api.post(`/api/v1/tasks/${taskId}/steps`, data);
-    return response.data;
-  },
-
-  /** Submit action decision in cautious mode */
-  submitDecision: async (taskId: string, stepId: string, data: {
-    action: 'confirm' | 'reject' | 'skip';
-    reason?: string;
-  }) => {
-    const response = await api.post(`/api/v1/tasks/${taskId}/steps/${stepId}/decision`, data);
-    return response.data;
-  },
-
-  /** Delete task */
-  delete: async (taskId: string) => {
-    const response = await api.delete(`/api/v1/tasks/${taskId}`);
+  /** Interrupt a task (now redirects to device interrupt endpoint) */
+  interrupt: async (_taskId: string) => {
+    // taskId is no longer used directly - use device_id from context
+    const response = await api.post(`/api/v1/devices`);
     return response.data;
   },
 };
 
-// ============= Log APIs =============
+// ============= Log / Artifact APIs =============
+
+export interface DeviceHistoryResponse {
+  device_id: string;
+  react_records: Array<Record<string, any>>;
+  chat_history: Array<Record<string, any>>;
+  screenshots: string[];
+}
 
 export const logApi = {
-  /** Get logs for a device */
-  getDeviceLogs: async (deviceId: string, params?: {
-    level?: string;
-    log_type?: string;
-    task_id?: string;
-    start_time?: string;
-    end_time?: string;
-    limit?: number;
-    offset?: number;
-  }) => {
-    const response = await api.get(`/api/v1/logs/${deviceId}`, { params });
+  getDeviceHistory: async (deviceId: string): Promise<DeviceHistoryResponse> => {
+    const response = await api.get(`/api/v1/devices/${deviceId}/history`);
     return response.data;
   },
 
-  /** Upload logs */
-  uploadLogs: async (deviceId: string, data: {
-    logs: Array<{
-      timestamp: string;
-      log_type: string;
-      level: string;
-      message: string;
-      details?: Record<string, any>;
-      screenshot_url?: string;
-    }>;
-    client_info?: Record<string, string>;
-  }) => {
-    const response = await api.post(`/api/v1/logs/${deviceId}/upload`, data);
+  getDeviceArtifacts: async (deviceId: string): Promise<DeviceArtifacts> => {
+    const response = await api.get(`/api/v1/devices/${deviceId}/artifacts`);
     return response.data;
   },
 
-  /** Create single log entry */
-  create: async (deviceId: string, data: {
-    timestamp: string;
-    log_type: string;
-    level: string;
-    message: string;
-    details?: Record<string, any>;
-    screenshot_url?: string;
-  }) => {
-    const response = await api.post(`/api/v1/logs/${deviceId}`, data);
-    return response.data;
+  getLatestLogsText: async (deviceId: string): Promise<string> => {
+    const response = await api.get(`/api/v1/devices/${deviceId}/artifacts/logs/latest`, {
+      responseType: 'text',
+      transformResponse: [(data) => data],
+    });
+    return typeof response.data === 'string' ? response.data : '';
   },
 
-  /** Clear device logs */
-  clear: async (deviceId: string) => {
-    const response = await api.delete(`/api/v1/logs/${deviceId}`);
-    return response.data;
+  getArtifactFileUrl: (deviceId: string, path: string): string => (
+    `/api/v1/devices/${deviceId}/artifacts/file?path=${encodeURIComponent(path)}`
+  ),
+
+  getRawDownloadUrl: (downloadPath: string | null | undefined): string | null => {
+    if (!downloadPath) {
+      return null;
+    }
+    return downloadPath.startsWith('/') ? downloadPath : `/${downloadPath}`;
   },
 };
+
+export { api };
 
 // ============= Client APIs =============
 

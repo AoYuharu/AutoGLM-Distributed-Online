@@ -86,6 +86,7 @@ export interface PendingAction {
 
 // Log Types
 export type LogLevel = 'info' | 'success' | 'warning' | 'error';
+export type LogSource = 'chat_history' | 'react_records' | 'device_logs' | 'artifacts' | 'imported';
 
 export interface LogEntry {
   id: string;
@@ -97,6 +98,22 @@ export interface LogEntry {
   message: string;
   details?: Record<string, any>;
   screenshot_url?: string;
+  artifact_path?: string;
+  download_url?: string;
+  source?: LogSource;
+  role?: string;
+  phase?: string;
+  step_number?: number;
+}
+
+export interface DeviceArtifacts {
+  device_id: string;
+  screenshots: string[];
+  latest_screenshot: string | null;
+  latest_screenshot_download: string | null;
+  latest_log_download: string | null;
+  react_records_download: string | null;
+  chat_history_download: string | null;
 }
 
 // Task Types
