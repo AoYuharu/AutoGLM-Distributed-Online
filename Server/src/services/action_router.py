@@ -188,6 +188,348 @@ class ActionRouter:
             "step_number": pending.step_number,
         }
 
+    async def _broadcast_progress(
+        self,
+        pending: PendingAction,
+        phase: str,
+        stage: str,
+        message: str,
+        **data,
+    ) -> None:
+        if not self._ws_hub:
+            return
+
+        await self._ws_hub.broadcast_agent_progress(
+            task_id=pending.task_id,
+            device_id=pending.device_id,
+            step_number=pending.step_number,
+            phase=phase,
+            stage=stage,
+            message=message,
+            version=pending.round_version,
+            **data,
+        )
+
+    async def _broadcast_progress_by_ids(
+        self,
+        task_id: str,
+        device_id: str,
+        step_number: int,
+        phase: str,
+        stage: str,
+        message: str,
+        **data,
+    ) -> None:
+        if not self._ws_hub:
+            return
+
+        await self._ws_hub.broadcast_agent_progress(
+            task_id=task_id,
+            device_id=device_id,
+            step_number=step_number,
+            phase=phase,
+            stage=stage,
+            message=message,
+            **data,
+        )
+
+    def _create_progress_payload(self, pending: PendingAction, **overrides) -> dict:
+        # Clean transport milestone payload — do NOT inject reasoning/action by default.
+        # Only reason-detail stages (reason_complete, action_dispatched) should carry them.
+        payload = {}
+        payload.update(overrides)
+        return payload
+
+    def _create_reason_progress_payload(self, pending: PendingAction, **overrides) -> dict:
+        """Payload for reason-detail stages that should carry reasoning/action."""
+        payload = {
+            "reasoning": pending.reasoning,
+            "action": pending.action,
+        }
+        payload.update(overrides)
+        return payload
+
+    def _schedule_progress(
+        self,
+        pending: PendingAction,
+        phase: str,
+        stage: str,
+        message: str,
+        **data,
+    ) -> None:
+        if not self._ws_hub:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._broadcast_progress(pending, phase, stage, message, **data))
+
+    def _schedule_progress_by_ids(
+        self,
+        task_id: str,
+        device_id: str,
+        step_number: int,
+        phase: str,
+        stage: str,
+        message: str,
+        **data,
+    ) -> None:
+        if not self._ws_hub:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(
+            self._broadcast_progress_by_ids(task_id, device_id, step_number, phase, stage, message, **data)
+        )
+
+    def _infer_timeout_stage(self, pending: PendingAction, error_type: str) -> str:
+        if error_type == "ack_timeout":
+            return "ack_timeout"
+        if error_type == "observe_timeout":
+            return "observe_timeout"
+        return error_type
+
+    def _infer_timeout_phase(self, pending: PendingAction, error_type: str) -> str:
+        if error_type == "ack_timeout":
+            return "act"
+        if error_type == "observe_timeout":
+            return "observe"
+        return "act"
+
+    def _infer_timeout_message(self, error_type: str, message: str) -> str:
+        if error_type == "ack_timeout":
+            return "ACK 超时"
+        if error_type == "observe_timeout":
+            return "Observe 超时"
+        return message
+
+    def _emit_timeout_progress(self, pending: PendingAction, error_type: str, message: str) -> None:
+        self._schedule_progress(
+            pending,
+            self._infer_timeout_phase(pending, error_type),
+            self._infer_timeout_stage(pending, error_type),
+            self._infer_timeout_message(error_type, message),
+            **self._create_progress_payload(
+                pending,
+                error=message,
+                error_type=error_type,
+                success=False,
+            ),
+        )
+
+    async def _emit_waiting_ack_progress(self, pending: PendingAction) -> None:
+        # action_dispatched carries reasoning/action for reason detail bubble
+        reason_payload = self._create_reason_progress_payload(pending)
+        await self._broadcast_progress(
+            pending,
+            "act",
+            "action_dispatched",
+            "动作已下发",
+            **reason_payload,
+        )
+        # waiting_ack is a clean transport milestone — no reasoning/action
+        await self._broadcast_progress(
+            pending,
+            "act",
+            "waiting_ack",
+            "已下发，等待 ACK",
+        )
+
+    async def _emit_waiting_observe_progress(self, pending: PendingAction) -> None:
+        await self._broadcast_progress(
+            pending,
+            "observe",
+            "waiting_observe",
+            "ACK 已收到，开始等待 Observe",
+            **self._create_progress_payload(pending),
+        )
+
+    async def _emit_ack_progress(
+        self,
+        pending: PendingAction,
+        accepted: bool,
+        error: Optional[str],
+        error_code: Optional[str],
+    ) -> None:
+        if accepted:
+            await self._broadcast_progress(
+                pending,
+                "act",
+                "ack_received",
+                "ACK 已收到",
+                **self._create_progress_payload(
+                    pending,
+                    success=True,
+                ),
+            )
+            return
+
+        await self._broadcast_progress(
+            pending,
+            "act",
+            "ack_rejected",
+            "ACK 被拒绝",
+            **self._create_progress_payload(
+                pending,
+                success=False,
+                error=error or "Action rejected by client",
+                error_type="ack_rejected",
+                result=error,
+                error_code=error_code,
+            ),
+        )
+
+    async def _emit_observe_progress(
+        self,
+        pending: PendingAction,
+        *,
+        success: bool,
+        result: str,
+        screenshot: Optional[str],
+        error: Optional[str],
+    ) -> None:
+        await self._broadcast_progress(
+            pending,
+            "observe",
+            "observe_received",
+            "Observe 已收到",
+            **self._create_progress_payload(
+                pending,
+                result=result,
+                screenshot=screenshot,
+                success=success,
+                error=error,
+                error_type=None if success else "observe_error",
+            ),
+        )
+
+    async def _emit_send_failed_progress(self, pending: PendingAction) -> None:
+        await self._broadcast_progress(
+            pending,
+            "act",
+            "ack_rejected",
+            "动作下发失败",
+            **self._create_progress_payload(
+                pending,
+                success=False,
+                error="Device not connected",
+                error_type="send_failed",
+            ),
+        )
+
+    async def _emit_cancelled_progress(self, pending: PendingAction) -> None:
+        await self._broadcast_progress(
+            pending,
+            "act",
+            "ack_rejected",
+            "动作已取消",
+            **self._create_progress_payload(
+                pending,
+                success=False,
+                error="Action cancelled",
+                error_type="cancelled",
+            ),
+        )
+
+    async def _emit_reason_complete_progress(
+        self,
+        task_id: str,
+        device_id: str,
+        step_number: int,
+        reasoning: str,
+        action: dict,
+        version: Optional[int] = None,
+    ) -> None:
+        await self._broadcast_progress_by_ids(
+            task_id,
+            device_id,
+            step_number,
+            "reason",
+            "reason_complete",
+            "Reason 完成，动作已解析",
+            reasoning=reasoning,
+            action=action,
+            version=version,
+        )
+
+    async def push_agent_progress(
+        self,
+        task_id: str,
+        device_id: str,
+        step_number: int,
+        phase: str,
+        stage: str,
+        message: str,
+        **data,
+    ):
+        await self._broadcast_progress_by_ids(
+            task_id,
+            device_id,
+            step_number,
+            phase,
+            stage,
+            message,
+            **data,
+        )
+
+    async def push_reason_complete(
+        self,
+        task_id: str,
+        device_id: str,
+        step_number: int,
+        reasoning: str,
+        action: dict,
+        version: Optional[int] = None,
+    ):
+        await self._emit_reason_complete_progress(
+            task_id,
+            device_id,
+            step_number,
+            reasoning,
+            action,
+            version,
+        )
+
+    async def push_transport_stage(
+        self,
+        pending: PendingAction,
+        stage: str,
+        message: str,
+        *,
+        phase: Optional[str] = None,
+        **data,
+    ):
+        await self._broadcast_progress(
+            pending,
+            phase or ("observe" if "observe" in stage else "act"),
+            stage,
+            message,
+            **self._create_progress_payload(pending, **data),
+        )
+
+    async def push_timeout_stage(self, pending: PendingAction, error_type: str, message: str):
+        await self._broadcast_progress(
+            pending,
+            self._infer_timeout_phase(pending, error_type),
+            self._infer_timeout_stage(pending, error_type),
+            self._infer_timeout_message(error_type, message),
+            **self._create_progress_payload(
+                pending,
+                success=False,
+                error=message,
+                error_type=error_type,
+            ),
+        )
+
+    async def push_progress_for_pending(self, pending: PendingAction):
+        await self._emit_waiting_ack_progress(pending)
+
+    async def push_waiting_observe(self, pending: PendingAction):
+        await self._emit_waiting_observe_progress(pending)
+
     def _store_completed_round(self, pending: PendingAction, result: dict):
         completed = dict(result)
         completed["_stored_at"] = time.time()
@@ -232,6 +574,7 @@ class ActionRouter:
         pending.status = ActionStatus.TIMEOUT
         pending.error = message
         pending.last_update = time.time()
+        self._emit_timeout_progress(pending, error_type, message)
 
         ack_future = self._ack_futures.get(action_id)
         if ack_future and not ack_future.done():
@@ -303,6 +646,7 @@ class ActionRouter:
         if not success:
             pending.status = ActionStatus.CANCELLED
             pending.error = "Device not connected"
+            await self._emit_send_failed_progress(pending)
             result = self._build_result(
                 pending,
                 success=False,
@@ -311,6 +655,8 @@ class ActionRouter:
             )
             self._finalize_pending(pending, result)
             return pending
+
+        await self._emit_waiting_ack_progress(pending)
 
         logger.info(
             "Action sent to client",
@@ -410,6 +756,14 @@ class ActionRouter:
         if error:
             pending.error = error
 
+        await self._emit_observe_progress(
+            pending,
+            success=success,
+            result=result,
+            screenshot=screenshot,
+            error=error,
+        )
+
         observe_result = self._build_result(
             pending,
             success=success,
@@ -489,6 +843,7 @@ class ActionRouter:
         if accepted:
             pending.status = ActionStatus.ACKNOWLEDGED
             pending.timeout_seconds = pending.observe_timeout_seconds
+            await self._emit_ack_progress(pending, True, error, error_code)
             if ack_future and not ack_future.done():
                 ack_future.set_result(ack_result)
             logger.debug(
@@ -502,6 +857,7 @@ class ActionRouter:
 
         pending.status = ActionStatus.CANCELLED
         pending.error = error or "Action rejected by client"
+        await self._emit_ack_progress(pending, False, pending.error, error_code)
         if ack_future and not ack_future.done():
             ack_future.set_result(ack_result)
 
@@ -521,6 +877,7 @@ class ActionRouter:
                     pending.status = ActionStatus.CANCELLED
                     pending.error = "Action cancelled"
                     pending.last_update = time.time()
+                    await self._emit_cancelled_progress(pending)
                     result = self._build_result(
                         pending,
                         success=False,
@@ -645,13 +1002,15 @@ class ActionRouter:
             return {
                 "success": False,
                 "error": ack.get("error") or "Action rejected by client",
-                "error_type": "ack_rejected",
+                "error_type": ack.get("error_type") or "ack_rejected",
                 "action_id": pending.action_id,
                 "task_id": task_id,
                 "device_id": device_id,
                 "version": round_version,
                 "step_number": step_number,
             }
+
+        await self._emit_waiting_observe_progress(pending)
 
         try:
             result = await self.wait_for_result(pending.action_id, timeout=observe_timeout_seconds)

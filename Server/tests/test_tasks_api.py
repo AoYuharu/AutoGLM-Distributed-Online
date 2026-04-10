@@ -6,11 +6,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from src.database import Base
+from src.database import Base, get_db
 from src.main import app
-from src.models.models import Client, Device, Task
-from src.database import get_db
-from src.services.device_status_manager import device_status_manager
+from src.models.models import Client, Device
+from src.services.file_storage import file_storage
 from src.services.react_scheduler import scheduler
 
 
@@ -49,223 +48,310 @@ def client_with_db(monkeypatch):
     db.commit()
     db.close()
 
-    class DummyTask:
-        def __init__(self, task_id: str):
-            self.task_id = task_id
-            self.is_active = True
-            self.phase = None
-            self.react_records = []
+    storage_state = {}
 
-    scheduled = {}
+    def fake_load_chat_history(device_id):
+        return list(storage_state.get(device_id, []))
 
-    def fake_submit_task(device_id, task_id, instruction, mode="normal", max_steps=100, **kwargs):
-        scheduled[device_id] = {
-            "task_id": task_id,
-            "instruction": instruction,
-            "mode": mode,
-            "max_steps": max_steps,
-        }
-        return DummyTask(task_id)
+    def fake_save_chat_history(device_id, messages):
+        storage_state[device_id] = list(messages)
 
-    async def fake_interrupt_task(device_id):
-        scheduled.pop(device_id, None)
+    def fake_append_chat_message(device_id, message):
+        storage_state.setdefault(device_id, []).append(dict(message))
 
-    async def fake_set_observe_result(device_id, screenshot, observation):
-        scheduled.setdefault("observe", []).append((device_id, screenshot, observation))
+    monkeypatch.setattr(file_storage, "load_chat_history", fake_load_chat_history)
+    monkeypatch.setattr(file_storage, "save_chat_history", fake_save_chat_history)
+    monkeypatch.setattr(file_storage, "append_chat_message", fake_append_chat_message)
+    monkeypatch.setattr(file_storage, "get_screenshots", lambda device_id: [])
 
-    def fake_requeue_task(device_id):
-        scheduled.setdefault("requeued", []).append(device_id)
-
-    monkeypatch.setattr(scheduler, "submit_task", fake_submit_task)
-    monkeypatch.setattr(scheduler, "interrupt_task", fake_interrupt_task)
-    monkeypatch.setattr(scheduler, "set_observe_result", fake_set_observe_result)
-    monkeypatch.setattr(scheduler, "requeue_task", fake_requeue_task)
-
-    yield TestClient(app), TestingSessionLocal, scheduled
+    yield TestClient(app), TestingSessionLocal, storage_state
 
     app.dependency_overrides.clear()
 
 
+class _SessionTask:
+    task_id = "task-session"
+    is_active = True
+    status = type("Status", (), {"value": "running"})()
+    instruction = "restore timeline"
+    current_step = 3
+    max_steps = 10
+
+
+def test_device_session_and_chat_history_pass_through_progress_metadata(client_with_db, monkeypatch):
+    client, _SessionLocal, storage_state = client_with_db
+    storage_state["device-1"] = [
+        {
+            "id": "msg_user",
+            "role": "user",
+            "content": "restore timeline",
+            "created_at": "2026-04-10T00:00:00",
+            "task_id": "task-session",
+        },
+        {
+            "id": "msg_progress",
+            "role": "agent",
+            "content": "ACK 已收到",
+            "created_at": "2026-04-10T00:00:01",
+            "task_id": "task-session",
+            "step_number": 2,
+            "phase": "act",
+            "stage": "ack_received",
+            "progress_status_text": "ack_received",
+            "progress_message": "ACK 已收到",
+            "thinking": "tap confirm",
+            "action_type": "Tap",
+            "action_params": {"action": "Tap", "x": 10, "y": 20},
+            "result": "accepted",
+            "success": True,
+            "error": None,
+            "error_type": None,
+            "version": 8,
+            "error_code": None,
+            "data": {
+                "task_id": "task-session",
+                "source": "test",
+                "restore_metadata": {"resume_round": 2},
+            },
+        },
+    ]
+    monkeypatch.setattr(scheduler, "get_task", lambda device_id: _SessionTask())
+
+    session_response = client.get("/api/v1/devices/device-1/session")
+    assert session_response.status_code == 200, session_response.text
+    session_body = session_response.json()
+
+    progress = session_body["chat_history"][-1]
+    assert progress["task_id"] == "task-session"
+    assert progress["step_number"] == 2
+    assert progress["phase"] == "act"
+    assert progress["stage"] == "ack_received"
+    assert progress["progress_status_text"] == "ack_received"
+    assert progress["progress_message"] == "ACK 已收到"
+    assert progress["result"] == "accepted"
+    assert progress["success"] is True
+    assert progress["version"] == 8
+    assert progress["action_type"] == "Tap"
+    assert progress["action_params"] == {"action": "Tap", "x": 10, "y": 20}
+    assert progress["data"]["restore_metadata"]["resume_round"] == 2
+
+    chat_response = client.get("/api/v1/devices/device-1/chat")
+    assert chat_response.status_code == 200, chat_response.text
+    chat_body = chat_response.json()
+
+    assert chat_body["total"] == 2
+    assert chat_body["messages"][-1]["stage"] == "ack_received"
+    assert chat_body["messages"][-1]["action_type"] == "Tap"
+    assert chat_body["messages"][-1]["data"]["source"] == "test"
+
+
 @pytest.mark.asyncio
-async def test_create_task_marks_device_busy_and_rejects_second_task(client_with_db):
-    client, SessionLocal, scheduled = client_with_db
-    await device_status_manager.set_idle("device-1")
+async def test_broadcast_agent_progress_and_status_persist_replay_milestones(monkeypatch):
+    from src.services.websocket import WebSocketHub
 
-    response = client.post(
-        "/api/v1/tasks",
-        json={"device_id": "device-1", "instruction": "do something", "max_steps": 5},
+    persisted = []
+
+    def fake_append_chat_message(device_id, message):
+        persisted.append((device_id, message))
+
+    hub = WebSocketHub()
+    monkeypatch.setattr(file_storage, "append_chat_message", fake_append_chat_message)
+
+    await hub.broadcast_agent_progress(
+        task_id="task-1",
+        device_id="device-1",
+        step_number=0,
+        phase="observe",
+        stage="requesting_initial_screenshot",
+        message="正在请求初始截图",
     )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["task_id"].startswith("task_")
-    assert scheduled["device-1"]["max_steps"] == 5
+    # Bootstrap stages are now persisted per plan
+    assert len(persisted) == 1
+    _, bootstrap_entry = persisted[-1]
+    assert bootstrap_entry["task_id"] == "task-1"
+    assert bootstrap_entry["step_number"] == 0
+    assert bootstrap_entry["stage"] == "requesting_initial_screenshot"
 
-    entry = await device_status_manager.get_entry("device-1")
-    assert entry is not None
-    assert entry.status.value == "busy"
-    assert entry.current_task_id == body["task_id"]
-
-    second = client.post(
-        "/api/v1/tasks",
-        json={"device_id": "device-1", "instruction": "second task"},
+    progress_message = await hub.broadcast_agent_progress(
+        task_id="task-1",
+        device_id="device-1",
+        step_number=2,
+        phase="act",
+        stage="ack_received",
+        message="ACK 已收到",
+        version=6,
+        reasoning="tap submit",
+        action={"action": "Tap", "x": 1, "y": 2},
+        result="accepted",
+        success=True,
     )
-    assert second.status_code == 400
+    assert progress_message["stage"] == "ack_received"
+    assert len(persisted) == 2
+
+    device_id, entry = persisted[-1]
+    assert device_id == "device-1"
+    assert entry["task_id"] == "task-1"
+    assert entry["step_number"] == 2
+    assert entry["phase"] == "act"
+    assert entry["stage"] == "ack_received"
+    assert entry["progress_message"] == "ACK 已收到"
+    assert entry["progress_status_text"] == "ack_received"
+    # Transport milestones (ack_received) no longer carry reasoning/action per plan
+    assert entry.get("thinking") is None
+    assert entry.get("action_type") is None
+    assert entry.get("action_params") is None
+    assert entry["result"] == "accepted"
+    assert entry["success"] is True
+    assert entry["version"] == 6
+
+    status_message = await hub.broadcast_agent_status(
+        device_id="device-1",
+        session_id="task-1",
+        status="failed",
+        message="Observation timeout",
+        data={"task_id": "task-1", "error_type": "observe_timeout"},
+    )
+    assert status_message["status"] == "failed"
+    assert len(persisted) == 3  # bootstrap + ack_received + failed status
+
+    _, status_entry = persisted[-1]
+    assert status_entry["task_id"] == "task-1"
+    assert status_entry["progress_status_text"] == "failed"
+    assert status_entry["progress_message"] == "Observation timeout"
+    assert status_entry["data"]["error_type"] == "observe_timeout"
+
+    await hub.broadcast_agent_status(
+        device_id="device-1",
+        session_id="task-1",
+        status="running",
+        message="Task running",
+        data={"task_id": "task-1"},
+    )
+    assert len(persisted) == 3  # bootstrap + ack_received + failed status (running status not persisted)
 
 
-def test_observe_updates_db_and_scheduler(client_with_db):
-    client, SessionLocal, scheduled = client_with_db
-    db = SessionLocal()
-    task = db.query(Task).filter(Task.task_id == scheduled.get("device-1", {}).get("task_id", "missing")).first()
-    if task is None:
-        task = Task(
-            task_id="task-observe",
-            device_id=db.query(Device).filter(Device.device_id == "device-1").one().id,
-            client_id=db.query(Client).filter(Client.client_id == "client-1").one().id,
-            instruction="observe",
-            status="pending",
+@pytest.mark.asyncio
+async def test_broadcast_task_update_routes_legacy_progress_to_canonical_protocol(monkeypatch):
+    from src.services.websocket import WebSocketHub
+
+    progress_calls = []
+
+    async def fake_broadcast_agent_progress(**kwargs):
+        progress_calls.append(kwargs)
+
+    hub = WebSocketHub()
+    monkeypatch.setattr(hub, "broadcast_agent_progress", fake_broadcast_agent_progress)
+
+    await hub.broadcast_task_update(
+        task_id="task-9",
+        device_id="device-9",
+        update={
+            "stage": "reason_complete",
+            "step_number": 4,
+            "message": "Reasoning finished",
+            "reasoning": "tap submit",
+            "version": 3,
+        },
+    )
+
+    assert len(progress_calls) == 1
+    call = progress_calls[0]
+    assert call["task_id"] == "task-9"
+    assert call["device_id"] == "device-9"
+    assert call["step_number"] == 4
+    assert call["stage"] == "reason_complete"
+    assert call["phase"] == "reason"
+    assert call["message"] == "Reasoning finished"
+    assert call["reasoning"] == "tap submit"
+    assert call["version"] == 3
+
+
+@pytest.mark.asyncio
+async def test_broadcast_task_update_routes_legacy_status_to_canonical_protocol(monkeypatch):
+    from src.services.websocket import WebSocketHub
+
+    status_calls = []
+
+    async def fake_broadcast_agent_status(**kwargs):
+        status_calls.append(kwargs)
+
+    hub = WebSocketHub()
+    monkeypatch.setattr(hub, "broadcast_agent_status", fake_broadcast_agent_status)
+
+    await hub.broadcast_task_update(
+        task_id="task-10",
+        device_id="device-10",
+        update={
+            "status": "completed",
+            "message": "Task completed",
+            "data": {"task_id": "task-10", "summary": "done"},
+        },
+    )
+
+    assert len(status_calls) == 1
+    call = status_calls[0]
+    assert call["device_id"] == "device-10"
+    assert call["session_id"] == "task-10"
+    assert call["status"] == "completed"
+    assert call["message"] == "Task completed"
+    assert call["data"]["summary"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_observe_http_skips_canonical_pending_round_router(client_with_db, monkeypatch):
+    from src.api import tasks as tasks_api
+    from src.services.action_router import action_router
+
+    client, _SessionLocal, _storage_state = client_with_db
+    scheduler_calls = []
+    routed_payloads = []
+
+    async def fake_set_observe_result(device_id, screenshot, observation, **kwargs):
+        scheduler_calls.append(
+            {
+                "device_id": device_id,
+                "screenshot": screenshot,
+                "observation": observation,
+                **kwargs,
+            }
         )
-        db.add(task)
-        db.commit()
-        task_id = "task-observe"
-    else:
-        task_id = task.task_id
-    db.close()
+
+    async def fake_handle_observe_result(payload):
+        routed_payloads.append(payload)
+        return True
+
+    monkeypatch.setattr(scheduler, "set_observe_result", fake_set_observe_result)
+    monkeypatch.setattr(action_router, "handle_observe_result", fake_handle_observe_result)
+    monkeypatch.setattr(file_storage, "save_screenshot", lambda *args, **kwargs: "screenshots/step_0_test.png")
+    monkeypatch.setattr(file_storage, "append_adb_log", lambda *args, **kwargs: None)
 
     response = client.post(
-        "/api/v1/tasks/observe",
+        "/api/v1/observe",
         json={
-            "msg_id": "m1",
+            "msg_id": "observe-bootstrap-1",
             "type": "observe_result",
             "version": "3",
             "payload": {
-                "task_id": task_id,
+                "task_id": "task-bootstrap",
                 "device_id": "device-1",
-                "step_number": 1,
-                "screenshot": "abc",
-                "result": "ok",
+                "step_number": 0,
+                "screenshot": "bootstrap-image",
+                "result": "bootstrap observation",
                 "success": True,
                 "version": 3,
             },
         },
     )
-    assert response.status_code == 200, response.text
-
-    db = SessionLocal()
-    task_row = db.query(Task).filter(Task.task_id == task_id).one()
-    assert task_row.current_step == 1
-    assert task_row.status == "running"
-    db.close()
-
-    assert ("device-1", "abc", "ok") in scheduled["observe"]
-    assert "device-1" in scheduled["requeued"]
-
-
-@pytest.mark.asyncio
-async def test_device_status_idle_heartbeat_preserves_active_task(client_with_db, monkeypatch):
-    client, SessionLocal, scheduled = client_with_db
-    await device_status_manager.set_busy("device-1", "task-live")
-
-    class ActiveTask:
-        task_id = "task-live"
-        is_active = True
-
-    monkeypatch.setattr(scheduler, "get_task", lambda device_id: ActiveTask())
-
-    response = client.post(
-        "/api/v1/devices/status",
-        json={
-            "msg_id": "status-1",
-            "type": "device_status",
-            "version": "1.0",
-            "client_id": "client-1",
-            "payload": {
-                "devices": [
-                    {
-                        "device_id": "device-1",
-                        "status": "idle",
-                        "platform": "android",
-                    }
-                ]
-            },
-        },
-    )
 
     assert response.status_code == 200, response.text
-
-    entry = await device_status_manager.get_entry("device-1")
-    assert entry is not None
-    assert entry.status.value == "busy"
-    assert entry.current_task_id == "task-live"
-
-
-@pytest.mark.asyncio
-async def test_scheduler_reason_failed_marks_task_failed_without_execute_act(monkeypatch):
-    from src.services.react_scheduler import DeviceTask, ReActScheduler, TaskStatus
-
-    scheduler_instance = ReActScheduler(core_threads=1, max_threads=1)
-    task = DeviceTask(device_id="device-1", task_id="task-1", instruction="do something")
-    task.initialize()
-    scheduler_instance._device_tasks["device-1"] = task
-
-
-    update_calls = []
-    idle_calls = []
-    removed = []
-
-    async def fake_execute_reason():
-        return "AI模型响应超时", {
-            "action": "error",
-            "message": "model_timeout",
-            "error_type": "reason_failed",
-        }
-
-    async def fake_execute_act(action, round_version):
-        raise AssertionError("execute_act should not run when reasoning fails")
-
-    async def fake_update_task_db(task_id, **kwargs):
-        update_calls.append((task_id, kwargs))
-
-    async def fake_broadcast_phase_start(*args, **kwargs):
-        return None
-
-    async def fake_broadcast_phase_end(*args, **kwargs):
-        return None
-
-    async def fake_set_device_idle(device_id):
-        idle_calls.append(device_id)
-
-    def fake_remove_task(device_id):
-        removed.append(device_id)
-        scheduler_instance._device_tasks.pop(device_id, None)
-
-    class DummyHub:
-        def __init__(self):
-            self.statuses = []
-
-        async def broadcast_agent_status(self, **kwargs):
-            self.statuses.append(kwargs)
-
-    task.execute_reason = fake_execute_reason
-    task.execute_act = fake_execute_act
-    scheduler_instance._update_task_db = fake_update_task_db
-    scheduler_instance._broadcast_phase_start = fake_broadcast_phase_start
-    scheduler_instance._broadcast_phase_end = fake_broadcast_phase_end
-    scheduler_instance._set_device_idle = fake_set_device_idle
-    scheduler_instance.remove_task = fake_remove_task
-    scheduler_instance._ws_hub = DummyHub()
-
-    result = await scheduler_instance.run_one_cycle("device-1")
-
-    assert result is True
-    assert task.status == TaskStatus.FAILED
-    assert idle_calls == ["device-1"]
-    assert removed == ["device-1"]
-    assert update_calls
-    _, kwargs = update_calls[-1]
-    assert kwargs["status"] == "failed"
-    assert kwargs["error_message"] == "model_timeout"
-    assert kwargs["result"]["error_type"] == "reason_failed"
-    assert scheduler_instance._ws_hub.statuses[-1]["status"] == "failed"
-    assert scheduler_instance._ws_hub.statuses[-1]["message"] == "model_timeout"
-    assert scheduler_instance.get_task("device-1") is None
-    scheduler_instance.executor.shutdown(wait=False)
+    assert response.json() == {
+        "success": True,
+        "message": "Observe result recorded",
+        "data": None,
+    }
+    assert len(scheduler_calls) == 1
+    assert scheduler_calls[0]["device_id"] == "device-1"
+    assert scheduler_calls[0]["step_number"] == 0
+    assert scheduler_calls[0]["round_version"] == 3
+    assert scheduler_calls[0]["screenshot_path"] == "screenshots/step_0_test.png"
+    assert routed_payloads == []

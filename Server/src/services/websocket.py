@@ -17,6 +17,179 @@ from fastapi import WebSocket, WebSocketDisconnect
 import structlog
 
 from src.config import settings
+from src.services.file_storage import file_storage
+
+
+def _coerce_message_text(*candidates) -> str:
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if isinstance(candidate, str):
+            if candidate:
+                return candidate
+            continue
+        return str(candidate)
+    return ""
+
+
+def _build_progress_chat_message(device_id: str, ws_message: dict) -> dict:
+    action = ws_message.get("action")
+    action_type = None
+    action_params = None
+    if isinstance(action, dict):
+        action_type = action.get("action") or action.get("type")
+        action_params = action
+
+    progress_message = _coerce_message_text(
+        ws_message.get("progress_message"),
+        ws_message.get("message"),
+    )
+    content = _coerce_message_text(
+        ws_message.get("content"),
+        progress_message,
+        ws_message.get("result"),
+        ws_message.get("error"),
+    )
+
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:12]}",
+        "role": "agent",
+        "content": content,
+        "created_at": ws_message.get("timestamp") or datetime.utcnow().isoformat(),
+        "task_id": ws_message.get("task_id"),
+        "step_number": ws_message.get("step_number"),
+        "phase": ws_message.get("phase"),
+        "stage": ws_message.get("stage"),
+        "progress_status_text": ws_message.get("stage") or ws_message.get("status"),
+        "progress_message": progress_message,
+        "thinking": ws_message.get("reasoning") or ws_message.get("thinking"),
+        "action_type": action_type,
+        "action_params": action_params,
+        "screenshot_path": ws_message.get("screenshot") or ws_message.get("screenshot_path"),
+        "result": _coerce_message_text(ws_message.get("result"), None),
+        "success": ws_message.get("success"),
+        "error": ws_message.get("error"),
+        "error_type": ws_message.get("error_type"),
+        "version": ws_message.get("version"),
+        "error_code": ws_message.get("error_code"),
+        "data": ws_message.get("data"),
+        "source": "canonical_websocket",
+        "message_type": ws_message.get("type"),
+        "device_id": device_id,
+    }
+
+
+def _persist_chat_history_message(device_id: str, ws_message: dict) -> None:
+    try:
+        file_storage.append_chat_message(device_id, _build_progress_chat_message(device_id, ws_message))
+    except Exception as e:
+        logger.warning(
+            "[chat_history_persist] Failed to append chat history entry",
+            device_id=device_id,
+            message_type=ws_message.get("type"),
+            stage=ws_message.get("stage"),
+            error=str(e),
+        )
+
+
+def _should_persist_progress_stage(stage: Optional[str]) -> bool:
+    return stage in {
+        "reason_start",
+        "reason_complete",
+        "action_dispatched",
+        "waiting_ack",
+        "ack_received",
+        "waiting_observe",
+        "observe_received",
+        "ack_timeout",
+        "observe_timeout",
+        "ack_rejected",
+        "requesting_initial_screenshot",
+        "initial_screenshot_ack_received",
+        "initial_screenshot_received",
+    }
+
+
+def is_reason_detail_stage(stage: Optional[str]) -> bool:
+    """Stages that should carry reasoning/action in the persisted chat history entry."""
+    return stage in {"reason_start", "reason_stream", "reason_complete", "action_dispatched"}
+
+
+def _should_persist_status(status: Optional[str]) -> bool:
+    return status in {"completed", "failed"}
+
+
+def _infer_legacy_phase(stage: str) -> str:
+    canonical_stage_phases = {
+        "reason_start": "reason",
+        "reason_complete": "reason",
+        "action_dispatched": "act",
+        "waiting_ack": "act",
+        "ack_received": "act",
+        "ack_rejected": "act",
+        "ack_timeout": "act",
+        "waiting_observe": "observe",
+        "observe_received": "observe",
+        "observe_timeout": "observe",
+        "requesting_initial_screenshot": "observe",
+        "initial_screenshot_ack_received": "observe",
+        "initial_screenshot_received": "observe",
+        "initial_screenshot_failed": "observe",
+    }
+    return canonical_stage_phases.get(stage, "observe" if "observe" in stage else "act")
+
+
+
+def _task_update_to_canonical_message(task_id: str, device_id: str, update: dict) -> Optional[dict]:
+    if not update:
+        return None
+
+    stage = update.get("stage")
+    status = update.get("status")
+
+    if stage:
+        message = {
+            "type": "agent_progress",
+            "task_id": task_id,
+            "device_id": device_id,
+            "step_number": update.get("step_number", 0),
+            "phase": update.get("phase") or _infer_legacy_phase(stage),
+            "stage": stage,
+            "message": update.get("message") or update.get("progress_message") or stage,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        for key in (
+            "version",
+            "reasoning",
+            "thinking",
+            "action",
+            "result",
+            "success",
+            "error",
+            "error_type",
+            "error_code",
+            "screenshot",
+            "screenshot_path",
+            "data",
+        ):
+            value = update.get(key)
+            if value is not None:
+                message[key] = value
+        return message
+
+    if status:
+        return {
+            "type": "agent_status",
+            "task_id": task_id,
+            "device_id": device_id,
+            "status": status,
+            "message": update.get("message") or status,
+            "data": update.get("data") or {},
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    return None
+
 
 logger = structlog.get_logger()
 
@@ -252,11 +425,60 @@ class WebSocketHub:
         logger.info(f"[broadcast_device_update] Broadcast to all consoles: device={device_id}, status={update.get('status')}")
 
     async def broadcast_task_update(self, task_id: str, device_id: str, update: dict):
-        """Broadcast task progress update (stub - no-op)"""
-        logger.debug(f"[broadcast_task_update] Stub called for task {task_id}")
+        """Compatibility wrapper that normalizes legacy task updates into canonical broadcasts."""
+        canonical_message = _task_update_to_canonical_message(task_id, device_id, update)
+        if canonical_message is None:
+            logger.debug(
+                "[broadcast_task_update] Ignored legacy update with no canonical mapping",
+                task_id=task_id,
+                device_id=device_id,
+                update_keys=sorted(update.keys()) if isinstance(update, dict) else [],
+            )
+            return
+
+        if canonical_message["type"] == "agent_progress":
+            await self.broadcast_agent_progress(
+                task_id=canonical_message["task_id"],
+                device_id=canonical_message["device_id"],
+                step_number=canonical_message.get("step_number", 0),
+                phase=canonical_message.get("phase", "act"),
+                stage=canonical_message.get("stage", "unknown"),
+                message=canonical_message.get("message", ""),
+                version=canonical_message.get("version"),
+                **{
+                    key: canonical_message[key]
+                    for key in (
+                        "reasoning",
+                        "thinking",
+                        "action",
+                        "result",
+                        "success",
+                        "error",
+                        "error_type",
+                        "error_code",
+                        "screenshot",
+                        "screenshot_path",
+                        "data",
+                    )
+                    if key in canonical_message
+                },
+            )
+            return
+
+        await self.broadcast_agent_status(
+            device_id=device_id,
+            session_id=task_id,
+            status=canonical_message.get("status", ""),
+            message=canonical_message.get("message", ""),
+            data=canonical_message.get("data") or {"task_id": task_id},
+        )
 
     async def broadcast_agent_step(self, task_id: str, device_id: str, step: dict, step_type: str = "agent_step"):
         """Broadcast agent step to all Web Consoles (broadcast mode, no subscription required)."""
+        result = step.get("result")
+        if result is None:
+            result = step.get("action_result", "")
+
         message = {
             "type": "agent_step",
             "task_id": task_id,
@@ -264,13 +486,59 @@ class WebSocketHub:
             "step_number": step.get("step_number", 0),
             "reasoning": step.get("reasoning", ""),
             "action": step.get("action", {}),
-            "result": step.get("action_result", ""),
+            "result": result,
             "screenshot": step.get("screenshot", ""),
             "success": step.get("success", True),
             "error": step.get("error"),
+            "error_type": step.get("error_type"),
         }
         await self.broadcast_to_web_consoles(message)
         logger.info(f"[broadcast_agent_step] Broadcast to all consoles: device={device_id}, task={task_id}, step={step.get('step_number')}")
+
+    async def broadcast_agent_progress(
+        self,
+        task_id: str,
+        device_id: str,
+        step_number: int,
+        phase: str,
+        stage: str,
+        message: str,
+        version: Optional[int] = None,
+        **data,
+    ):
+        """Broadcast fine-grained agent progress updates to all Web Consoles."""
+        ws_message: dict = {
+            "type": "agent_progress",
+            "task_id": task_id,
+            "device_id": device_id,
+            "step_number": step_number,
+            "phase": phase,
+            "stage": stage,
+            "message": message,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        if version is not None:
+            ws_message["version"] = version
+        for key, value in data.items():
+            if value is not None:
+                ws_message[key] = value
+
+        if _should_persist_progress_stage(stage):
+            # Strip reasoning/action from transport milestone persisted entries to avoid
+            # duplicate display in Web UI chat history.
+            if not is_reason_detail_stage(stage):
+                persist_message = {k: v for k, v in ws_message.items() if k not in ("reasoning", "action")}
+            else:
+                persist_message = ws_message
+            _persist_chat_history_message(device_id, persist_message)
+
+        await self.broadcast_to_web_consoles(ws_message)
+        logger.info(
+            f"[broadcast_agent_progress] Broadcast to all consoles: "
+            f"device={device_id}, task={task_id}, step={step_number}, stage={stage}"
+        )
+        return ws_message
+
 
     async def broadcast_agent_phase_start(self, device_id: str, task_id: str, phase: str, step_number: int):
         """Broadcast agent phase start (reason/act/observe) to all Web Consoles."""
@@ -334,15 +602,20 @@ class WebSocketHub:
         """Broadcast agent status update to all Web Consoles."""
         if data is None:
             data = {}
-        message = {
+        ws_message = {
             "type": "agent_status",
             "device_id": device_id,
             "status": status,
             "message": message,
-            "task_id": data.get("task_id", ""),
+            "task_id": data.get("task_id", session_id or ""),
+            "data": data,
+            "timestamp": datetime.utcnow().isoformat(),
         }
-        await self.broadcast_to_web_consoles(message)
+        if _should_persist_status(status):
+            _persist_chat_history_message(device_id, ws_message)
+        await self.broadcast_to_web_consoles(ws_message)
         logger.info(f"[broadcast_agent_status] Broadcast to all consoles: device={device_id}, status={status}")
+        return ws_message
 
     # === Web Console (Server -> Web) Methods ===
 

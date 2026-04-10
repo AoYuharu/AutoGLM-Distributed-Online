@@ -62,7 +62,7 @@ test.describe('Web API 层修复验证', () => {
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'healthy' }) });
       } else if (url.includes('/api/v1/devices') && !url.includes('/chat')) {
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(MOCK_DEVICES_RESPONSE) });
-      } else if (url.includes('/api/v1/tasks/devices')) {
+      } else if (url.includes('/api/v1/devices') && url.includes('/session')) {
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(MOCK_SESSION_SNAPSHOT) });
       } else if (url.includes('/api/v1/devices') && url.includes('/chat')) {
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(MOCK_CHAT_HISTORY) });

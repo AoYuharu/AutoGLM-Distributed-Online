@@ -58,6 +58,152 @@ const getActionTypeName = (type: string): string => {
   return names[type] || type;
 };
 
+const getProgressPhaseName = (phase?: ChatMessage['progressPhase']) => {
+  switch (phase) {
+    case 'reason':
+      return 'Reason';
+    case 'act':
+      return 'Act';
+    case 'observe':
+      return 'Observe';
+    default:
+      return '阶段';
+  }
+};
+
+const getProgressTagColor = (message: ChatMessage) => {
+  if (message.error || message.success === false) return 'error';
+  if (message.isCompleted) return 'success';
+  if (message.progressPhase === 'reason') return 'purple';
+  if (message.progressPhase === 'act') return 'blue';
+  if (message.progressPhase === 'observe') return 'green';
+  return 'default';
+};
+
+const getProgressStageText = (message: ChatMessage) => {
+  return message.progressStatusText || message.progressMessage || message.progressStage || '进行中';
+};
+
+const getBubbleContent = (message: ChatMessage) => {
+  if (message.progressMessage && (!message.content || message.content === message.progressMessage)) {
+    return message.progressMessage;
+  }
+  return message.content;
+};
+
+const shouldShowProgressBlock = (message: ChatMessage) => {
+  return Boolean(message.isProgressMessage || message.progressStage || message.progressMessage || message.progressPhase);
+};
+
+const shouldShowResultBlock = (message: ChatMessage) => {
+  return Boolean(message.result && message.result !== message.content);
+};
+
+const shouldShowErrorBlock = (message: ChatMessage) => {
+  return Boolean(message.error && message.error !== message.content);
+};
+
+const shouldShowScreenshotHint = (message: ChatMessage) => {
+  return Boolean(message.screenshot);
+};
+
+const getProgressContainerClass = (message: ChatMessage) => {
+  if (message.error || message.success === false) {
+    return 'mt-2 ml-1 px-4 py-3 rounded-xl bg-red-50 dark:bg-red-900/40 border border-red-200 dark:border-red-700/60 text-xs max-w-90 shadow-md';
+  }
+  if (message.isCompleted) {
+    return 'mt-2 ml-1 px-4 py-3 rounded-xl bg-green-50 dark:bg-green-900/40 border border-green-200 dark:border-green-700/60 text-xs max-w-90 shadow-md';
+  }
+  return 'mt-2 ml-1 px-4 py-3 rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700/60 text-xs max-w-90 shadow-md';
+};
+
+const getProgressTitleClass = (message: ChatMessage) => {
+  if (message.error || message.success === false) {
+    return 'text-red-700 dark:text-red-300 font-semibold mb-2 flex items-center gap-2';
+  }
+  if (message.isCompleted) {
+    return 'text-green-700 dark:text-green-300 font-semibold mb-2 flex items-center gap-2';
+  }
+  return 'text-slate-700 dark:text-slate-300 font-semibold mb-2 flex items-center gap-2';
+};
+
+const getProgressDotClass = (message: ChatMessage) => {
+  if (message.error || message.success === false) return 'bg-red-500';
+  if (message.isCompleted) return 'bg-green-500';
+  if (message.progressPhase === 'reason') return 'bg-purple-500';
+  if (message.progressPhase === 'act') return 'bg-blue-500';
+  if (message.progressPhase === 'observe') return 'bg-green-500';
+  return 'bg-slate-500';
+};
+
+const getMessageBubbleClass = (isUser: boolean, isParseError: boolean) => {
+  if (isUser) {
+    return 'px-5 py-4 text-sm whitespace-pre-wrap break-words shadow-xl max-w-90 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl';
+  }
+  if (isParseError) {
+    return 'px-5 py-4 text-sm whitespace-pre-wrap break-words shadow-xl max-w-90 bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100 rounded-xl border-2 border-red-300 dark:border-red-700';
+  }
+  return 'px-5 py-4 text-sm whitespace-pre-wrap break-words shadow-xl max-w-90 bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-100 border-2 border-gray-200 dark:border-gray-700 rounded-xl';
+};
+
+const getAvatarClass = (isUser: boolean, isParseError: boolean) => {
+  if (isUser) return 'bg-gradient-to-br from-blue-400 to-blue-600 ml-2';
+  if (isParseError) return 'bg-gradient-to-br from-red-400 to-red-600 mr-2';
+  return 'bg-gradient-to-br from-gray-500 to-gray-600 mr-2';
+};
+
+const getNameClass = (isUser: boolean) => {
+  return isUser ? 'text-right text-blue-200' : 'text-left text-gray-500 dark:text-gray-400';
+};
+
+const getItemsClass = (isUser: boolean) => {
+  return isUser ? 'items-end' : 'items-start';
+};
+
+const getRowClass = (isUser: boolean) => {
+  return isUser ? 'flex-row-reverse' : 'flex-row';
+};
+
+const getThinkingBlockTitle = () => '思考过程';
+const getActionBlockTitle = () => '执行动作';
+const getProgressBlockTitle = (message: ChatMessage) => `${getProgressPhaseName(message.progressPhase)} 状态`;
+const getResultBlockTitle = () => '结果';
+const getErrorBlockTitle = () => '错误';
+const getScreenshotBlockTitle = () => '截图已更新';
+const getScreenshotBlockText = () => '右侧截图区域已更新为当前步骤的最新截图。';
+const getProgressSecondaryText = (message: ChatMessage) => message.progressMessage || message.content;
+const getResultText = (message: ChatMessage) => message.result || '';
+const getErrorText = (message: ChatMessage) => message.error || '';
+const getStepLabel = (message: ChatMessage) => message.stepNumber ? `Step ${message.stepNumber}` : null;
+const getCompletionText = (message: ChatMessage) => message.isCompleted ? '已完成' : '进行中';
+const getCompletionColor = (message: ChatMessage) => (message.error || message.success === false ? 'error' : message.isCompleted ? 'success' : 'processing');
+const getActionDescription = (message: ChatMessage) => message.action?.description || '';
+const hasActionDescription = (message: ChatMessage) => Boolean(message.action?.description);
+const isReasonBubble = (message: ChatMessage) => message.progressStage === 'reason' || message.progressStage === 'reason_start' || message.progressStage === 'reason_stream' || message.progressStage === 'reason_complete';
+// Only show thinking/action blocks for reason-detail bubbles, not for transport milestones.
+const hasThinking = (message: ChatMessage, isUser: boolean) => Boolean(message.thinking && !isUser && isReasonBubble(message));
+const hasAction = (message: ChatMessage, isUser: boolean) => Boolean(message.action && !isUser && isReasonBubble(message));
+const hasRawContent = (message: ChatMessage, isParseError: boolean) => Boolean(isParseError && message.rawContent);
+const getRawOutputTitle = () => 'AI原始输出（解析失败）';
+const getResultContainerClass = 'mt-2 ml-1 px-4 py-3 rounded-xl bg-emerald-50 dark:bg-emerald-900/40 border border-emerald-200 dark:border-emerald-700/60 text-xs max-w-90 shadow-md';
+const getErrorContainerClass = 'mt-2 ml-1 px-4 py-3 rounded-xl bg-red-50 dark:bg-red-900/40 border border-red-200 dark:border-red-700/60 text-xs max-w-90 shadow-md';
+const getScreenshotContainerClass = 'mt-2 ml-1 px-4 py-3 rounded-xl bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700/60 text-xs max-w-90 shadow-md';
+const getResultTitleClass = 'text-emerald-700 dark:text-emerald-300 font-semibold mb-2 flex items-center gap-2';
+const getErrorTitleClass = 'text-red-700 dark:text-red-300 font-semibold mb-2 flex items-center gap-2';
+const getScreenshotTitleClass = 'text-gray-700 dark:text-gray-300 font-semibold mb-2 flex items-center gap-2';
+const getBlockTextClass = 'text-gray-700 dark:text-gray-200 whitespace-pre-wrap break-words leading-relaxed';
+const getSmallDotClass = (colorClass: string) => `inline-flex items-center justify-center w-2.5 h-2.5 rounded-full ${colorClass}`;
+const getProgressDot = (message: ChatMessage) => getSmallDotClass(getProgressDotClass(message));
+const getResultDot = () => getSmallDotClass('bg-emerald-500');
+const getErrorDot = () => getSmallDotClass('bg-red-500');
+const getScreenshotDot = () => getSmallDotClass('bg-gray-500');
+const getThinkingDot = () => 'inline-flex items-center justify-center w-5 h-5 rounded-full bg-purple-500 text-white text-xs shadow-sm';
+const getActionDot = () => 'inline-flex items-center justify-center w-5 h-5 rounded-full bg-blue-500 text-white text-xs shadow-sm';
+const getRawOutputDot = () => 'inline-flex items-center justify-center w-5 h-5 rounded-full bg-orange-500 text-white text-xs shadow-sm';
+const getThinkingIcon = () => '💭';
+const getActionIcon = () => '🎯';
+const getRawOutputIcon = () => '⚠️';
+
 interface AgentWindowProps {
   deviceId: string;
   onClose?: () => void;
@@ -181,80 +327,115 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
     return (
       <div
         key={message.id}
-        className={clsx(
-          'flex mb-3 animate-fadeIn',
-          isUser ? 'flex-row-reverse' : 'flex-row'
-        )}
+        className={clsx('flex mb-3 animate-fadeIn', getRowClass(isUser))}
       >
-        {/* 头像 */}
         <div
           className={clsx(
             'w-9 h-9 rounded-full flex items-center justify-center text-white text-base flex-shrink-0 shadow-lg',
-            isUser ? 'bg-gradient-to-br from-blue-400 to-blue-600 ml-2' : isParseError ? 'bg-gradient-to-br from-red-400 to-red-600 mr-2' : 'bg-gradient-to-br from-gray-500 to-gray-600 mr-2'
+            getAvatarClass(isUser, !!isParseError)
           )}
         >
           {isUser ? <UserOutlined /> : <RobotOutlined />}
         </div>
 
-        {/* 消息内容 */}
-        <div
-          className={clsx(
-            'max-w-75 flex flex-col',
-            isUser ? 'items-end' : 'items-start'
-          )}
-        >
-          {/* 用户名和时间 */}
-          <div className={clsx('text-xs mb-1.5 mx-1 font-medium', isUser ? 'text-right text-blue-200' : 'text-left text-gray-500 dark:text-gray-400')}>
+        <div className={clsx('max-w-75 flex flex-col', getItemsClass(isUser))}>
+          <div className={clsx('text-xs mb-1.5 mx-1 font-medium', getNameClass(isUser))}>
             {isUser ? '我' : 'Agent'} · {formatTime(message.timestamp)}
           </div>
 
-          {/* 消息气泡 */}
-          <div
-            className={
-              isUser
-                ? 'px-5 py-4 text-sm whitespace-pre-wrap break-words shadow-xl max-w-90 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl'
-                : isParseError
-                ? 'px-5 py-4 text-sm whitespace-pre-wrap break-words shadow-xl max-w-90 bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100 rounded-xl border-2 border-red-300 dark:border-red-700'
-                : 'px-5 py-4 text-sm whitespace-pre-wrap break-words shadow-xl max-w-90 bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-100 border-2 border-gray-200 dark:border-gray-700 rounded-xl'
-            }
-          >
-            {message.content}
+          <div className={getMessageBubbleClass(isUser, !!isParseError)}>
+            {getBubbleContent(message)}
           </div>
 
-          {/* 思考过程（仅Agent消息） */}
-          {message.thinking && !isUser && (
+          {!isUser && shouldShowProgressBlock(message) && (
+            <div className={getProgressContainerClass(message)}>
+              <div className={getProgressTitleClass(message)}>
+                <span className={getProgressDot(message)} />
+                {getProgressBlockTitle(message)}
+                {getStepLabel(message) && (
+                  <Tag color={getProgressTagColor(message)} className="m-0 ml-1">
+                    {getStepLabel(message)}
+                  </Tag>
+                )}
+              </div>
+              <div className="flex flex-wrap items-center gap-2 mb-2">
+                <Tag color={getProgressTagColor(message)} className="m-0">
+                  {getProgressStageText(message)}
+                </Tag>
+                <Tag color={getCompletionColor(message)} className="m-0">
+                  {getCompletionText(message)}
+                </Tag>
+              </div>
+              <div className={getBlockTextClass}>
+                {getProgressSecondaryText(message)}
+              </div>
+            </div>
+          )}
+
+          {hasThinking(message, isUser) && (
             <div className="mt-2 ml-1 px-4 py-3.5 rounded-xl bg-purple-50 dark:bg-purple-900/60 border border-purple-200 dark:border-purple-700/60 text-xs max-w-90 shadow-md">
               <div className="text-purple-700 dark:text-purple-300 font-semibold mb-2 flex items-center gap-2">
-                <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-purple-500 text-white text-xs shadow-sm">💭</span>
-                思考过程
+                <span className={getThinkingDot()}>{getThinkingIcon()}</span>
+                {getThinkingBlockTitle()}
               </div>
-              <div className="text-gray-700 dark:text-gray-200 whitespace-pre-wrap break-words leading-relaxed">
+              <div className={getBlockTextClass}>
                 {message.thinking}
               </div>
             </div>
           )}
 
-          {/* 动作信息（仅Agent消息） */}
-          {message.action && !isUser && (
+          {hasAction(message, isUser) && (
             <div className="mt-2 ml-1 px-4 py-3 rounded-xl bg-blue-50 dark:bg-blue-900/60 border border-blue-200 dark:border-blue-700/60 text-xs max-w-90 shadow-md">
               <div className="text-blue-700 dark:text-blue-300 font-semibold mb-2 flex items-center gap-2">
-                <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-blue-500 text-white text-xs shadow-sm">🎯</span>
-                执行动作
+                <span className={getActionDot()}>{getActionIcon()}</span>
+                {getActionBlockTitle()}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <Tag color="blue" className="m-0">
-                  {getActionTypeName(message.action.type)}
+                  {getActionTypeName(message.action!.type)}
                 </Tag>
+                {hasActionDescription(message) && (
+                  <span className="text-gray-700 dark:text-gray-200">{getActionDescription(message)}</span>
+                )}
               </div>
             </div>
           )}
 
-          {/* 原始输出（仅解析错误时显示） */}
-          {isParseError && message.rawContent && (
+          {!isUser && shouldShowResultBlock(message) && (
+            <div className={getResultContainerClass}>
+              <div className={getResultTitleClass}>
+                <span className={getResultDot()} />
+                {getResultBlockTitle()}
+              </div>
+              <div className={getBlockTextClass}>{getResultText(message)}</div>
+            </div>
+          )}
+
+          {!isUser && shouldShowErrorBlock(message) && (
+            <div className={getErrorContainerClass}>
+              <div className={getErrorTitleClass}>
+                <span className={getErrorDot()} />
+                {getErrorBlockTitle()}
+              </div>
+              <div className={getBlockTextClass}>{getErrorText(message)}</div>
+            </div>
+          )}
+
+          {!isUser && shouldShowScreenshotHint(message) && (
+            <div className={getScreenshotContainerClass}>
+              <div className={getScreenshotTitleClass}>
+                <span className={getScreenshotDot()} />
+                {getScreenshotBlockTitle()}
+              </div>
+              <div className={getBlockTextClass}>{getScreenshotBlockText()}</div>
+            </div>
+          )}
+
+          {hasRawContent(message, !!isParseError) && (
             <div className="mt-2 ml-1 px-4 py-3 rounded-xl bg-orange-100 dark:bg-orange-900/60 border border-orange-300 dark:border-orange-700/60 text-xs max-w-90 shadow-md">
               <div className="text-orange-700 dark:text-orange-300 font-semibold mb-2 flex items-center gap-2">
-                <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-orange-500 text-white text-xs shadow-sm">⚠️</span>
-                AI原始输出（解析失败）
+                <span className={getRawOutputDot()}>{getRawOutputIcon()}</span>
+                {getRawOutputTitle()}
               </div>
               <div className="text-gray-800 dark:text-gray-200 whitespace-pre-wrap break-words leading-relaxed bg-white/80 dark:bg-black/40 p-2 rounded-lg font-mono text-[10px] max-h-40 overflow-y-auto">
                 {message.rawContent}

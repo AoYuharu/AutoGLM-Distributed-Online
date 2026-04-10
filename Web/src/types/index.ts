@@ -36,6 +36,19 @@ export interface ChatMessage {
   screenshot?: string;  // 对应的截图
   rawContent?: string;  // AI原始输出
   isParseError?: boolean;  // 是否为解析错误
+  taskId?: string;
+  stepNumber?: number;
+  progressKey?: string;
+  progressPhase?: 'reason' | 'act' | 'observe';
+  progressStage?: string;
+  progressMessage?: string;
+  progressStatusText?: string;
+  result?: string;
+  success?: boolean;
+  error?: string;
+  errorType?: string;
+  isProgressMessage?: boolean;
+  isCompleted?: boolean;
 }
 
 // 历史步骤类型（兼容旧格式）

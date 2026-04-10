@@ -153,7 +153,7 @@ test.describe('Log panel timeline', () => {
         return;
       }
 
-      if (url.includes('/api/v1/tasks/devices/')) {
+      if (url.includes('/api/v1/devices/') && url.includes('/session')) {
         await route.fulfill({
           status: 200,
           contentType: 'application/json',

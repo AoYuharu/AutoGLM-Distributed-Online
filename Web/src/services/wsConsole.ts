@@ -19,6 +19,7 @@ import { useDeviceStore } from '../stores/deviceStore';
 export interface WsConsoleMessage {
   type:
     | 'agent_step'
+    | 'agent_progress'
     | 'agent_status'
     | 'agent_action_pending'
     | 'session_locked'
@@ -45,9 +46,12 @@ export interface WsConsoleMessage {
   screenshot?: string;
   success?: boolean;
   error?: string;
+  error_type?: string;
   status?: string;
+  stage?: string;
   message?: string;
   controller_id?: string;
+  version?: number;
   data?: Record<string, any>;
   devices?: Array<{
     device_id: string;

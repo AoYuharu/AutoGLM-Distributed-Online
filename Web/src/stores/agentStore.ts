@@ -7,23 +7,92 @@ import { agentStoreLogger } from '../hooks/useLogger';
 
 const MAX_MEMORY_ROUNDS = 10; // 最大记忆轮数
 
+function toConversationMessage(msg: Awaited<ReturnType<typeof agentApi.getChatHistory>>['messages'][number]): ChatMessage {
+  return {
+    id: msg.id,
+    role: msg.role as 'user' | 'agent',
+    content: msg.content,
+    timestamp: msg.created_at,
+    thinking: msg.thinking,
+    action: msg.action_type ? {
+      type: msg.action_type as any,
+      params: msg.action_params || {},
+      description: msg.action_type,
+    } : undefined,
+    screenshot: msg.screenshot_path,
+    taskId: msg.task_id,
+    stepNumber: msg.step_number ?? undefined,
+    progressPhase: msg.phase as ChatMessage['progressPhase'],
+    progressStage: msg.stage,
+    progressMessage: msg.progress_message,
+    progressStatusText: msg.progress_status_text,
+    result: msg.result,
+    success: msg.success,
+    error: msg.error,
+    errorType: msg.error_type,
+    isProgressMessage: Boolean(msg.stage || msg.progress_message || msg.progress_status_text),
+    isCompleted: msg.success === false
+      ? true
+      : Boolean(msg.stage && ['observe_received', 'ack_timeout', 'observe_timeout', 'ack_rejected'].includes(msg.stage)),
+    progressKey: msg.task_id && msg.step_number != null && msg.stage
+      ? `${msg.task_id}:${msg.step_number}:${msg.stage}`
+      : undefined,
+  };
+}
+
+function dedupeConversationMessages(messages: ChatMessage[]): ChatMessage[] {
+  const merged = new Map<string, ChatMessage>();
+  messages.forEach((message) => {
+    const existing = merged.get(message.id);
+    merged.set(message.id, existing ? mergeProgressMessage(existing, message) : message);
+  });
+  return Array.from(merged.values()).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+}
+
+function latestScreenshotFromConversation(messages: ChatMessage[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].screenshot) {
+      return messages[i].screenshot || null;
+    }
+  }
+  return null;
+}
+
+function progressTrackingFromConversation(messages: ChatMessage[]): Record<string, string> {
+  return messages.reduce<Record<string, string>>((acc, message) => {
+    if (message.isProgressMessage && message.progressKey && !message.isCompleted) {
+      acc[message.progressKey] = message.id;
+    }
+    return acc;
+  }, {});
+}
+
+function transientStateFromConversation(messages: ChatMessage[]) {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (!message.isProgressMessage || message.isCompleted) {
+      continue;
+    }
+
+    return {
+      currentPhase: message.progressPhase || null,
+      isThinking: message.progressPhase === 'reason' && Boolean(message.thinking),
+      thinkingContent: message.progressPhase === 'reason' ? (message.thinking || '') : '',
+    };
+  }
+
+  return resetTransientProgressState();
+}
+
+function mergeRestoredConversation(primary: ChatMessage[], secondary: ChatMessage[]): ChatMessage[] {
+  return dedupeConversationMessages([...primary, ...secondary]);
+}
+
 // 从 API 加载聊天历史
 async function loadConversationHistoryFromAPI(deviceId: string, taskId?: string | null): Promise<ChatMessage[]> {
   try {
     const response = await agentApi.getChatHistory(deviceId, 50, taskId || undefined);
-    return response.messages.map((msg) => ({
-      id: msg.id,
-      role: msg.role as 'user' | 'agent',
-      content: msg.content,
-      timestamp: msg.created_at,
-      thinking: msg.thinking,
-      action: msg.action_type ? {
-        type: msg.action_type as any,
-        params: msg.action_params || {},
-        description: msg.action_type,
-      } : undefined,
-      screenshot: msg.screenshot_path,
-    }));
+    return response.messages.map(toConversationMessage);
   } catch (e) {
     console.error('Failed to load conversation history from API:', e);
     return [];
@@ -61,6 +130,2960 @@ function buildHistoryFromSnapshot(snapshot: Awaited<ReturnType<typeof agentApi.g
   }));
 }
 
+function getProgressKey(taskId?: string | null, stepNumber?: number | null, stage?: string | null): string | null {
+  if (!taskId || stepNumber == null) return null;
+  return `${taskId}:${stepNumber}:${stage || 'progress'}`;
+}
+
+function getProgressStatusText(stage?: string): string {
+  switch (stage) {
+    case 'reason':
+    case 'reason_start':
+      return '开始调用模型';
+    case 'reason_stream':
+      return '模型推理中';
+    case 'reason_complete':
+      return 'Reason 完成';
+    case 'action_dispatched':
+      return '动作已下发';
+    case 'waiting_ack':
+      return '等待 ACK';
+    case 'ack_received':
+      return 'ACK 已收到';
+    case 'ack_rejected':
+      return 'ACK 被拒绝';
+    case 'waiting_observe':
+      return '等待 Observe';
+    case 'observe_received':
+      return 'Observe 已收到';
+    case 'ack_timeout':
+      return 'ACK 超时';
+    case 'observe_timeout':
+      return 'Observe 超时';
+    case 'initial_screenshot_ack_received':
+      return '已获取到ACK，等待初始截图';
+    case 'requesting_initial_screenshot':
+      return '初始截图请求';
+    case 'initial_screenshot_received':
+      return '已获取到初始截图';
+    default:
+      return stage || '进行中';
+  }
+}
+
+function getProgressContent(message: WsConsoleMessage): string {
+  if (message.error) {
+    return `❌ ${message.error}`;
+  }
+  if (message.result) {
+    return message.result;
+  }
+  return message.message || getProgressStatusText(message.stage);
+}
+
+function normalizeAction(action?: Record<string, any>): AgentAction | undefined {
+  if (!action || Object.keys(action).length === 0) return undefined;
+  return {
+    type: (action.action || 'unknown') as any,
+    params: action,
+    description: formatActionDescription(action),
+  };
+}
+
+function buildStatusFailureMessage(statusMessage?: string, data?: Record<string, any>): string {
+  const errorType = data?.error_type;
+  if (errorType === 'ack_timeout') {
+    return '执行失败: ACK 超时';
+  }
+  if (errorType === 'observe_timeout') {
+    return '执行失败: Observe 超时';
+  }
+  if (statusMessage === 'Device not found') {
+    return '执行失败: Device not found (ACK_TIMEOUT)';
+  }
+  return `执行失败: ${statusMessage || 'Task failed'}`;
+}
+
+function buildStatusCompletionMessage(statusMessage?: string): string {
+  return statusMessage || 'Task completed';
+}
+
+function buildStatusInterruptionMessage(statusMessage?: string, data?: Record<string, any>): string {
+  if (data?.reason === 'device_disconnected') {
+    return statusMessage || '设备连接断开，任务已中断';
+  }
+  return statusMessage || '任务被中断';
+}
+
+function mergeProgressMessage(message: ChatMessage, updates: Partial<ChatMessage>): ChatMessage {
+  return {
+    ...message,
+    ...updates,
+    thinking: updates.thinking ?? message.thinking,
+    action: updates.action ?? message.action,
+    screenshot: updates.screenshot ?? message.screenshot,
+    result: updates.result ?? message.result,
+    error: updates.error ?? message.error,
+    errorType: updates.errorType ?? message.errorType,
+    progressStatusText: updates.progressStatusText ?? message.progressStatusText,
+    progressMessage: updates.progressMessage ?? message.progressMessage,
+  };
+}
+
+function upsertConversationProgress(
+  history: ChatMessage[],
+  messageId: string,
+  baseMessage: ChatMessage,
+): ChatMessage[] {
+  const exists = history.some((msg) => msg.id === messageId);
+  if (!exists) {
+    return [...history, baseMessage];
+  }
+
+  return history.map((msg) => (msg.id === messageId ? mergeProgressMessage(msg, baseMessage) : msg));
+}
+
+function finalizeProgressMessages(
+  history: ChatMessage[],
+  taskId: string | null,
+  status: 'completed' | 'failed' | 'interrupted',
+  content?: string,
+  errorType?: string,
+): ChatMessage[] {
+  if (!taskId) return history;
+
+  return history.map((msg) => {
+    if (msg.taskId !== taskId || !msg.isProgressMessage || msg.isCompleted) {
+      return msg;
+    }
+
+    const isFailure = status === 'failed' || status === 'interrupted';
+    return {
+      ...msg,
+      content: content || msg.content,
+      progressStatusText: status === 'completed' ? '已完成' : status === 'failed' ? '已失败' : '已中断',
+      errorType: errorType || msg.errorType,
+      success: status === 'completed',
+      isCompleted: true,
+      error: isFailure ? (content || msg.error) : msg.error,
+    };
+  });
+}
+
+function clearProgressTracking(progressMessageIds: Record<string, string>, taskId: string | null): Record<string, string> {
+  if (!taskId) return progressMessageIds;
+
+  return Object.fromEntries(
+    Object.entries(progressMessageIds).filter(([key]) => !key.startsWith(`${taskId}:`))
+  );
+}
+
+function appendStatusMessageIfNeeded(
+  history: ChatMessage[],
+  taskId: string | null,
+  content: string,
+  status: 'completed' | 'failed' | 'interrupted',
+): ChatMessage[] {
+  if (!taskId) return history;
+  const hasOpenProgress = history.some((msg) => msg.taskId === taskId && msg.isProgressMessage && !msg.isCompleted);
+  if (hasOpenProgress) {
+    return history;
+  }
+
+  return [
+    ...history,
+    {
+      id: generateId(),
+      role: 'agent',
+      content,
+      timestamp: new Date().toISOString(),
+      taskId,
+      success: status === 'completed',
+      error: status === 'completed' ? undefined : content,
+      errorType: status === 'failed' ? 'task_failed' : undefined,
+      isCompleted: true,
+    },
+  ];
+}
+
+function shouldMarkProgressCompleted(stage?: string): boolean {
+  return stage === 'observe_received' || stage === 'ack_timeout' || stage === 'observe_timeout' || stage === 'ack_rejected';
+}
+
+function shouldKeepThinkingPanel(stage?: string): boolean {
+  return stage === 'reason_complete';
+}
+
+function inferProgressPhase(message: WsConsoleMessage): 'reason' | 'act' | 'observe' {
+  return (message.phase as 'reason' | 'act' | 'observe') || 'act';
+}
+
+function inferMessageSuccess(message: WsConsoleMessage): boolean | undefined {
+  if (message.success !== undefined) return message.success;
+  if (message.stage === 'ack_timeout' || message.stage === 'observe_timeout' || message.stage === 'ack_rejected') {
+    return false;
+  }
+  if (message.stage === 'observe_received') {
+    return message.error ? false : true;
+  }
+  return undefined;
+}
+
+function inferMessageError(message: WsConsoleMessage): string | undefined {
+  return message.error || (inferMessageSuccess(message) === false ? getProgressStatusText(message.stage) : undefined);
+}
+
+function inferProgressTimestamp(): string {
+  return new Date().toISOString();
+}
+
+function isSameProgressMessage(msg: ChatMessage, progressKey: string): boolean {
+  return msg.progressKey === progressKey || msg.id === progressKey;
+}
+
+function updateProgressHistoryByKey(
+  history: ChatMessage[],
+  progressKey: string,
+  updater: (msg: ChatMessage) => ChatMessage,
+): ChatMessage[] {
+  return history.map((msg) => (isSameProgressMessage(msg, progressKey) ? updater(msg) : msg));
+}
+
+function hasProgressMessage(history: ChatMessage[], progressKey: string): boolean {
+  return history.some((msg) => isSameProgressMessage(msg, progressKey));
+}
+
+function buildProgressMessageId(progressKey: string): string {
+  return progressKey;
+}
+
+function getTaskIdFromMessage(message: WsConsoleMessage): string | null {
+  return message.task_id || null;
+}
+
+function getStepNumberFromMessage(message: WsConsoleMessage): number {
+  return message.step_number ?? 0;
+}
+
+function shouldFinalizeOnAgentStep(message: WsConsoleMessage): boolean {
+  return message.step_number != null && Boolean(message.task_id);
+}
+
+function finalizeProgressForStep(
+  history: ChatMessage[],
+  progressKey: string,
+  updates: Partial<ChatMessage>,
+): ChatMessage[] {
+  return updateProgressHistoryByKey(history, progressKey, (msg) => ({
+    ...mergeProgressMessage(msg, updates),
+    isCompleted: true,
+  }));
+}
+
+function normalizeStatusData(data?: Record<string, any>): Record<string, any> {
+  return data || {};
+}
+
+function normalizeFailureErrorType(message: WsConsoleMessage): string | undefined {
+  return message.error_type || message.data?.error_type;
+}
+
+function normalizeFailureMessage(message: WsConsoleMessage): string {
+  return buildStatusFailureMessage(message.message, normalizeStatusData(message.data));
+}
+
+function normalizeCompletionMessage(message: WsConsoleMessage): string {
+  return buildStatusCompletionMessage(message.message);
+}
+
+function normalizeInterruptionMessage(message: WsConsoleMessage): string {
+  return buildStatusInterruptionMessage(message.message, normalizeStatusData(message.data));
+}
+
+function progressHistoryAfterStatus(
+  history: ChatMessage[],
+  taskId: string | null,
+  status: 'completed' | 'failed' | 'interrupted',
+  content: string,
+  errorType?: string,
+): ChatMessage[] {
+  const finalized = finalizeProgressMessages(history, taskId, status, content, errorType);
+  return appendStatusMessageIfNeeded(finalized, taskId, content, status);
+}
+
+function shouldSuppressStandaloneAgentStep(history: ChatMessage[], progressKey: string | null): boolean {
+  return Boolean(progressKey && hasProgressMessage(history, progressKey));
+}
+
+function buildAgentStepMessageContent(action?: Record<string, any>, result?: string, success?: boolean, error?: string): string {
+  if (success === false) {
+    return `❌ ${error || result || '执行失败'}`;
+  }
+  if (action && Object.keys(action).length > 0) {
+    return formatActionDescription(action);
+  }
+  return result || '步骤完成';
+}
+
+function buildProgressBubbleContent(message: WsConsoleMessage): string {
+  return getProgressContent(message);
+}
+
+function updateProgressTracking(
+  map: Record<string, string>,
+  progressKey: string,
+  messageId: string,
+): Record<string, string> {
+  return {
+    ...map,
+    [progressKey]: messageId,
+  };
+}
+
+function removeProgressTracking(
+  map: Record<string, string>,
+  progressKey?: string | null,
+): Record<string, string> {
+  if (!progressKey) return map;
+  const next = { ...map };
+  delete next[progressKey];
+  return next;
+}
+
+function removeTaskProgressTracking(
+  map: Record<string, string>,
+  taskId: string | null,
+): Record<string, string> {
+  return clearProgressTracking(map, taskId);
+}
+
+function normalizeProgressResult(message: WsConsoleMessage): string | undefined {
+  return message.result || undefined;
+}
+
+function normalizeProgressScreenshot(message: WsConsoleMessage): string | undefined {
+  return message.screenshot || undefined;
+}
+
+function normalizeProgressErrorType(message: WsConsoleMessage): string | undefined {
+  return message.error_type || undefined;
+}
+
+function normalizeProgressAction(message: WsConsoleMessage): AgentAction | undefined {
+  return normalizeAction(message.action);
+}
+
+function normalizeProgressThinking(message: WsConsoleMessage): string | undefined {
+  return message.reasoning || undefined;
+}
+
+function normalizeProgressMessageText(message: WsConsoleMessage): string {
+  return message.message || getProgressStatusText(message.stage);
+}
+
+function normalizeProgressStage(message: WsConsoleMessage): string {
+  return message.stage || 'progress';
+}
+
+function normalizeProgressTaskId(message: WsConsoleMessage): string | null {
+  return getTaskIdFromMessage(message);
+}
+
+function normalizeProgressStepNumber(message: WsConsoleMessage): number {
+  return getStepNumberFromMessage(message);
+}
+
+function normalizeProgressKey(message: WsConsoleMessage): string | null {
+  // Collapse all reason-related stages into a single evolving bubble.
+  // reason_start / reason_stream / reason_complete all use the same :reason key.
+  const rawStage = normalizeProgressStage(message);
+  const collapsedStage = isReasonStage(rawStage) ? 'reason' : rawStage;
+  return getProgressKey(
+    normalizeProgressTaskId(message) || undefined,
+    normalizeProgressStepNumber(message),
+    collapsedStage,
+  );
+}
+
+function shouldFinalizeProgressMessage(message: WsConsoleMessage): boolean {
+  return shouldMarkProgressCompleted(message.stage);
+}
+
+function normalizeProgressStatus(message: WsConsoleMessage): string {
+  return getProgressStatusText(message.stage);
+}
+
+function normalizeProgressSuccess(message: WsConsoleMessage): boolean | undefined {
+  return inferMessageSuccess(message);
+}
+
+function normalizeProgressError(message: WsConsoleMessage): string | undefined {
+  return inferMessageError(message);
+}
+
+function normalizeProgressPhase(message: WsConsoleMessage): 'reason' | 'act' | 'observe' {
+  return inferProgressPhase(message);
+}
+
+function normalizeProgressTimestampValue(): string {
+  return inferProgressTimestamp();
+}
+
+function shouldHideThinkingPanel(message: WsConsoleMessage): boolean {
+  return !shouldKeepThinkingPanel(message.stage);
+}
+
+function normalizeStatusTaskId(message: WsConsoleMessage): string | null {
+  return message.task_id || message.data?.task_id || null;
+}
+
+function normalizeAgentStepProgressKey(message: WsConsoleMessage): string | null {
+  // Apply same reason-stage normalization so agent_step is suppressed if a reason bubble exists.
+  const rawStage = message.stage || 'observe_received';
+  const collapsedStage = isReasonStage(rawStage) ? 'reason' : rawStage;
+  return getProgressKey(message.task_id, message.step_number, collapsedStage);
+}
+
+function getAnyStepProgressKeys(progressMessageIds: Record<string, string>, message: WsConsoleMessage): string[] {
+  const taskId = message.task_id;
+  const stepNumber = message.step_number;
+  if (!taskId || stepNumber == null) {
+    return [];
+  }
+
+  const prefix = `${taskId}:${stepNumber}:`;
+  return Object.keys(progressMessageIds).filter((key) => key.startsWith(prefix));
+}
+
+function hasAnyStepProgressMessage(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): boolean {
+  const taskId = message.task_id;
+  const stepNumber = message.step_number;
+  if (!taskId || stepNumber == null) {
+    return false;
+  }
+
+  const prefix = `${taskId}:${stepNumber}:`;
+  return state.conversationHistory.some((item) => item.progressKey?.startsWith(prefix));
+}
+
+function markAllStepProgressCompleted(
+  history: ChatMessage[],
+  message: WsConsoleMessage,
+): ChatMessage[] {
+  const taskId = message.task_id;
+  const stepNumber = message.step_number;
+  if (!taskId || stepNumber == null) {
+    return history;
+  }
+
+  const prefix = `${taskId}:${stepNumber}:`;
+  return history.map((item) => {
+    if (!item.progressKey?.startsWith(prefix)) {
+      return item;
+    }
+
+    return mergeProgressMessage(item, {
+      screenshot: normalizeAgentStepScreenshot(message),
+      result: normalizeAgentStepResult(message),
+      success: normalizeAgentStepSuccess(message),
+      error: normalizeAgentStepError(message),
+      errorType: normalizeAgentStepErrorType(message),
+      isCompleted: true,
+      progressStatusText: item.progressStatusText || (message.success === false ? '已失败' : '已完成'),
+    });
+  });
+}
+
+function removeAllStepProgressTracking(
+  progressMessageIds: Record<string, string>,
+  message: WsConsoleMessage,
+): Record<string, string> {
+  return getAnyStepProgressKeys(progressMessageIds, message).reduce<Record<string, string>>((acc, key) => {
+    const next = { ...acc };
+    delete next[key];
+    return next;
+  }, { ...progressMessageIds });
+}
+
+function latestOpenProgressMessageForStep(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): ChatMessage | undefined {
+  const taskId = message.task_id;
+  const stepNumber = message.step_number;
+  if (!taskId || stepNumber == null) {
+    return undefined;
+  }
+
+  const prefix = `${taskId}:${stepNumber}:`;
+  return [...state.conversationHistory]
+    .reverse()
+    .find((item) => item.progressKey?.startsWith(prefix) && !item.isCompleted);
+}
+
+function shouldSyncProgressScreenshotOnStep(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): boolean {
+  return Boolean(latestOpenProgressMessageForStep(state, message)?.screenshot);
+}
+
+function screenshotForStepMessage(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): string | undefined {
+  return message.screenshot || latestOpenProgressMessageForStep(state, message)?.screenshot;
+}
+
+function normalizeAgentStepAction(message: WsConsoleMessage): AgentAction | undefined {
+  return normalizeAction(message.action);
+}
+
+function normalizeAgentStepThinking(message: WsConsoleMessage): string | undefined {
+  return message.reasoning || undefined;
+}
+
+function normalizeAgentStepScreenshot(message: WsConsoleMessage): string | undefined {
+  return message.screenshot || undefined;
+}
+
+function normalizeAgentStepResult(message: WsConsoleMessage): string | undefined {
+  return message.result || undefined;
+}
+
+function normalizeAgentStepError(message: WsConsoleMessage): string | undefined {
+  return message.error || undefined;
+}
+
+function normalizeAgentStepErrorType(message: WsConsoleMessage): string | undefined {
+  return message.error_type || undefined;
+}
+
+function normalizeAgentStepSuccess(message: WsConsoleMessage): boolean {
+  return message.success ?? true;
+}
+
+function normalizeAgentStepContent(message: WsConsoleMessage): string {
+  return buildAgentStepMessageContent(message.action, message.result, message.success, message.error);
+}
+
+function normalizeAgentStepTimestamp(): string {
+  return new Date().toISOString();
+}
+
+function normalizeAgentStepNumber(message: WsConsoleMessage): number {
+  return message.step_number ?? 0;
+}
+
+function normalizeAgentStepTaskId(message: WsConsoleMessage): string | null {
+  return message.task_id || null;
+}
+
+function normalizeStatusErrorType(message: WsConsoleMessage): string | undefined {
+  return message.error_type || message.data?.error_type;
+}
+
+function normalizeStatusReason(message: WsConsoleMessage): string | undefined {
+  return message.data?.reason;
+}
+
+function normalizeStatusFinalReasoning(message: WsConsoleMessage): string | undefined {
+  return message.data?.final_reasoning;
+}
+
+function statusShouldStopThinking(status?: string): boolean {
+  return status === 'completed' || status === 'failed' || status === 'interrupted';
+}
+
+function resetTransientProgressState() {
+  return {
+    currentPhase: null as 'reason' | 'act' | 'observe' | null,
+    isThinking: false,
+    thinkingContent: '',
+  };
+}
+
+function buildProgressBaseMessage(message: WsConsoleMessage, progressKey: string): ChatMessage {
+  return {
+    id: buildProgressMessageId(progressKey),
+    role: 'agent',
+    content: buildProgressBubbleContent(message),
+    timestamp: normalizeProgressTimestampValue(),
+    taskId: normalizeProgressTaskId(message) || undefined,
+    stepNumber: normalizeProgressStepNumber(message),
+    progressKey,
+    progressPhase: normalizeProgressPhase(message),
+    progressStage: normalizeProgressStage(message),
+    progressMessage: normalizeProgressMessageText(message),
+    progressStatusText: normalizeProgressStatus(message),
+    thinking: normalizeProgressThinking(message),
+    action: normalizeProgressAction(message),
+    screenshot: normalizeProgressScreenshot(message),
+    result: normalizeProgressResult(message),
+    success: normalizeProgressSuccess(message),
+    error: normalizeProgressError(message),
+    errorType: normalizeProgressErrorType(message),
+    isProgressMessage: true,
+    isCompleted: shouldFinalizeProgressMessage(message),
+  };
+}
+
+function updateProgressMessageFromWs(existing: ChatMessage, message: WsConsoleMessage): ChatMessage {
+  return mergeProgressMessage(existing, {
+    content: buildProgressBubbleContent(message),
+    timestamp: normalizeProgressTimestampValue(),
+    progressPhase: normalizeProgressPhase(message),
+    progressStage: normalizeProgressStage(message),
+    progressMessage: normalizeProgressMessageText(message),
+    progressStatusText: normalizeProgressStatus(message),
+    thinking: normalizeProgressThinking(message),
+    action: normalizeProgressAction(message),
+    screenshot: normalizeProgressScreenshot(message),
+    result: normalizeProgressResult(message),
+    success: normalizeProgressSuccess(message),
+    error: normalizeProgressError(message),
+    errorType: normalizeProgressErrorType(message),
+    isProgressMessage: true,
+    isCompleted: shouldFinalizeProgressMessage(message),
+  });
+}
+
+function upsertProgressIntoHistory(
+  history: ChatMessage[],
+  progressKey: string,
+  message: WsConsoleMessage,
+): ChatMessage[] {
+  const base = buildProgressBaseMessage(message, progressKey);
+  if (!hasProgressMessage(history, progressKey)) {
+    return [...history, base];
+  }
+
+  return updateProgressHistoryByKey(history, progressKey, (existing) => updateProgressMessageFromWs(existing, message));
+}
+
+function markStepProgressCompleted(
+  history: ChatMessage[],
+  progressKey: string,
+  message: WsConsoleMessage,
+): ChatMessage[] {
+  return finalizeProgressForStep(history, progressKey, {
+    content: normalizeAgentStepContent(message),
+    timestamp: normalizeAgentStepTimestamp(),
+    thinking: normalizeAgentStepThinking(message),
+    action: normalizeAgentStepAction(message),
+    screenshot: normalizeAgentStepScreenshot(message),
+    result: normalizeAgentStepResult(message),
+    success: normalizeAgentStepSuccess(message),
+    error: normalizeAgentStepError(message),
+    errorType: normalizeAgentStepErrorType(message),
+    progressStage: message.success === false ? 'observe_timeout' : 'observe_received',
+    progressStatusText: message.success === false ? '已失败' : '已完成',
+  });
+}
+
+function buildStandaloneAgentStepMessage(message: WsConsoleMessage): ChatMessage {
+  return {
+    id: generateId(),
+    role: 'agent',
+    content: normalizeAgentStepContent(message),
+    timestamp: normalizeAgentStepTimestamp(),
+    taskId: normalizeAgentStepTaskId(message) || undefined,
+    stepNumber: normalizeAgentStepNumber(message),
+    thinking: normalizeAgentStepThinking(message),
+    action: normalizeAgentStepAction(message),
+    screenshot: normalizeAgentStepScreenshot(message),
+    result: normalizeAgentStepResult(message),
+    success: normalizeAgentStepSuccess(message),
+    error: normalizeAgentStepError(message),
+    errorType: normalizeAgentStepErrorType(message),
+    isCompleted: true,
+  };
+}
+
+function applyStatusToState(
+  history: ChatMessage[],
+  message: WsConsoleMessage,
+): ChatMessage[] {
+  const taskId = normalizeStatusTaskId(message);
+
+  if (message.status === 'finished' || message.status === 'completed') {
+    return progressHistoryAfterStatus(history, taskId, 'completed', normalizeCompletionMessage(message));
+  }
+  if (message.status === 'error' || message.status === 'failed') {
+    return progressHistoryAfterStatus(
+      history,
+      taskId,
+      'failed',
+      normalizeFailureMessage(message),
+      normalizeStatusErrorType(message),
+    );
+  }
+  if (message.status === 'interrupted') {
+    return progressHistoryAfterStatus(history, taskId, 'interrupted', normalizeInterruptionMessage(message));
+  }
+
+  return history;
+}
+
+function updateProgressMapForStatus(
+  progressMessageIds: Record<string, string>,
+  message: WsConsoleMessage,
+): Record<string, string> {
+  if (message.status === 'finished' || message.status === 'completed' || message.status === 'error' || message.status === 'failed' || message.status === 'interrupted') {
+    return removeTaskProgressTracking(progressMessageIds, normalizeStatusTaskId(message));
+  }
+  return progressMessageIds;
+}
+
+function updateStoreTransientForProgress(message: WsConsoleMessage) {
+  return {
+    currentPhase: normalizeProgressPhase(message),
+    isThinking: normalizeProgressPhase(message) === 'reason' && !shouldHideThinkingPanel(message),
+    thinkingContent: normalizeProgressThinking(message) || '',
+  };
+}
+
+function updateStoreTransientForStep() {
+  return resetTransientProgressState();
+}
+
+function updateStoreTransientForStatus(message: WsConsoleMessage) {
+  return statusShouldStopThinking(message.status) ? resetTransientProgressState() : {};
+}
+
+function shouldUpdateScreenshotFromMessage(message: WsConsoleMessage): boolean {
+  return Boolean(message.screenshot);
+}
+
+function shouldUpdateDeviceBusyStatus(message: WsConsoleMessage): boolean {
+  return message.type === 'agent_progress' || message.type === 'agent_step';
+}
+
+function isTerminalAgentStatus(status?: string): boolean {
+  return status === 'finished' || status === 'completed' || status === 'error' || status === 'failed' || status === 'interrupted';
+}
+
+function shouldForgetMessagesAfterStatus(status?: string): boolean {
+  return status === 'finished' || status === 'completed';
+}
+
+function progressMessageIdForState(progressMessageIds: Record<string, string>, progressKey: string): string {
+  return progressMessageIds[progressKey] || buildProgressMessageId(progressKey);
+}
+
+function upsertProgressStateHistory(
+  history: ChatMessage[],
+  progressKey: string,
+  messageId: string,
+  message: WsConsoleMessage,
+): ChatMessage[] {
+  const baseMessage = buildProgressBaseMessage(message, progressKey);
+  baseMessage.id = messageId;
+  return upsertConversationProgress(history, messageId, baseMessage);
+}
+
+function updateProgressStateHistory(
+  history: ChatMessage[],
+  progressKey: string,
+  messageId: string,
+  message: WsConsoleMessage,
+): ChatMessage[] {
+  return hasProgressMessage(history, progressKey)
+    ? updateProgressHistoryByKey(history, progressKey, (existing) => updateProgressMessageFromWs(existing, message))
+    : upsertProgressStateHistory(history, progressKey, messageId, message);
+}
+
+function progressMessageExists(history: ChatMessage[], progressKey: string): boolean {
+  return hasProgressMessage(history, progressKey);
+}
+
+function nextProgressMessageId(progressMessageIds: Record<string, string>, progressKey: string): string {
+  return progressMessageIdForState(progressMessageIds, progressKey);
+}
+
+function createProgressMessageId(progressKey: string): string {
+  return buildProgressMessageId(progressKey);
+}
+
+function shouldAppendStandaloneStatusMessage(history: ChatMessage[], taskId: string | null): boolean {
+  return !history.some((msg) => msg.taskId === taskId && msg.isProgressMessage && !msg.isCompleted);
+}
+
+function clearTransientProgressOnStatus(status?: string) {
+  return statusShouldStopThinking(status) ? resetTransientProgressState() : {};
+}
+
+function normalizeStatusContent(message: WsConsoleMessage): string {
+  if (message.status === 'finished' || message.status === 'completed') return normalizeCompletionMessage(message);
+  if (message.status === 'error' || message.status === 'failed') return normalizeFailureMessage(message);
+  if (message.status === 'interrupted') return normalizeInterruptionMessage(message);
+  return message.message || '';
+}
+
+function buildStandaloneStatusMessage(message: WsConsoleMessage): ChatMessage {
+  return {
+    id: generateId(),
+    role: 'agent',
+    content: normalizeStatusContent(message),
+    timestamp: new Date().toISOString(),
+    taskId: normalizeStatusTaskId(message) || undefined,
+    errorType: normalizeStatusErrorType(message),
+    success: message.status === 'completed' || message.status === 'finished',
+    error: message.status === 'failed' || message.status === 'error' || message.status === 'interrupted'
+      ? normalizeStatusContent(message)
+      : undefined,
+    isCompleted: true,
+  };
+}
+
+function ensureStatusMessage(history: ChatMessage[], message: WsConsoleMessage): ChatMessage[] {
+  const taskId = normalizeStatusTaskId(message);
+  if (!shouldAppendStandaloneStatusMessage(history, taskId)) {
+    return history;
+  }
+  return [...history, buildStandaloneStatusMessage(message)];
+}
+
+function isFailureStatus(status?: string): boolean {
+  return status === 'error' || status === 'failed';
+}
+
+function isCompletionStatus(status?: string): boolean {
+  return status === 'finished' || status === 'completed';
+}
+
+function isInterruptionStatus(status?: string): boolean {
+  return status === 'interrupted';
+}
+
+function normalizeFailureStateMessage(message: WsConsoleMessage): string {
+  return normalizeFailureMessage(message);
+}
+
+function normalizeCompletionStateMessage(message: WsConsoleMessage): string {
+  return normalizeCompletionMessage(message);
+}
+
+function normalizeInterruptionStateMessage(message: WsConsoleMessage): string {
+  return normalizeInterruptionMessage(message);
+}
+
+function shouldKeepStatusOnlyMessage(message: WsConsoleMessage): boolean {
+  return isTerminalAgentStatus(message.status);
+}
+
+function progressTrackingFromState(state: { progressMessageIds: Record<string, string> }) {
+  return state.progressMessageIds;
+}
+
+function withUpdatedProgressMessage(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+): { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string>; messageId: string | null } {
+  const progressKey = normalizeProgressKey(message);
+  if (!progressKey) {
+    return {
+      conversationHistory: state.conversationHistory,
+      progressMessageIds: state.progressMessageIds,
+      messageId: null,
+    };
+  }
+
+  const messageId = nextProgressMessageId(state.progressMessageIds, progressKey);
+  const conversationHistory = updateProgressStateHistory(state.conversationHistory, progressKey, messageId, message);
+  const progressMessageIds = updateProgressTracking(state.progressMessageIds, progressKey, messageId);
+  return { conversationHistory, progressMessageIds, messageId };
+}
+
+function finalizeStepInState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+): { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> } {
+  const progressKey = normalizeAgentStepProgressKey(message);
+  if (!progressKey || !progressMessageExists(state.conversationHistory, progressKey)) {
+    return state;
+  }
+
+  return {
+    conversationHistory: markStepProgressCompleted(state.conversationHistory, progressKey, message),
+    progressMessageIds: removeProgressTracking(state.progressMessageIds, progressKey),
+  };
+}
+
+function appendStandaloneStepInState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+): { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> } {
+  return {
+    conversationHistory: [...state.conversationHistory, buildStandaloneAgentStepMessage(message)],
+    progressMessageIds: state.progressMessageIds,
+  };
+}
+
+function applyStatusInState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+): { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> } {
+  const conversationHistory = ensureStatusMessage(applyStatusToState(state.conversationHistory, message), message);
+  const progressMessageIds = updateProgressMapForStatus(state.progressMessageIds, message);
+  return { conversationHistory, progressMessageIds };
+}
+
+function shouldShowStepAsSeparateBubble(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): boolean {
+  return !shouldSuppressStandaloneAgentStep(state.conversationHistory, normalizeAgentStepProgressKey(message));
+}
+
+function shouldTrackProgressMessage(message: WsConsoleMessage): boolean {
+  return Boolean(normalizeProgressKey(message));
+}
+
+function shouldUpdateCurrentPhaseFromProgress(_message: WsConsoleMessage): boolean {
+  return true;
+}
+
+function shouldResetPhaseOnStep(): boolean {
+  return true;
+}
+
+function shouldResetPhaseOnStatus(status?: string): boolean {
+  return statusShouldStopThinking(status);
+}
+
+function getDeviceBusyPatch() {
+  return { status: 'busy' as const };
+}
+
+function getDeviceIdlePatch(currentDeviceStatus?: string) {
+  return { status: currentDeviceStatus === 'offline' ? 'offline' as const : 'idle' as const };
+}
+
+function getDeviceErrorPatch() {
+  return { status: 'error' as const };
+}
+
+function setCurrentStepFromAgentStep(message: WsConsoleMessage): AgentStep {
+  return {
+    id: `step_${normalizeAgentStepNumber(message)}`,
+    phase: 'action',
+    action: {
+      type: (message.action?.action || 'unknown') as any,
+      params: message.action || {},
+      description: formatActionDescription(message.action),
+    },
+    thinking: message.reasoning || '',
+    timestamp: new Date().toISOString(),
+    success: message.success ?? true,
+    step_number: normalizeAgentStepNumber(message),
+    error: message.error,
+  };
+}
+
+function updateProgressMessageWithStep(message: WsConsoleMessage): Partial<ChatMessage> {
+  return {
+    content: normalizeAgentStepContent(message),
+    thinking: normalizeAgentStepThinking(message),
+    action: normalizeAgentStepAction(message),
+    screenshot: normalizeAgentStepScreenshot(message),
+    result: normalizeAgentStepResult(message),
+    success: normalizeAgentStepSuccess(message),
+    error: normalizeAgentStepError(message),
+    errorType: normalizeAgentStepErrorType(message),
+    progressStage: message.success === false ? 'observe_timeout' : 'observe_received',
+    progressStatusText: message.success === false ? '已失败' : '已完成',
+    isCompleted: true,
+  };
+}
+
+function shouldUseExistingProgressMessage(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): boolean {
+  return hasAnyStepProgressMessage(state, message);
+}
+
+function removeStepProgressTracking(
+  progressMessageIds: Record<string, string>,
+  message: WsConsoleMessage,
+): Record<string, string> {
+  return removeAllStepProgressTracking(progressMessageIds, message);
+}
+
+function getTaskIdOrUndefined(taskId: string | null): string | undefined {
+  return taskId || undefined;
+}
+
+function getReasoningOrUndefined(reasoning?: string): string | undefined {
+  return reasoning || undefined;
+}
+
+function getScreenshotOrUndefined(screenshot?: string): string | undefined {
+  return screenshot || undefined;
+}
+
+function getErrorOrUndefined(error?: string): string | undefined {
+  return error || undefined;
+}
+
+function getResultOrUndefined(result?: string): string | undefined {
+  return result || undefined;
+}
+
+function buildAgentStepChatMessage(message: WsConsoleMessage): ChatMessage {
+  return {
+    id: generateId(),
+    role: 'agent',
+    content: normalizeAgentStepContent(message),
+    timestamp: normalizeAgentStepTimestamp(),
+    taskId: getTaskIdOrUndefined(normalizeAgentStepTaskId(message)),
+    stepNumber: normalizeAgentStepNumber(message),
+    thinking: getReasoningOrUndefined(message.reasoning),
+    action: normalizeAgentStepAction(message),
+    screenshot: getScreenshotOrUndefined(message.screenshot),
+    result: getResultOrUndefined(message.result),
+    success: normalizeAgentStepSuccess(message),
+    error: getErrorOrUndefined(message.error),
+    errorType: normalizeAgentStepErrorType(message),
+    isCompleted: true,
+  };
+}
+
+function buildProgressChatMessage(message: WsConsoleMessage, progressKey: string, messageId: string): ChatMessage {
+  const chatMessage = buildProgressBaseMessage(message, progressKey);
+  chatMessage.id = messageId;
+  return chatMessage;
+}
+
+function applyProgressMessageToHistory(
+  history: ChatMessage[],
+  message: WsConsoleMessage,
+  progressKey: string,
+  messageId: string,
+): ChatMessage[] {
+  const chatMessage = buildProgressChatMessage(message, progressKey, messageId);
+  return upsertConversationProgress(history, messageId, chatMessage);
+}
+
+function progressMessageMapAfterUpsert(
+  progressMessageIds: Record<string, string>,
+  progressKey: string,
+  messageId: string,
+): Record<string, string> {
+  return updateProgressTracking(progressMessageIds, progressKey, messageId);
+}
+
+function getOrCreateProgressMessageId(
+  progressMessageIds: Record<string, string>,
+  progressKey: string,
+): string {
+  return progressMessageIds[progressKey] || buildProgressMessageId(progressKey);
+}
+
+function isReasonPhase(message: WsConsoleMessage): boolean {
+  return normalizeProgressPhase(message) === 'reason';
+}
+
+function getThinkingPanelStateFromProgress(message: WsConsoleMessage) {
+  return {
+    currentPhase: normalizeProgressPhase(message),
+    isThinking: isReasonPhase(message) && !shouldHideThinkingPanel(message),
+    thinkingContent: normalizeProgressThinking(message) || '',
+  };
+}
+
+function getThinkingPanelStateFromStep() {
+  return resetTransientProgressState();
+}
+
+function getThinkingPanelStateFromStatus(message: WsConsoleMessage) {
+  return clearTransientProgressOnStatus(message.status);
+}
+
+function buildProgressUpsertResult(
+  conversationHistory: ChatMessage[],
+  progressMessageIds: Record<string, string>,
+  messageId: string | null,
+) {
+  return { conversationHistory, progressMessageIds, messageId };
+}
+
+function buildNoProgressUpsertResult(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+) {
+  return {
+    conversationHistory: state.conversationHistory,
+    progressMessageIds: state.progressMessageIds,
+    messageId: null,
+  };
+}
+
+function withProgressMessage(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  const progressKey = normalizeProgressKey(message);
+  if (!progressKey) {
+    return buildNoProgressUpsertResult(state);
+  }
+  const messageId = getOrCreateProgressMessageId(state.progressMessageIds, progressKey);
+  return buildProgressUpsertResult(
+    applyProgressMessageToHistory(state.conversationHistory, message, progressKey, messageId),
+    progressMessageMapAfterUpsert(state.progressMessageIds, progressKey, messageId),
+    messageId,
+  );
+}
+
+function getProgressKeyFromTaskStep(taskId?: string | null, stepNumber?: number): string | null {
+  return getProgressKey(taskId || undefined, stepNumber);
+}
+
+function clearProgressOnSessionReset() {
+  return {} as Record<string, string>;
+}
+
+function mergeSavedHistory(messages: ChatMessage[]): ChatMessage[] {
+  return messages;
+}
+
+function normalizeInitialProgressMap(): Record<string, string> {
+  return {};
+}
+
+function normalizeSavedHistory(messages: ChatMessage[]): ChatMessage[] {
+  return mergeSavedHistory(messages);
+}
+
+function shouldUpdateBusyStatusFromProgress(_message: WsConsoleMessage): boolean {
+  return true;
+}
+
+function shouldUpdateBusyStatusFromStep(_message: WsConsoleMessage): boolean {
+  return true;
+}
+
+function normalizeStatusRunning(message: WsConsoleMessage): boolean {
+  return hasActiveBackendTask(normalizeStatusTaskId(message), message.status, true);
+}
+
+function normalizeStatusPending(message: WsConsoleMessage, currentTaskId: string | null, canInterrupt: boolean): boolean {
+  return hasActiveBackendTask(currentTaskId, message.status, canInterrupt);
+}
+
+function normalizeTaskIdForStatus(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return normalizeStatusTaskId(message) || currentTaskId;
+}
+
+function normalizeTaskIdForProgress(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return normalizeProgressTaskId(message) || currentTaskId;
+}
+
+function normalizeTaskIdForStep(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return normalizeAgentStepTaskId(message) || currentTaskId;
+}
+
+function updateCurrentTaskIdFromMessage(taskIdFromMessage: string | null, currentTaskId: string | null): string | null {
+  return taskIdFromMessage || currentTaskId;
+}
+
+function shouldSetCurrentTaskIdFromProgress(message: WsConsoleMessage): boolean {
+  return Boolean(normalizeProgressTaskId(message));
+}
+
+function shouldSetCurrentTaskIdFromStep(message: WsConsoleMessage): boolean {
+  return Boolean(normalizeAgentStepTaskId(message));
+}
+
+function shouldSetCurrentTaskIdFromStatus(message: WsConsoleMessage): boolean {
+  return Boolean(normalizeStatusTaskId(message));
+}
+
+function normalizeMessageTaskId(message: WsConsoleMessage): string | null {
+  return message.task_id || message.data?.task_id || null;
+}
+
+function normalizeMessageErrorType(message: WsConsoleMessage): string | undefined {
+  return message.error_type || message.data?.error_type;
+}
+
+function normalizeMessageSuccess(message: WsConsoleMessage): boolean | undefined {
+  return message.success;
+}
+
+function normalizeMessageScreenshot(message: WsConsoleMessage): string | undefined {
+  return message.screenshot || undefined;
+}
+
+function normalizeMessageReasoning(message: WsConsoleMessage): string | undefined {
+  return message.reasoning || undefined;
+}
+
+function normalizeMessageAction(message: WsConsoleMessage): AgentAction | undefined {
+  return normalizeAction(message.action);
+}
+
+function normalizeMessageResult(message: WsConsoleMessage): string | undefined {
+  return message.result || undefined;
+}
+
+function normalizeMessageError(message: WsConsoleMessage): string | undefined {
+  return message.error || undefined;
+}
+
+function normalizeProgressMessageUpdates(message: WsConsoleMessage): Partial<ChatMessage> {
+  return {
+    content: buildProgressBubbleContent(message),
+    timestamp: normalizeProgressTimestampValue(),
+    taskId: normalizeProgressTaskId(message) || undefined,
+    stepNumber: normalizeProgressStepNumber(message),
+    progressPhase: normalizeProgressPhase(message),
+    progressStage: normalizeProgressStage(message),
+    progressMessage: normalizeProgressMessageText(message),
+    progressStatusText: normalizeProgressStatus(message),
+    thinking: normalizeProgressThinking(message),
+    action: normalizeProgressAction(message),
+    screenshot: normalizeProgressScreenshot(message),
+    result: normalizeProgressResult(message),
+    success: normalizeProgressSuccess(message),
+    error: normalizeProgressError(message),
+    errorType: normalizeProgressErrorType(message),
+    isProgressMessage: true,
+    isCompleted: shouldFinalizeProgressMessage(message),
+  };
+}
+
+function updateExistingProgressMessage(msg: ChatMessage, message: WsConsoleMessage): ChatMessage {
+  return mergeProgressMessage(msg, normalizeProgressMessageUpdates(message));
+}
+
+function upsertProgressMessageInHistory(history: ChatMessage[], message: WsConsoleMessage, progressKey: string, messageId: string): ChatMessage[] {
+  const exists = hasProgressMessage(history, progressKey);
+  if (!exists) {
+    return [...history, { ...buildProgressBaseMessage(message, progressKey), id: messageId }];
+  }
+  return updateProgressHistoryByKey(history, progressKey, (msg) => updateExistingProgressMessage(msg, message));
+}
+
+function finalizeProgressWithStep(history: ChatMessage[], message: WsConsoleMessage): ChatMessage[] {
+  const progressKey = normalizeAgentStepProgressKey(message);
+  if (!progressKey) return history;
+  return finalizeProgressForStep(history, progressKey, updateProgressMessageWithStep(message));
+}
+
+function buildStandaloneFailureMessage(content: string): ChatMessage {
+  return {
+    id: generateId(),
+    role: 'agent',
+    content,
+    timestamp: new Date().toISOString(),
+    isCompleted: true,
+    error: content,
+  };
+}
+
+function shouldAppendStandaloneFailure(history: ChatMessage[], taskId: string | null): boolean {
+  return !history.some((msg) => msg.taskId === taskId && msg.isProgressMessage);
+}
+
+function appendStandaloneFailure(history: ChatMessage[], taskId: string | null, content: string): ChatMessage[] {
+  if (!shouldAppendStandaloneFailure(history, taskId)) {
+    return history;
+  }
+  return [...history, { ...buildStandaloneFailureMessage(content), taskId: taskId || undefined }];
+}
+
+function normalizeAgentStatusMessage(message: WsConsoleMessage): string {
+  return normalizeStatusContent(message);
+}
+
+function normalizeAgentStatusErrorType(message: WsConsoleMessage): string | undefined {
+  return normalizeStatusErrorType(message);
+}
+
+function normalizeAgentStatusTaskId(message: WsConsoleMessage): string | null {
+  return normalizeStatusTaskId(message);
+}
+
+function isRunningStatus(status?: string): boolean {
+  return status === 'running';
+}
+
+function isPendingStatus(status?: string): boolean {
+  return status === 'pending';
+}
+
+function resetProgressMap(): Record<string, string> {
+  return {};
+}
+
+function normalizeConversationHistory(messages: ChatMessage[]): ChatMessage[] {
+  return messages;
+}
+
+function normalizeSnapshotConversation(messages: ChatMessage[]): ChatMessage[] {
+  return normalizeConversationHistory(messages);
+}
+
+function normalizeTaskCreatedState() {
+  return {
+    currentStepNum: 0,
+    history: [],
+    currentStep: null,
+    currentScreenshot: null,
+    currentApp: '未知',
+    canInterrupt: true,
+    canResume: false,
+    progressMessageIds: resetProgressMap(),
+    ...resetTransientProgressState(),
+  };
+}
+
+function normalizeEndSessionState() {
+  return {
+    currentTaskId: null,
+    isRunning: false,
+    isLocked: false,
+    controllerId: null,
+    currentStep: null,
+    pendingAction: null,
+    status: 'pending' as const,
+    history: [],
+    conversationHistory: [],
+    currentScreenshot: null,
+    currentApp: '未知',
+    canInterrupt: false,
+    canResume: false,
+    progressMessageIds: resetProgressMap(),
+    ...resetTransientProgressState(),
+  };
+}
+
+function normalizeInitSessionState(savedHistory: ChatMessage[]) {
+  const conversationHistory = normalizeSnapshotConversation(savedHistory);
+  return {
+    conversationHistory,
+    progressMessageIds: progressTrackingFromConversation(conversationHistory),
+    ...transientStateFromConversation(conversationHistory),
+  };
+}
+
+function normalizeInitErrorState() {
+  return {
+    conversationHistory: [],
+    progressMessageIds: resetProgressMap(),
+    ...resetTransientProgressState(),
+  };
+}
+
+function normalizeSendCommandStartState() {
+  return {
+    pendingAction: null,
+    waitingForConfirm: false,
+    waitingConfirmPhase: null,
+    progressMessageIds: resetProgressMap(),
+    ...resetTransientProgressState(),
+  };
+}
+
+function normalizeInterruptState() {
+  return {
+    isRunning: false,
+    pendingAction: null,
+    status: 'interrupted' as const,
+    canInterrupt: false,
+    canResume: false,
+  };
+}
+
+function normalizeProgressBaseState(message: WsConsoleMessage, currentTaskId: string | null) {
+  return {
+    currentTaskId: updateCurrentTaskIdFromMessage(normalizeTaskIdForProgress(message, currentTaskId), currentTaskId),
+    currentStepNum: normalizeProgressStepNumber(message) || 0,
+    ...getThinkingPanelStateFromProgress(message),
+  };
+}
+
+function normalizeStepBaseState(message: WsConsoleMessage, currentTaskId: string | null) {
+  return {
+    currentTaskId: updateCurrentTaskIdFromMessage(normalizeTaskIdForStep(message, currentTaskId), currentTaskId),
+    currentStepNum: normalizeAgentStepNumber(message),
+    ...getThinkingPanelStateFromStep(),
+  };
+}
+
+function normalizeStatusBaseState(message: WsConsoleMessage, currentTaskId: string | null) {
+  return {
+    currentTaskId: updateCurrentTaskIdFromMessage(normalizeTaskIdForStatus(message, currentTaskId), currentTaskId),
+    ...getThinkingPanelStateFromStatus(message),
+  };
+}
+
+function normalizeStatusRunningState(message: WsConsoleMessage, currentTaskId: string | null) {
+  return {
+    isRunning: normalizeStatusRunning(message),
+    status: 'running' as const,
+    currentTaskId: updateCurrentTaskIdFromMessage(normalizeTaskIdForStatus(message, currentTaskId), currentTaskId),
+    canInterrupt: Boolean(normalizeStatusTaskId(message) || currentTaskId),
+    canResume: false,
+  };
+}
+
+function normalizeStatusPendingState(message: WsConsoleMessage, currentTaskId: string | null, canInterrupt: boolean) {
+  return {
+    isRunning: normalizeStatusPending(message, currentTaskId, canInterrupt),
+    status: 'pending' as const,
+    currentTaskId: updateCurrentTaskIdFromMessage(normalizeTaskIdForStatus(message, currentTaskId), currentTaskId),
+    canInterrupt: Boolean(normalizeStatusTaskId(message) || currentTaskId),
+    canResume: false,
+  };
+}
+
+function normalizeStatusCompletedState(message: WsConsoleMessage, currentTaskId: string | null) {
+  return {
+    isRunning: false,
+    status: 'completed' as const,
+    currentTaskId: updateCurrentTaskIdFromMessage(normalizeTaskIdForStatus(message, currentTaskId), currentTaskId),
+    canInterrupt: false,
+    canResume: false,
+  };
+}
+
+function normalizeStatusFailedState(message: WsConsoleMessage, currentTaskId: string | null) {
+  return {
+    isRunning: false,
+    status: 'failed' as const,
+    error: message.message || 'Task failed',
+    currentTaskId: updateCurrentTaskIdFromMessage(normalizeTaskIdForStatus(message, currentTaskId), currentTaskId),
+    canInterrupt: false,
+    canResume: false,
+  };
+}
+
+function normalizeStatusInterruptedState(message: WsConsoleMessage, currentTaskId: string | null) {
+  return {
+    isRunning: false,
+    status: 'interrupted' as const,
+    currentTaskId: updateCurrentTaskIdFromMessage(normalizeTaskIdForStatus(message, currentTaskId), currentTaskId),
+    canInterrupt: false,
+    canResume: false,
+  };
+}
+
+function shouldStatusUpdateDeviceIdle(status?: string): boolean {
+  return isCompletionStatus(status) || isInterruptionStatus(status);
+}
+
+function shouldStatusUpdateDeviceError(status?: string): boolean {
+  return isFailureStatus(status);
+}
+
+function shouldStatusUpdateDeviceBusy(status?: string): boolean {
+  return isRunningStatus(status) || isPendingStatus(status);
+}
+
+function getConversationHistoryFromStatus(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): ChatMessage[] {
+  return applyStatusToState(state.conversationHistory, message);
+}
+
+function withStandaloneStatusMessage(history: ChatMessage[], message: WsConsoleMessage): ChatMessage[] {
+  return ensureStatusMessage(history, message);
+}
+
+function withStatusConversationHistory(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): ChatMessage[] {
+  return withStandaloneStatusMessage(getConversationHistoryFromStatus(state, message), message);
+}
+
+function statusProgressMapAfterMessage(progressMessageIds: Record<string, string>, message: WsConsoleMessage): Record<string, string> {
+  return updateProgressMapForStatus(progressMessageIds, message);
+}
+
+function normalizeProgressKeyValue(message: WsConsoleMessage): string | null {
+  return normalizeProgressKey(message);
+}
+
+/** Returns true for stages that are part of the reason phase and should share a single bubble. */
+function isReasonStage(stage?: string | null): boolean {
+  return stage === 'reason_start' || stage === 'reason_stream' || stage === 'reason_complete' || stage === 'reason';
+}
+
+function normalizeStepProgressKeyValue(message: WsConsoleMessage): string | null {
+  return normalizeAgentStepProgressKey(message);
+}
+
+function normalizeMessageIdForProgress(progressMessageIds: Record<string, string>, message: WsConsoleMessage): string | null {
+  const progressKey = normalizeProgressKeyValue(message);
+  if (!progressKey) return null;
+  return getOrCreateProgressMessageId(progressMessageIds, progressKey);
+}
+
+function normalizeTaskFinishedState(message: WsConsoleMessage) {
+  return message.status === 'finished' || message.status === 'completed';
+}
+
+function normalizeTaskFailedState(message: WsConsoleMessage) {
+  return message.status === 'error' || message.status === 'failed';
+}
+
+function normalizeTaskInterruptedState(message: WsConsoleMessage) {
+  return message.status === 'interrupted';
+}
+
+function normalizeCurrentDeviceStatusForInterrupt(deviceId: string | null): string | undefined {
+  return deviceId ? useDeviceStore.getState().getDeviceById(deviceId)?.status : undefined;
+}
+
+function normalizeFailureDisplayMessage(message: WsConsoleMessage): string {
+  return normalizeFailureMessage(message);
+}
+
+function normalizeCompletionDisplayMessage(message: WsConsoleMessage): string {
+  return normalizeCompletionMessage(message);
+}
+
+function normalizeInterruptDisplayMessage(message: WsConsoleMessage): string {
+  return normalizeInterruptionMessage(message);
+}
+
+function shouldClearProgressAfterStatus(message: WsConsoleMessage): boolean {
+  return isTerminalAgentStatus(message.status);
+}
+
+function shouldTrackTaskCreatedProgressReset(): boolean {
+  return true;
+}
+
+function buildProgressConversationEntry(message: WsConsoleMessage, progressKey: string, messageId: string): ChatMessage {
+  return { ...buildProgressBaseMessage(message, progressKey), id: messageId };
+}
+
+function buildProgressConversationUpdates(message: WsConsoleMessage): Partial<ChatMessage> {
+  return normalizeProgressMessageUpdates(message);
+}
+
+function mergeProgressConversationMessage(existing: ChatMessage, message: WsConsoleMessage): ChatMessage {
+  return mergeProgressMessage(existing, buildProgressConversationUpdates(message));
+}
+
+function addOrUpdateProgressConversationEntry(history: ChatMessage[], message: WsConsoleMessage, progressKey: string, messageId: string): ChatMessage[] {
+  if (!hasProgressMessage(history, progressKey)) {
+    return [...history, buildProgressConversationEntry(message, progressKey, messageId)];
+  }
+  return updateProgressHistoryByKey(history, progressKey, (existing) => mergeProgressConversationMessage(existing, message));
+}
+
+function normalizeProgressConversationState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  const progressKey = normalizeProgressKeyValue(message);
+  if (!progressKey) {
+    return buildNoProgressUpsertResult(state);
+  }
+  const messageId = getOrCreateProgressMessageId(state.progressMessageIds, progressKey);
+  return buildProgressUpsertResult(
+    addOrUpdateProgressConversationEntry(state.conversationHistory, message, progressKey, messageId),
+    progressMessageMapAfterUpsert(state.progressMessageIds, progressKey, messageId),
+    messageId,
+  );
+}
+
+function normalizeAgentStepConversationState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  const nextHistory = shouldUseExistingProgressMessage(state, message)
+    ? markAllStepProgressCompleted(state.conversationHistory, message)
+    : state.conversationHistory;
+
+  return {
+    conversationHistory: [...nextHistory, buildStandaloneAgentStepMessage(message)],
+    progressMessageIds: removeStepProgressTracking(state.progressMessageIds, message),
+  };
+}
+
+function normalizeAgentStatusConversationState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return applyStatusInState(state, message);
+}
+
+function normalizeProgressCurrentTaskId(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return updateCurrentTaskIdFromMessage(normalizeProgressTaskId(message), currentTaskId);
+}
+
+function normalizeAgentStepCurrentTaskId(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return updateCurrentTaskIdFromMessage(normalizeAgentStepTaskId(message), currentTaskId);
+}
+
+function normalizeAgentStatusCurrentTaskId(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return updateCurrentTaskIdFromMessage(normalizeStatusTaskId(message), currentTaskId);
+}
+
+function normalizeMessageContentForFailure(message: WsConsoleMessage): string {
+  return normalizeFailureDisplayMessage(message);
+}
+
+function normalizeMessageContentForCompletion(message: WsConsoleMessage): string {
+  return normalizeCompletionDisplayMessage(message);
+}
+
+function normalizeMessageContentForInterrupt(message: WsConsoleMessage): string {
+  return normalizeInterruptDisplayMessage(message);
+}
+
+function normalizeCurrentApp(app: string | undefined): string {
+  return app || '未知';
+}
+
+function normalizeProgressMessageId(progressKey: string): string {
+  return buildProgressMessageId(progressKey);
+}
+
+function normalizeProgressMapAfterStep(progressMessageIds: Record<string, string>, message: WsConsoleMessage): Record<string, string> {
+  return removeStepProgressTracking(progressMessageIds, message);
+}
+
+function normalizeProgressMapAfterStatus(progressMessageIds: Record<string, string>, message: WsConsoleMessage): Record<string, string> {
+  return statusProgressMapAfterMessage(progressMessageIds, message);
+}
+
+function normalizeProgressMapAfterReset(): Record<string, string> {
+  return resetProgressMap();
+}
+
+function shouldUseProgressState(message: WsConsoleMessage): boolean {
+  return shouldTrackProgressMessage(message);
+}
+
+function shouldUseAgentStepState(_message: WsConsoleMessage): boolean {
+  return true;
+}
+
+function shouldUseAgentStatusState(_message: WsConsoleMessage): boolean {
+  return true;
+}
+
+function buildDeviceBusyStatePatch() {
+  return getDeviceBusyPatch();
+}
+
+function buildDeviceIdleStatePatch(currentDeviceStatus?: string) {
+  return getDeviceIdlePatch(currentDeviceStatus);
+}
+
+function buildDeviceErrorStatePatch() {
+  return getDeviceErrorPatch();
+}
+
+function shouldSetScreenshot(message: WsConsoleMessage): boolean {
+  return shouldUpdateScreenshotFromMessage(message);
+}
+
+function normalizeStepAsCurrent(message: WsConsoleMessage): AgentStep {
+  return setCurrentStepFromAgentStep(message);
+}
+
+function normalizeProgressUpsertState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeProgressConversationState(state, message);
+}
+
+function normalizeStepConversationState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeAgentStepConversationState(state, message);
+}
+
+function normalizeStatusConversationState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeAgentStatusConversationState(state, message);
+}
+
+function normalizeProgressTransientState(message: WsConsoleMessage) {
+  return normalizeProgressBaseState(message, null);
+}
+
+function normalizeStepTransientState(message: WsConsoleMessage) {
+  return normalizeStepBaseState(message, null);
+}
+
+function normalizeStatusTransientState(message: WsConsoleMessage) {
+  return normalizeStatusBaseState(message, null);
+}
+
+function normalizeSavedConversation(messages: ChatMessage[]): ChatMessage[] {
+  return normalizeSavedHistory(messages);
+}
+
+function normalizeProgressStateReset() {
+  return resetProgressMap();
+}
+
+function normalizeTaskCreatedProgressState() {
+  return resetProgressMap();
+}
+
+function normalizeStatusStateReset() {
+  return resetTransientProgressState();
+}
+
+function normalizeProgressPanelState(message: WsConsoleMessage) {
+  return getThinkingPanelStateFromProgress(message);
+}
+
+function normalizeStepPanelState() {
+  return getThinkingPanelStateFromStep();
+}
+
+function normalizeStatusPanelState(message: WsConsoleMessage) {
+  return getThinkingPanelStateFromStatus(message);
+}
+
+function normalizeConversationWithStatus(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): ChatMessage[] {
+  return withStatusConversationHistory(state, message);
+}
+
+function normalizeConversationWithProgress(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeProgressUpsertState(state, message);
+}
+
+function normalizeConversationWithStep(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeStepConversationState(state, message);
+}
+
+function normalizeCurrentStep(message: WsConsoleMessage): AgentStep {
+  return normalizeStepAsCurrent(message);
+}
+
+function normalizeConversationCompletion(history: ChatMessage[], message: WsConsoleMessage): ChatMessage[] {
+  return applyStatusToState(history, message);
+}
+
+function normalizeProgressRecordKey(message: WsConsoleMessage): string | null {
+  return normalizeProgressKeyValue(message);
+}
+
+function normalizeProgressRecordId(progressMessageIds: Record<string, string>, message: WsConsoleMessage): string | null {
+  return normalizeMessageIdForProgress(progressMessageIds, message);
+}
+
+function normalizeProgressConversationUpdate(message: WsConsoleMessage): Partial<ChatMessage> {
+  return buildProgressConversationUpdates(message);
+}
+
+function normalizeProgressConversationEntry(message: WsConsoleMessage, progressKey: string, messageId: string): ChatMessage {
+  return buildProgressConversationEntry(message, progressKey, messageId);
+}
+
+function normalizeStatusResultMessage(message: WsConsoleMessage): string {
+  return normalizeStatusContent(message);
+}
+
+function normalizeAgentProgressMessage(message: WsConsoleMessage): string {
+  return buildProgressBubbleContent(message);
+}
+
+function normalizeAgentProgressStatus(message: WsConsoleMessage): string {
+  return normalizeProgressStatus(message);
+}
+
+function normalizeAgentProgressPhase(message: WsConsoleMessage): 'reason' | 'act' | 'observe' {
+  return normalizeProgressPhase(message);
+}
+
+function normalizeAgentProgressStage(message: WsConsoleMessage): string {
+  return normalizeProgressStage(message);
+}
+
+function normalizeAgentProgressTaskId(message: WsConsoleMessage): string | null {
+  return normalizeProgressTaskId(message);
+}
+
+function normalizeAgentProgressStep(message: WsConsoleMessage): number {
+  return normalizeProgressStepNumber(message);
+}
+
+function normalizeAgentProgressErrorType(message: WsConsoleMessage): string | undefined {
+  return normalizeProgressErrorType(message);
+}
+
+function normalizeAgentProgressError(message: WsConsoleMessage): string | undefined {
+  return normalizeProgressError(message);
+}
+
+function normalizeAgentProgressSuccess(message: WsConsoleMessage): boolean | undefined {
+  return normalizeProgressSuccess(message);
+}
+
+function normalizeAgentProgressThinking(message: WsConsoleMessage): string | undefined {
+  return normalizeProgressThinking(message);
+}
+
+function normalizeAgentProgressAction(message: WsConsoleMessage): AgentAction | undefined {
+  return normalizeProgressAction(message);
+}
+
+function normalizeAgentProgressScreenshot(message: WsConsoleMessage): string | undefined {
+  return normalizeProgressScreenshot(message);
+}
+
+function normalizeAgentProgressResult(message: WsConsoleMessage): string | undefined {
+  return normalizeProgressResult(message);
+}
+
+function normalizeStatusRecordKey(message: WsConsoleMessage): string | null {
+  return normalizeStatusTaskId(message);
+}
+
+function normalizeStepRecordKey(message: WsConsoleMessage): string | null {
+  return normalizeAgentStepProgressKey(message);
+}
+
+function normalizeProgressMessageRecordKey(message: WsConsoleMessage): string | null {
+  return normalizeProgressRecordKey(message);
+}
+
+function normalizeProgressMessageRecordId(progressMessageIds: Record<string, string>, message: WsConsoleMessage): string | null {
+  return normalizeProgressRecordId(progressMessageIds, message);
+}
+
+function normalizeProgressMessageConversationState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeConversationWithProgress(state, message);
+}
+
+function normalizeStepMessageConversationState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeConversationWithStep(state, message);
+}
+
+function normalizeStatusMessageConversationState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeStatusConversationState(state, message);
+}
+
+function normalizeResetProgressTracking() {
+  return resetProgressMap();
+}
+
+function normalizeResetTransientState() {
+  return resetTransientProgressState();
+}
+
+function normalizeMessageProgressKey(message: WsConsoleMessage): string | null {
+  return normalizeProgressKeyValue(message);
+}
+
+function normalizeMessageStepKey(message: WsConsoleMessage): string | null {
+  return normalizeAgentStepProgressKey(message);
+}
+
+function normalizeMessageTaskStatus(message: WsConsoleMessage): string | undefined {
+  return message.status;
+}
+
+function normalizeStatusShouldForget(message: WsConsoleMessage): boolean {
+  return shouldForgetMessagesAfterStatus(message.status);
+}
+
+function normalizeStatusShouldStop(message: WsConsoleMessage): boolean {
+  return isTerminalAgentStatus(message.status);
+}
+
+function normalizeCurrentTaskId(taskId: string | null): string | null {
+  return taskId;
+}
+
+function normalizeStateCurrentTaskId(messageTaskId: string | null, currentTaskId: string | null): string | null {
+  return updateCurrentTaskIdFromMessage(messageTaskId, currentTaskId);
+}
+
+function normalizeThinkingPanelState(message: WsConsoleMessage) {
+  return getThinkingPanelStateFromProgress(message);
+}
+
+function normalizeTerminalStatusHistory(history: ChatMessage[], message: WsConsoleMessage): ChatMessage[] {
+  return ensureStatusMessage(applyStatusToState(history, message), message);
+}
+
+function normalizeTaskIdFromProgressKey(progressKey: string): string {
+  return progressKey.split(':')[0];
+}
+
+function normalizeTaskIdMatchesProgress(taskId: string | null, progressKey: string): boolean {
+  return Boolean(taskId && normalizeTaskIdFromProgressKey(progressKey) === taskId);
+}
+
+function normalizeFilteredProgressMap(progressMessageIds: Record<string, string>, taskId: string | null): Record<string, string> {
+  return removeTaskProgressTracking(progressMessageIds, taskId);
+}
+
+function normalizeTerminalConversationState(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return {
+    conversationHistory: normalizeTerminalStatusHistory(state.conversationHistory, message),
+    progressMessageIds: normalizeFilteredProgressMap(state.progressMessageIds, normalizeStatusTaskId(message)),
+  };
+}
+
+function normalizeProgressConversationResult(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeProgressMessageConversationState(state, message);
+}
+
+function normalizeStepConversationResult(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeStepMessageConversationState(state, message);
+}
+
+function normalizeStatusConversationResult(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeStatusMessageConversationState(state, message);
+}
+
+function normalizeProgressOrNoop(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return shouldTrackProgressMessage(message)
+    ? normalizeProgressConversationResult(state, message)
+    : buildNoProgressUpsertResult(state);
+}
+
+function normalizeStandaloneStepIfNeeded(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return shouldShowStepAsSeparateBubble(state, message)
+    ? appendStandaloneStepInState(state, message)
+    : normalizeAgentStepConversationState(state, message);
+}
+
+function normalizeTerminalOrOngoingStatus(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return isTerminalAgentStatus(message.status)
+    ? normalizeTerminalConversationState(state, message)
+    : normalizeStatusConversationResult(state, message);
+}
+
+function normalizeHistoryPatchForStep(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return shouldUseExistingProgressMessage(state, message)
+    ? normalizeAgentStepConversationState(state, message)
+    : appendStandaloneStepInState(state, message);
+}
+
+function normalizeHistoryPatchForProgress(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeProgressOrNoop(state, message);
+}
+
+function normalizeHistoryPatchForStatus(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeTerminalOrOngoingStatus(state, message);
+}
+
+function normalizeCurrentStepPatch(message: WsConsoleMessage): AgentStep {
+  return setCurrentStepFromAgentStep(message);
+}
+
+function normalizeCurrentStepNumPatch(message: WsConsoleMessage): number {
+  return message.step_number ?? 0;
+}
+
+function normalizeCurrentTaskIdPatch(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return normalizeStateCurrentTaskId(normalizeMessageTaskId(message), currentTaskId);
+}
+
+function normalizeProgressMessageState(
+  message: WsConsoleMessage,
+  progressMessageIds: Record<string, string>,
+  conversationHistory: ChatMessage[],
+) {
+  return normalizeProgressMessageConversationState({ progressMessageIds, conversationHistory }, message);
+}
+
+function normalizeAgentStepState(
+  message: WsConsoleMessage,
+  progressMessageIds: Record<string, string>,
+  conversationHistory: ChatMessage[],
+) {
+  return normalizeStepMessageConversationState({ progressMessageIds, conversationHistory }, message);
+}
+
+function normalizeAgentStatusState(
+  message: WsConsoleMessage,
+  progressMessageIds: Record<string, string>,
+  conversationHistory: ChatMessage[],
+) {
+  return normalizeStatusMessageConversationState({ progressMessageIds, conversationHistory }, message);
+}
+
+function normalizeEmptyProgressResult(
+  conversationHistory: ChatMessage[],
+  progressMessageIds: Record<string, string>,
+) {
+  return buildProgressUpsertResult(conversationHistory, progressMessageIds, null);
+}
+
+function normalizeShouldTrackProgress(message: WsConsoleMessage): boolean {
+  return shouldTrackProgressMessage(message);
+}
+
+function normalizeProgressUpsert(
+  message: WsConsoleMessage,
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+) {
+  return normalizeShouldTrackProgress(message)
+    ? normalizeProgressMessageConversationState(state, message)
+    : normalizeEmptyProgressResult(state.conversationHistory, state.progressMessageIds);
+}
+
+function normalizeProgressTaskKey(taskId?: string | null, stepNumber?: number): string | null {
+  return getProgressKey(taskId || undefined, stepNumber);
+}
+
+function normalizeHistoryMessages(history: ChatMessage[]): ChatMessage[] {
+  return history;
+}
+
+function normalizeProgressMessageHistory(
+  history: ChatMessage[],
+  message: WsConsoleMessage,
+  progressKey: string,
+  messageId: string,
+): ChatMessage[] {
+  return addOrUpdateProgressConversationEntry(history, message, progressKey, messageId);
+}
+
+function normalizeHasProgressMessage(history: ChatMessage[], progressKey: string): boolean {
+  return hasProgressMessage(history, progressKey);
+}
+
+function normalizeMergedProgressMessage(existing: ChatMessage, message: WsConsoleMessage): ChatMessage {
+  return mergeProgressConversationMessage(existing, message);
+}
+
+function normalizeProgressUpdate(message: WsConsoleMessage): Partial<ChatMessage> {
+  return buildProgressConversationUpdates(message);
+}
+
+function normalizeStandaloneStepMessage(message: WsConsoleMessage): ChatMessage {
+  return buildAgentStepChatMessage(message);
+}
+
+function normalizeTerminalStatusMessage(message: WsConsoleMessage): ChatMessage {
+  return buildStandaloneStatusMessage(message);
+}
+
+function normalizeTaskMessageTaskId(message: WsConsoleMessage): string | null {
+  return normalizeMessageTaskId(message);
+}
+
+function normalizeTaskMessageErrorType(message: WsConsoleMessage): string | undefined {
+  return normalizeMessageErrorType(message);
+}
+
+function normalizeTaskMessageSuccess(message: WsConsoleMessage): boolean | undefined {
+  return normalizeMessageSuccess(message);
+}
+
+function normalizeTaskMessageScreenshot(message: WsConsoleMessage): string | undefined {
+  return normalizeMessageScreenshot(message);
+}
+
+function normalizeTaskMessageReasoning(message: WsConsoleMessage): string | undefined {
+  return normalizeMessageReasoning(message);
+}
+
+function normalizeTaskMessageAction(message: WsConsoleMessage): AgentAction | undefined {
+  return normalizeMessageAction(message);
+}
+
+function normalizeTaskMessageResult(message: WsConsoleMessage): string | undefined {
+  return normalizeMessageResult(message);
+}
+
+function normalizeTaskMessageError(message: WsConsoleMessage): string | undefined {
+  return normalizeMessageError(message);
+}
+
+function normalizeMessageShouldSetScreenshot(message: WsConsoleMessage): boolean {
+  return shouldSetScreenshot(message);
+}
+
+function normalizeMessageShouldSetBusy(message: WsConsoleMessage): boolean {
+  return shouldUpdateDeviceBusyStatus(message);
+}
+
+function normalizeMessageShouldClearPhase(message: WsConsoleMessage): boolean {
+  return message.type === 'agent_step' || isTerminalAgentStatus(message.status);
+}
+
+function normalizeResetStateAfterConversationClear() {
+  return resetProgressMap();
+}
+
+function normalizeProgressHistory(messages: ChatMessage[]): ChatMessage[] {
+  return messages;
+}
+
+function normalizeTaskCreatedHistory(): ChatMessage[] {
+  return [];
+}
+
+function normalizeClearConversationHistory(): ChatMessage[] {
+  return [];
+}
+
+function normalizeTaskCreatedCurrentScreenshot(): string | null {
+  return null;
+}
+
+function normalizeTaskCreatedCurrentApp(): string {
+  return '未知';
+}
+
+function normalizeTaskCreatedCurrentStep(): AgentStep | null {
+  return null;
+}
+
+function normalizeTaskCreatedHistorySteps(): AgentStep[] {
+  return [];
+}
+
+function normalizeTaskCreatedCurrentStepNum(): number {
+  return 0;
+}
+
+function normalizeProgressCurrentStepNum(message: WsConsoleMessage): number {
+  return message.step_number ?? 0;
+}
+
+function normalizeProgressCurrentTaskIdValue(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return normalizeProgressCurrentTaskId(message, currentTaskId);
+}
+
+function normalizeStepCurrentTaskIdValue(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return normalizeAgentStepCurrentTaskId(message, currentTaskId);
+}
+
+function normalizeStatusCurrentTaskIdValue(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return normalizeAgentStatusCurrentTaskId(message, currentTaskId);
+}
+
+function normalizeProgressDevicePatch() {
+  return buildDeviceBusyStatePatch();
+}
+
+function normalizeStepDevicePatch() {
+  return buildDeviceBusyStatePatch();
+}
+
+function normalizeCompletedDevicePatch(currentDeviceStatus?: string) {
+  return buildDeviceIdleStatePatch(currentDeviceStatus);
+}
+
+function normalizeFailedDevicePatch() {
+  return buildDeviceErrorStatePatch();
+}
+
+function normalizeInterruptedDevicePatch(currentDeviceStatus?: string) {
+  return buildDeviceIdleStatePatch(currentDeviceStatus);
+}
+
+function normalizeProgressTaskIdValue(message: WsConsoleMessage): string | null {
+  return normalizeProgressTaskId(message);
+}
+
+function normalizeStatusTaskIdValue(message: WsConsoleMessage): string | null {
+  return normalizeStatusTaskId(message);
+}
+
+function normalizeCurrentDevicePatchForStatus(message: WsConsoleMessage, currentDeviceStatus?: string) {
+  if (normalizeTaskFinishedState(message)) return normalizeCompletedDevicePatch(currentDeviceStatus);
+  if (normalizeTaskFailedState(message)) return normalizeFailedDevicePatch();
+  if (normalizeTaskInterruptedState(message)) return normalizeInterruptedDevicePatch(currentDeviceStatus);
+  return normalizeProgressDevicePatch();
+}
+
+function normalizeCurrentTaskError(message: WsConsoleMessage): string | null {
+  if (normalizeTaskFailedState(message)) return message.message || 'Task failed';
+  return null;
+}
+
+function normalizeShouldAddStatusMessage(message: WsConsoleMessage): boolean {
+  return shouldKeepStatusOnlyMessage(message);
+}
+
+function normalizeShouldForgetState(message: WsConsoleMessage): boolean {
+  return normalizeStatusShouldForget(message);
+}
+
+function normalizeTerminalProgressCleanup(message: WsConsoleMessage, progressMessageIds: Record<string, string>): Record<string, string> {
+  return shouldClearProgressAfterStatus(message)
+    ? normalizeProgressMapAfterStatus(progressMessageIds, message)
+    : progressMessageIds;
+}
+
+function normalizeConversationStateAfterStatus(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return {
+    conversationHistory: normalizeConversationWithStatus(state, message),
+    progressMessageIds: normalizeTerminalProgressCleanup(message, state.progressMessageIds),
+  };
+}
+
+function normalizeConversationStateAfterProgress(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeConversationWithProgress(state, message);
+}
+
+function normalizeConversationStateAfterStep(
+  state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
+  message: WsConsoleMessage,
+) {
+  return normalizeConversationWithStep(state, message);
+}
+
+function normalizeStepShouldUpdateCurrentStep(): boolean {
+  return true;
+}
+
+function normalizeProgressShouldUpdateCurrentStepNum(): boolean {
+  return true;
+}
+
+function normalizeStepShouldUpdateCurrentStepNum(): boolean {
+  return true;
+}
+
+function normalizeStatusShouldUpdateCurrentTaskId(message: WsConsoleMessage): boolean {
+  return Boolean(normalizeStatusTaskId(message));
+}
+
+function normalizeProgressShouldUpdateCurrentTaskId(message: WsConsoleMessage): boolean {
+  return Boolean(normalizeProgressTaskId(message));
+}
+
+function normalizeStepShouldUpdateCurrentTaskId(message: WsConsoleMessage): boolean {
+  return Boolean(normalizeAgentStepTaskId(message));
+}
+
+function normalizeTaskCreatedTaskId(message: WsConsoleMessage): string | undefined {
+  return message.task_id;
+}
+
+function normalizeTaskCreatedRunning(): boolean {
+  return true;
+}
+
+function normalizeTaskCreatedStatus(): 'running' {
+  return 'running';
+}
+
+function normalizeTaskCreatedProgressResetMap(): Record<string, string> {
+  return resetProgressMap();
+}
+
+function normalizeTaskCreatedTransientState() {
+  return resetTransientProgressState();
+}
+
+function normalizeTaskCreatedBaseState() {
+  return {
+    currentStepNum: normalizeTaskCreatedCurrentStepNum(),
+    history: normalizeTaskCreatedHistorySteps(),
+    currentStep: normalizeTaskCreatedCurrentStep(),
+    currentScreenshot: normalizeTaskCreatedCurrentScreenshot(),
+    currentApp: normalizeTaskCreatedCurrentApp(),
+    canInterrupt: true,
+    canResume: false,
+    progressMessageIds: normalizeTaskCreatedProgressResetMap(),
+    ...normalizeTaskCreatedTransientState(),
+  };
+}
+
+function normalizeClearConversationState() {
+  return {
+    conversationHistory: normalizeClearConversationHistory(),
+    progressMessageIds: normalizeResetStateAfterConversationClear(),
+  };
+}
+
+function normalizeProgressSessionInit(savedHistory: ChatMessage[]) {
+  const conversationHistory = normalizeSavedConversation(savedHistory);
+  return {
+    conversationHistory,
+    progressMessageIds: progressTrackingFromConversation(conversationHistory),
+    ...transientStateFromConversation(conversationHistory),
+  };
+}
+
+function normalizeProgressSessionInitError() {
+  return {
+    conversationHistory: [],
+    progressMessageIds: normalizeResetProgressTracking(),
+    ...normalizeResetTransientState(),
+  };
+}
+
+function normalizeProgressSendStart() {
+  return {
+    pendingAction: null,
+    waitingForConfirm: false,
+    waitingConfirmPhase: null,
+    progressMessageIds: normalizeResetProgressTracking(),
+    ...normalizeResetTransientState(),
+  };
+}
+
+function normalizeProgressTaskInterrupt() {
+  return normalizeInterruptState();
+}
+
+function normalizeProgressTaskEnd() {
+  return normalizeEndSessionState();
+}
+
+function normalizeProgressTaskCreate() {
+  return normalizeTaskCreatedBaseState();
+}
+
+function normalizeMessageStepNumber(message: WsConsoleMessage): number {
+  return message.step_number ?? 0;
+}
+
+function normalizeProgressTaskTaskId(message: WsConsoleMessage): string | null {
+  return normalizeProgressTaskIdValue(message);
+}
+
+function normalizeProgressTaskStep(message: WsConsoleMessage): number {
+  return normalizeMessageStepNumber(message);
+}
+
+function normalizeAgentStepTaskTaskId(message: WsConsoleMessage): string | null {
+  return normalizeAgentStepTaskId(message);
+}
+
+function normalizeAgentStatusTaskTaskId(message: WsConsoleMessage): string | null {
+  return normalizeStatusTaskIdValue(message);
+}
+
+function normalizeCurrentTaskIdMessage(message: WsConsoleMessage): string | null {
+  return normalizeMessageTaskId(message);
+}
+
+function normalizeTaskMessageContent(message: WsConsoleMessage): string {
+  return normalizeStatusContent(message);
+}
+
+function normalizeTaskMessagePhase(message: WsConsoleMessage): 'reason' | 'act' | 'observe' {
+  return normalizeProgressPhase(message);
+}
+
+function normalizeTaskMessageStage(message: WsConsoleMessage): string {
+  return normalizeProgressStage(message);
+}
+
+function normalizeTaskMessageStatus(message: WsConsoleMessage): string | undefined {
+  return message.status;
+}
+
+function normalizeTaskMessageData(message: WsConsoleMessage): Record<string, any> | undefined {
+  return message.data;
+}
+
+function normalizeTaskMessageVersion(message: WsConsoleMessage): number | undefined {
+  return message.version;
+}
+
+function normalizeTaskMessageControllerId(message: WsConsoleMessage): string | undefined {
+  return message.controller_id;
+}
+
+function normalizeTaskMessageType(message: WsConsoleMessage): string {
+  return message.type;
+}
+
+function normalizeShouldUseProgressBubble(message: WsConsoleMessage): boolean {
+  return message.type === 'agent_progress';
+}
+
+function normalizeShouldUseStepBubble(message: WsConsoleMessage): boolean {
+  return message.type === 'agent_step';
+}
+
+function normalizeShouldUseStatusBubble(message: WsConsoleMessage): boolean {
+  return message.type === 'agent_status';
+}
+
+function normalizeMessageToProgressKey(message: WsConsoleMessage): string | null {
+  return normalizeProgressKeyValue(message);
+}
+
+function normalizeMessageToStepKey(message: WsConsoleMessage): string | null {
+  return normalizeAgentStepProgressKey(message);
+}
+
+function normalizeMessageToTaskId(message: WsConsoleMessage): string | null {
+  return normalizeMessageTaskId(message);
+}
+
+function normalizeBaseChatMessage(content: string): ChatMessage {
+  return {
+    id: generateId(),
+    role: 'agent',
+    content,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function normalizeResultChatMessage(content: string, taskId?: string | null): ChatMessage {
+  return {
+    ...normalizeBaseChatMessage(content),
+    taskId: taskId || undefined,
+    isCompleted: true,
+  };
+}
+
+function normalizeShouldAppendTerminalMessage(history: ChatMessage[], taskId: string | null): boolean {
+  return shouldAppendStandaloneStatusMessage(history, taskId);
+}
+
+function normalizeAppendTerminalMessage(history: ChatMessage[], message: WsConsoleMessage): ChatMessage[] {
+  return normalizeShouldAppendTerminalMessage(history, normalizeStatusTaskId(message))
+    ? [...history, buildStandaloneStatusMessage(message)]
+    : history;
+}
+
+function normalizeProgressTrackingState(progressMessageIds: Record<string, string>): Record<string, string> {
+  return progressMessageIds;
+}
+
+function normalizeAgentStepTrackingState(progressMessageIds: Record<string, string>, message: WsConsoleMessage): Record<string, string> {
+  return removeStepProgressTracking(progressMessageIds, message);
+}
+
+function normalizeAgentStatusTrackingState(progressMessageIds: Record<string, string>, message: WsConsoleMessage): Record<string, string> {
+  return updateProgressMapForStatus(progressMessageIds, message);
+}
+
+function normalizeTaskCreatedTrackingState(): Record<string, string> {
+  return resetProgressMap();
+}
+
+function normalizeMessageProgressSuccess(message: WsConsoleMessage): boolean | undefined {
+  return normalizeProgressSuccess(message);
+}
+
+function normalizeMessageProgressError(message: WsConsoleMessage): string | undefined {
+  return normalizeProgressError(message);
+}
+
+function normalizeMessageProgressStatus(message: WsConsoleMessage): string {
+  return normalizeProgressStatus(message);
+}
+
+function normalizeMessageProgressContent(message: WsConsoleMessage): string {
+  return normalizeAgentProgressMessage(message);
+}
+
+function normalizeMessageProgressAction(message: WsConsoleMessage): AgentAction | undefined {
+  return normalizeAgentProgressAction(message);
+}
+
+function normalizeMessageProgressThinking(message: WsConsoleMessage): string | undefined {
+  return normalizeAgentProgressThinking(message);
+}
+
+function normalizeMessageProgressResult(message: WsConsoleMessage): string | undefined {
+  return normalizeAgentProgressResult(message);
+}
+
+function normalizeMessageProgressScreenshot(message: WsConsoleMessage): string | undefined {
+  return normalizeAgentProgressScreenshot(message);
+}
+
+function normalizeMessageProgressErrorType(message: WsConsoleMessage): string | undefined {
+  return normalizeAgentProgressErrorType(message);
+}
+
+function normalizeMessageProgressPhaseValue(message: WsConsoleMessage): 'reason' | 'act' | 'observe' {
+  return normalizeAgentProgressPhase(message);
+}
+
+function normalizeMessageProgressStageValue(message: WsConsoleMessage): string {
+  return normalizeAgentProgressStage(message);
+}
+
+function normalizeMessageProgressTaskIdValue(message: WsConsoleMessage): string | null {
+  return normalizeAgentProgressTaskId(message);
+}
+
+function normalizeMessageProgressStepValue(message: WsConsoleMessage): number {
+  return normalizeAgentProgressStep(message);
+}
+
+function normalizeMessageStatusTaskId(message: WsConsoleMessage): string | null {
+  return normalizeAgentStatusTaskTaskId(message);
+}
+
+function normalizeMessageStepTaskId(message: WsConsoleMessage): string | null {
+  return normalizeAgentStepTaskTaskId(message);
+}
+
+function normalizeMessageStatusErrorType(message: WsConsoleMessage): string | undefined {
+  return normalizeAgentStatusErrorType(message);
+}
+
+function normalizeMessageStatusContentValue(message: WsConsoleMessage): string {
+  return normalizeAgentStatusMessage(message);
+}
+
+function normalizeMessageStepContentValue(message: WsConsoleMessage): string {
+  return normalizeAgentStepContent(message);
+}
+
+function normalizeProgressStoreState(message: WsConsoleMessage, currentTaskId: string | null) {
+  return normalizeProgressBaseState(message, currentTaskId);
+}
+
+function normalizeStepStoreState(message: WsConsoleMessage, currentTaskId: string | null) {
+  return normalizeStepBaseState(message, currentTaskId);
+}
+
+function normalizeStatusStoreState(message: WsConsoleMessage, currentTaskId: string | null) {
+  return normalizeStatusBaseState(message, currentTaskId);
+}
+
+function normalizeNewProgressMessage(message: WsConsoleMessage, progressKey: string, messageId: string): ChatMessage {
+  return buildProgressChatMessage(message, progressKey, messageId);
+}
+
+function normalizeExistingProgressMessage(existing: ChatMessage, message: WsConsoleMessage): ChatMessage {
+  return updateExistingProgressMessage(existing, message);
+}
+
+function normalizeTerminalHistory(history: ChatMessage[], message: WsConsoleMessage): ChatMessage[] {
+  return normalizeAppendTerminalMessage(applyStatusToState(history, message), message);
+}
+
+function normalizeHistoryAfterProgress(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeProgressMessageConversationState(state, message);
+}
+
+function normalizeHistoryAfterStep(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeAgentStepConversationState(state, message);
+}
+
+function normalizeHistoryAfterStatus(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeAgentStatusConversationState(state, message);
+}
+
+function normalizeCurrentStepPatchValue(message: WsConsoleMessage): AgentStep {
+  return normalizeCurrentStepPatch(message);
+}
+
+function normalizeCurrentStepNumPatchValue(message: WsConsoleMessage): number {
+  return normalizeCurrentStepNumPatch(message);
+}
+
+function normalizeMessageTaskPatch(message: WsConsoleMessage, currentTaskId: string | null): string | null {
+  return normalizeCurrentTaskIdPatch(message, currentTaskId);
+}
+
+function normalizeProgressRecordIdValue(progressMessageIds: Record<string, string>, message: WsConsoleMessage): string | null {
+  return normalizeMessageIdForProgress(progressMessageIds, message);
+}
+
+function normalizeProgressShouldFinalize(message: WsConsoleMessage): boolean {
+  return shouldFinalizeProgressMessage(message);
+}
+
+function normalizeProgressShouldHideThinking(message: WsConsoleMessage): boolean {
+  return shouldHideThinkingPanel(message);
+}
+
+function normalizeProgressShouldSetBusy(_message: WsConsoleMessage): boolean {
+  return true;
+}
+
+function normalizeAgentStepShouldSetBusy(_message: WsConsoleMessage): boolean {
+  return true;
+}
+
+function normalizeTerminalShouldClearProgress(message: WsConsoleMessage): boolean {
+  return shouldClearProgressAfterStatus(message);
+}
+
+function normalizeStatusShouldSetIdle(message: WsConsoleMessage): boolean {
+  return normalizeTaskFinishedState(message) || normalizeTaskInterruptedState(message);
+}
+
+function normalizeStatusShouldSetError(message: WsConsoleMessage): boolean {
+  return normalizeTaskFailedState(message);
+}
+
+function normalizeStatusShouldSetBusyAgain(message: WsConsoleMessage): boolean {
+  return isRunningStatus(message.status) || isPendingStatus(message.status);
+}
+
+function normalizeStatusShouldResetStep(message: WsConsoleMessage): boolean {
+  return normalizeTaskFinishedState(message) || normalizeTaskFailedState(message) || normalizeTaskInterruptedState(message);
+}
+
+function normalizeStatusShouldForgetMessages(message: WsConsoleMessage): boolean {
+  return normalizeTaskFinishedState(message);
+}
+
+function normalizeShouldSetCurrentTaskIdFromStatus(message: WsConsoleMessage): boolean {
+  return Boolean(normalizeStatusTaskId(message));
+}
+
+function normalizeShouldSetCurrentTaskIdFromProgressMessage(message: WsConsoleMessage): boolean {
+  return Boolean(normalizeProgressTaskId(message));
+}
+
+function normalizeShouldSetCurrentTaskIdFromAgentStep(message: WsConsoleMessage): boolean {
+  return Boolean(normalizeAgentStepTaskId(message));
+}
+
+function normalizeTaskCreatedStatePatch(message: WsConsoleMessage) {
+  return {
+    currentTaskId: message.task_id,
+    isRunning: true,
+    status: 'running' as const,
+    ...normalizeTaskCreatedBaseState(),
+  };
+}
+
+function normalizeSessionInitState(savedHistory: ChatMessage[]) {
+  return normalizeProgressSessionInit(savedHistory);
+}
+
+function normalizeSessionInitErrorState() {
+  return normalizeProgressSessionInitError();
+}
+
+function normalizeSendCommandState() {
+  return normalizeProgressSendStart();
+}
+
+function normalizeInterruptPatch() {
+  return normalizeProgressTaskInterrupt();
+}
+
+function normalizeEndSessionPatch() {
+  return normalizeProgressTaskEnd();
+}
+
+function normalizeClearConversationPatch() {
+  return normalizeClearConversationState();
+}
+
+function normalizeTaskCreatedPatch(message: WsConsoleMessage) {
+  return normalizeTaskCreatedStatePatch(message);
+}
+
+function normalizeAgentStepPatch(message: WsConsoleMessage) {
+  return {
+    currentStep: normalizeCurrentStepPatchValue(message),
+    currentStepNum: normalizeCurrentStepNumPatchValue(message),
+  };
+}
+
+function normalizeAgentProgressPatch(message: WsConsoleMessage, currentTaskId: string | null) {
+  return {
+    currentTaskId: normalizeProgressCurrentTaskIdValue(message, currentTaskId),
+    currentStepNum: normalizeProgressCurrentStepNum(message),
+    ...getThinkingPanelStateFromProgress(message),
+  };
+}
+
+function normalizeAgentStatusPatch(message: WsConsoleMessage, currentTaskId: string | null, canInterrupt: boolean) {
+  if (normalizeTaskFinishedState(message)) {
+    return normalizeStatusCompletedState(message, currentTaskId);
+  }
+  if (normalizeTaskFailedState(message)) {
+    return normalizeStatusFailedState(message, currentTaskId);
+  }
+  if (normalizeTaskInterruptedState(message)) {
+    return normalizeStatusInterruptedState(message, currentTaskId);
+  }
+  if (isPendingStatus(message.status)) {
+    return normalizeStatusPendingState(message, currentTaskId, canInterrupt);
+  }
+  if (isRunningStatus(message.status)) {
+    return normalizeStatusRunningState(message, currentTaskId);
+  }
+  return normalizeStatusStoreState(message, currentTaskId);
+}
+
+function normalizeConversationPatchForProgress(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeHistoryAfterProgress(state, message);
+}
+
+function normalizeConversationPatchForStep(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeHistoryAfterStep(state, message);
+}
+
+function normalizeConversationPatchForStatus(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeHistoryAfterStatus(state, message);
+}
+
+function normalizeStatusDevicePatch(message: WsConsoleMessage, currentDeviceStatus?: string) {
+  return normalizeCurrentDevicePatchForStatus(message, currentDeviceStatus);
+}
+
+function normalizeAgentStepHistoryPatch(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeAgentStepConversationState(state, message);
+}
+
+function normalizeAgentProgressHistoryPatch(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeProgressMessageConversationState(state, message);
+}
+
+function normalizeAgentStatusHistoryPatch(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeAgentStatusConversationState(state, message);
+}
+
+function normalizeProgressStatePatch(message: WsConsoleMessage, currentTaskId: string | null) {
+  return normalizeAgentProgressPatch(message, currentTaskId);
+}
+
+function normalizeStepStatePatch(message: WsConsoleMessage) {
+  return normalizeAgentStepPatch(message);
+}
+
+function normalizeStatusStatePatch(message: WsConsoleMessage, currentTaskId: string | null, canInterrupt: boolean) {
+  return normalizeAgentStatusPatch(message, currentTaskId, canInterrupt);
+}
+
+function normalizeTaskCreatedStateValue(message: WsConsoleMessage) {
+  return normalizeTaskCreatedPatch(message);
+}
+
+function normalizeConversationResetPatch() {
+  return normalizeClearConversationPatch();
+}
+
+function normalizeHistoryInitPatch(savedHistory: ChatMessage[]) {
+  return normalizeSessionInitState(savedHistory);
+}
+
+function normalizeHistoryInitErrorPatch() {
+  return normalizeSessionInitErrorState();
+}
+
+function normalizeCommandStartPatch() {
+  return normalizeSendCommandState();
+}
+
+function normalizeTaskInterruptPatch() {
+  return normalizeInterruptPatch();
+}
+
+function normalizeTaskEndPatch() {
+  return normalizeEndSessionPatch();
+}
+
+function normalizeMessageProgressPatch(message: WsConsoleMessage, currentTaskId: string | null) {
+  return normalizeProgressStatePatch(message, currentTaskId);
+}
+
+function normalizeMessageStepPatch(message: WsConsoleMessage) {
+  return normalizeStepStatePatch(message);
+}
+
+function normalizeMessageStatusPatch(message: WsConsoleMessage, currentTaskId: string | null, canInterrupt: boolean) {
+  return normalizeStatusStatePatch(message, currentTaskId, canInterrupt);
+}
+
+function normalizeMessageHistoryProgressPatch(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeAgentProgressHistoryPatch(state, message);
+}
+
+function normalizeMessageHistoryStepPatch(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeAgentStepHistoryPatch(state, message);
+}
+
+function normalizeMessageHistoryStatusPatch(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeAgentStatusHistoryPatch(state, message);
+}
+
+function normalizeProgressStateValue(message: WsConsoleMessage, currentTaskId: string | null) {
+  return normalizeMessageProgressPatch(message, currentTaskId);
+}
+
+function normalizeStepStateValue(message: WsConsoleMessage) {
+  return normalizeMessageStepPatch(message);
+}
+
+function normalizeStatusStateValue(message: WsConsoleMessage, currentTaskId: string | null, canInterrupt: boolean) {
+  return normalizeMessageStatusPatch(message, currentTaskId, canInterrupt);
+}
+
+function normalizeProgressHistoryValue(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeMessageHistoryProgressPatch(state, message);
+}
+
+function normalizeStepHistoryValue(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeMessageHistoryStepPatch(state, message);
+}
+
+function normalizeStatusHistoryValue(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeMessageHistoryStatusPatch(state, message);
+}
+
+function normalizeProgressPatchResult(message: WsConsoleMessage, currentTaskId: string | null) {
+  return normalizeProgressStateValue(message, currentTaskId);
+}
+
+function normalizeStepPatchResult(message: WsConsoleMessage) {
+  return normalizeStepStateValue(message);
+}
+
+function normalizeStatusPatchResult(message: WsConsoleMessage, currentTaskId: string | null, canInterrupt: boolean) {
+  return normalizeStatusStateValue(message, currentTaskId, canInterrupt);
+}
+
+function normalizeProgressHistoryResult(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeProgressHistoryValue(state, message);
+}
+
+function normalizeStepHistoryResult(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeStepHistoryValue(state, message);
+}
+
+function normalizeStatusHistoryResult(state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeStatusHistoryValue(state, message);
+}
+
+function normalizeConversationStatePatch(type: 'progress' | 'step' | 'status', state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  if (type === 'progress') return normalizeProgressHistoryResult(state, message);
+  if (type === 'step') return normalizeStepHistoryResult(state, message);
+  return normalizeStatusHistoryResult(state, message);
+}
+
+function normalizeStorePatch(type: 'progress' | 'step' | 'status', message: WsConsoleMessage, currentTaskId: string | null, canInterrupt = false) {
+  if (type === 'progress') return normalizeProgressPatchResult(message, currentTaskId);
+  if (type === 'step') return normalizeStepPatchResult(message);
+  return normalizeStatusPatchResult(message, currentTaskId, canInterrupt);
+}
+
+function normalizeConversationAfterMessage(type: 'progress' | 'step' | 'status', state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> }, message: WsConsoleMessage) {
+  return normalizeConversationStatePatch(type, state, message);
+}
+
+function normalizeStateAfterMessage(type: 'progress' | 'step' | 'status', message: WsConsoleMessage, currentTaskId: string | null, canInterrupt = false) {
+  return normalizeStorePatch(type, message, currentTaskId, canInterrupt);
+}
+
+function normalizeTaskProgressMapReset() {
+  return resetProgressMap();
+}
+
+function normalizeProgressMessageIds(): Record<string, string> {
+  return {};
+}
+
+function normalizeConversationMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages;
+}
+
+function normalizeUseDeviceBusyPatch() {
+  return { status: 'busy' as const };
+}
+
+function normalizeUseDeviceErrorPatch() {
+  return { status: 'error' as const };
+}
+
+function normalizeUseDeviceIdlePatch(currentDeviceStatus?: string) {
+  return { status: currentDeviceStatus === 'offline' ? 'offline' as const : 'idle' as const };
+}
+
+function normalizeAddUserMessage(content: string): ChatMessage {
+  return {
+    id: generateId(),
+    role: 'user',
+    content,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function normalizeAddAgentMessage(
+  content: string,
+  thinking?: string,
+  action?: AgentAction,
+  screenshot?: string,
+  rawContent?: string,
+  isParseError?: boolean,
+): ChatMessage {
+  return {
+    id: generateId(),
+    role: 'agent',
+    content,
+    timestamp: new Date().toISOString(),
+    thinking,
+    action,
+    screenshot,
+    rawContent,
+    isParseError,
+  };
+}
+
+function normalizeStreamingMessage(): ChatMessage {
+  return {
+    id: generateId(),
+    role: 'agent',
+    content: '',
+    timestamp: new Date().toISOString(),
+    thinking: '',
+  };
+}
+
+function normalizeAddMessageHistory(history: ChatMessage[], message: ChatMessage): ChatMessage[] {
+  return [...history, message];
+}
+
+function normalizeUpdateMessageHistory(history: ChatMessage[], messageId: string, updates: Partial<ChatMessage>): ChatMessage[] {
+  return history.map((msg) => (msg.id === messageId ? { ...msg, ...updates } : msg));
+}
+
+function normalizeForgetHistory(history: ChatMessage[], keepCount = MAX_MEMORY_ROUNDS): ChatMessage[] {
+  const totalMessages = history.length;
+  if (totalMessages <= keepCount * 2) {
+    return history;
+  }
+  return history.slice(totalMessages - keepCount * 2);
+}
+
 function getCurrentStepFromHistory(history: AgentStep[]): AgentStep | null {
   return history.length > 0 ? history[history.length - 1] : null;
 }
@@ -88,9 +3111,222 @@ async function saveMessageToAPI(
   }
 }
 
+export const agentStoreLegacyCompatRegistry = {
+  shouldFinalizeOnAgentStep,
+  normalizeFailureErrorType,
+  shouldSyncProgressScreenshotOnStep,
+  screenshotForStepMessage,
+  normalizeStatusReason,
+  normalizeStatusFinalReasoning,
+  upsertProgressIntoHistory,
+  updateStoreTransientForProgress,
+  createProgressMessageId,
+  normalizeFailureStateMessage,
+  normalizeCompletionStateMessage,
+  normalizeInterruptionStateMessage,
+  progressTrackingFromState,
+  withUpdatedProgressMessage,
+  finalizeStepInState,
+  shouldUpdateCurrentPhaseFromProgress,
+  shouldResetPhaseOnStep,
+  shouldResetPhaseOnStatus,
+  withProgressMessage,
+  getProgressKeyFromTaskStep,
+  clearProgressOnSessionReset,
+  normalizeInitialProgressMap,
+  shouldUpdateBusyStatusFromStep,
+  shouldSetCurrentTaskIdFromProgress,
+  shouldSetCurrentTaskIdFromStep,
+  shouldSetCurrentTaskIdFromStatus,
+  upsertProgressMessageInHistory,
+  finalizeProgressWithStep,
+  appendStandaloneFailure,
+  normalizeAgentStatusTaskId,
+  normalizeTaskCreatedState,
+  normalizeInitSessionState,
+  normalizeInitErrorState,
+  normalizeSendCommandStartState,
+  shouldStatusUpdateDeviceIdle,
+  shouldStatusUpdateDeviceError,
+  shouldStatusUpdateDeviceBusy,
+  normalizeStepProgressKeyValue,
+  normalizeCurrentDeviceStatusForInterrupt,
+  shouldTrackTaskCreatedProgressReset,
+  normalizeMessageContentForFailure,
+  normalizeMessageContentForCompletion,
+  normalizeMessageContentForInterrupt,
+  normalizeCurrentApp,
+  normalizeProgressMessageId,
+  normalizeProgressMapAfterStep,
+  normalizeProgressMapAfterReset,
+  shouldUseProgressState,
+  shouldUseAgentStepState,
+  shouldUseAgentStatusState,
+  normalizeProgressTransientState,
+  normalizeStepTransientState,
+  normalizeStatusTransientState,
+  normalizeProgressStateReset,
+  normalizeProgressPanelState,
+  normalizeStepPanelState,
+  normalizeStatusPanelState,
+  normalizeConversationCompletion,
+  normalizeProgressConversationUpdate,
+  normalizeProgressConversationEntry,
+  normalizeStatusResultMessage,
+  normalizeAgentProgressStatus,
+  normalizeAgentProgressError,
+  normalizeAgentProgressSuccess,
+  normalizeStatusRecordKey,
+  normalizeStepRecordKey,
+  normalizeProgressMessageRecordKey,
+  normalizeProgressMessageRecordId,
+  normalizeMessageProgressKey,
+  normalizeMessageStepKey,
+  normalizeMessageTaskStatus,
+  normalizeStatusShouldStop,
+  normalizeCurrentTaskId,
+  normalizeThinkingPanelState,
+  normalizeTaskIdMatchesProgress,
+  normalizeStepConversationResult,
+  normalizeStandaloneStepIfNeeded,
+  normalizeHistoryPatchForStep,
+  normalizeHistoryPatchForProgress,
+  normalizeHistoryPatchForStatus,
+  normalizeProgressMessageState,
+  normalizeAgentStepState,
+  normalizeAgentStatusState,
+  normalizeProgressUpsert,
+  normalizeProgressTaskKey,
+  normalizeHistoryMessages,
+  normalizeProgressMessageHistory,
+  normalizeHasProgressMessage,
+  normalizeMergedProgressMessage,
+  normalizeProgressUpdate,
+  normalizeStandaloneStepMessage,
+  normalizeTerminalStatusMessage,
+  normalizeTaskMessageTaskId,
+  normalizeTaskMessageErrorType,
+  normalizeTaskMessageSuccess,
+  normalizeTaskMessageScreenshot,
+  normalizeTaskMessageReasoning,
+  normalizeTaskMessageAction,
+  normalizeTaskMessageResult,
+  normalizeTaskMessageError,
+  normalizeMessageShouldSetScreenshot,
+  normalizeMessageShouldSetBusy,
+  normalizeMessageShouldClearPhase,
+  normalizeProgressHistory,
+  normalizeTaskCreatedHistory,
+  normalizeStepCurrentTaskIdValue,
+  normalizeStatusCurrentTaskIdValue,
+  normalizeStepDevicePatch,
+  normalizeCurrentTaskError,
+  normalizeShouldAddStatusMessage,
+  normalizeShouldForgetState,
+  normalizeConversationStateAfterStatus,
+  normalizeConversationStateAfterProgress,
+  normalizeConversationStateAfterStep,
+  normalizeStepShouldUpdateCurrentStep,
+  normalizeProgressShouldUpdateCurrentStepNum,
+  normalizeStepShouldUpdateCurrentStepNum,
+  normalizeStatusShouldUpdateCurrentTaskId,
+  normalizeProgressShouldUpdateCurrentTaskId,
+  normalizeStepShouldUpdateCurrentTaskId,
+  normalizeTaskCreatedTaskId,
+  normalizeTaskCreatedRunning,
+  normalizeTaskCreatedStatus,
+  normalizeProgressTaskCreate,
+  normalizeProgressTaskTaskId,
+  normalizeProgressTaskStep,
+  normalizeCurrentTaskIdMessage,
+  normalizeTaskMessageContent,
+  normalizeTaskMessagePhase,
+  normalizeTaskMessageStage,
+  normalizeTaskMessageStatus,
+  normalizeTaskMessageData,
+  normalizeTaskMessageVersion,
+  normalizeTaskMessageControllerId,
+  normalizeTaskMessageType,
+  normalizeShouldUseProgressBubble,
+  normalizeShouldUseStepBubble,
+  normalizeShouldUseStatusBubble,
+  normalizeMessageToProgressKey,
+  normalizeMessageToStepKey,
+  normalizeMessageToTaskId,
+  normalizeResultChatMessage,
+  normalizeProgressTrackingState,
+  normalizeAgentStepTrackingState,
+  normalizeAgentStatusTrackingState,
+  normalizeTaskCreatedTrackingState,
+  normalizeMessageProgressSuccess,
+  normalizeMessageProgressError,
+  normalizeMessageProgressStatus,
+  normalizeMessageProgressContent,
+  normalizeMessageProgressAction,
+  normalizeMessageProgressThinking,
+  normalizeMessageProgressResult,
+  normalizeMessageProgressScreenshot,
+  normalizeMessageProgressErrorType,
+  normalizeMessageProgressPhaseValue,
+  normalizeMessageProgressStageValue,
+  normalizeMessageProgressTaskIdValue,
+  normalizeMessageProgressStepValue,
+  normalizeMessageStatusTaskId,
+  normalizeMessageStepTaskId,
+  normalizeMessageStatusErrorType,
+  normalizeMessageStatusContentValue,
+  normalizeMessageStepContentValue,
+  normalizeProgressStoreState,
+  normalizeStepStoreState,
+  normalizeNewProgressMessage,
+  normalizeExistingProgressMessage,
+  normalizeTerminalHistory,
+  normalizeMessageTaskPatch,
+  normalizeProgressRecordIdValue,
+  normalizeProgressShouldFinalize,
+  normalizeProgressShouldHideThinking,
+  normalizeProgressShouldSetBusy,
+  normalizeAgentStepShouldSetBusy,
+  normalizeTerminalShouldClearProgress,
+  normalizeStatusShouldSetIdle,
+  normalizeStatusShouldSetError,
+  normalizeStatusShouldSetBusyAgain,
+  normalizeStatusShouldResetStep,
+  normalizeStatusShouldForgetMessages,
+  normalizeShouldSetCurrentTaskIdFromStatus,
+  normalizeShouldSetCurrentTaskIdFromProgressMessage,
+  normalizeShouldSetCurrentTaskIdFromAgentStep,
+  normalizeConversationPatchForProgress,
+  normalizeConversationPatchForStep,
+  normalizeConversationPatchForStatus,
+  normalizeStatusDevicePatch,
+  normalizeTaskCreatedStateValue,
+  normalizeConversationResetPatch,
+  normalizeHistoryInitPatch,
+  normalizeHistoryInitErrorPatch,
+  normalizeCommandStartPatch,
+  normalizeTaskInterruptPatch,
+  normalizeTaskEndPatch,
+  normalizeConversationAfterMessage,
+  normalizeStateAfterMessage,
+  normalizeTaskProgressMapReset,
+  normalizeProgressMessageIds,
+  normalizeConversationMessages,
+  normalizeUseDeviceBusyPatch,
+  normalizeUseDeviceErrorPatch,
+  normalizeUseDeviceIdlePatch,
+  normalizeAddUserMessage,
+  normalizeAddAgentMessage,
+  normalizeStreamingMessage,
+  normalizeAddMessageHistory,
+  normalizeUpdateMessageHistory,
+  normalizeForgetHistory,
+};
+
 interface AgentState {
   // Current session
   currentDeviceId: string | null;
+  progressMessageIds: Record<string, string>;
   currentTaskId: string | null;
   currentInstruction: string | null; // 当前任务指令
   mode: AgentMode;
@@ -185,6 +3421,8 @@ interface AgentState {
   _handlePhaseStart: (message: WsConsoleMessage) => void;
   _handlePhaseEnd: (message: WsConsoleMessage) => void;
   _handleThinking: (message: WsConsoleMessage) => void;
+  _handleAgentProgress: (message: WsConsoleMessage) => void;
+  upsertProgressMessage: (message: WsConsoleMessage) => string | null;
   createStreamingAgentMessage: () => string;
 }
 
@@ -193,6 +3431,7 @@ const generateId = () => `msg_${Date.now()}_${Math.random().toString(36).substr(
 
 export const useAgentStore = create<AgentState>((set, get) => ({
   currentDeviceId: null,
+  progressMessageIds: {},
   currentTaskId: null,
   currentInstruction: null,
   mode: 'normal',
@@ -233,10 +3472,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     try {
       const snapshot = await agentApi.getLatestDeviceSnapshot(deviceId);
       const savedHistory = await loadConversationHistoryFromAPI(deviceId, snapshot.task_id);
+      const restoredHistory = mergeRestoredConversation(
+        snapshot.chat_history.map(toConversationMessage),
+        savedHistory,
+      );
       const history = buildHistoryFromSnapshot(snapshot);
       const currentStep = getCurrentStepFromHistory(history);
       const normalizedStatus = normalizeStoreStatus(snapshot.status);
       const isRunning = hasActiveBackendTask(snapshot.task_id, snapshot.status, snapshot.can_interrupt);
+      const transientState = transientStateFromConversation(restoredHistory);
 
       set({
         currentDeviceId: deviceId,
@@ -253,16 +3497,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         currentStepNum: snapshot.current_step,
         maxSteps: snapshot.max_steps,
         error: null,
-        conversationHistory: savedHistory,
-        currentScreenshot: snapshot.current_screenshot,
+        conversationHistory: restoredHistory,
+        currentScreenshot: snapshot.current_screenshot || latestScreenshotFromConversation(restoredHistory),
         currentApp: snapshot.current_app || '未知',
-        currentPhase: null,
-        thinkingContent: '',
-        isThinking: false,
         waitingForConfirm: false,
         waitingConfirmPhase: null,
         canInterrupt: snapshot.can_interrupt,
         canResume: snapshot.can_resume,
+        progressMessageIds: progressTrackingFromConversation(restoredHistory),
+        ...transientState,
       });
     } catch (error: any) {
       console.error('Failed to initialize agent session:', error);
@@ -291,6 +3534,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         waitingConfirmPhase: null,
         canInterrupt: false,
         canResume: false,
+        progressMessageIds: normalizeResetProgressTracking(),
       });
     }
   },
@@ -330,6 +3574,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       waitingConfirmPhase: null,
       canInterrupt: false,
       canResume: false,
+      progressMessageIds: normalizeResetProgressTracking(),
     });
   },
 
@@ -352,6 +3597,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       case 'agent_step':
         if (message.device_id === deviceId) {
           state._handleAgentStep(message);
+        }
+        break;
+
+      case 'agent_progress':
+        if (message.device_id === deviceId) {
+          state._handleAgentProgress(message);
         }
         break;
 
@@ -419,6 +3670,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             currentApp: '未知',
             canInterrupt: true,
             canResume: false,
+            progressMessageIds: normalizeTaskCreatedProgressState(),
+            ...normalizeStatusStateReset(),
           });
         }
         break;
@@ -490,17 +3743,17 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   // 遗忘机制 - 保留最近的N轮对话
   forgetOldMessages: (keepCount = MAX_MEMORY_ROUNDS) => {
     set((state) => {
-      const totalMessages = state.conversationHistory.length;
-      if (totalMessages <= keepCount * 2) {
-        // 不足10轮，无需遗忘
+      if (state.currentTaskId && (state.status === 'running' || state.status === 'pending')) {
         return state;
       }
-      // 保留最近的N轮对话（每轮包含用户消息和Agent回复）
-      const messagesToKeep = keepCount * 2;
-      const forgottenMessages = state.conversationHistory.slice(0, totalMessages - messagesToKeep);
-      console.log(`遗忘机制触发: 遗忘${forgottenMessages.length}条旧消息，保留${messagesToKeep}条新消息`);
+
+      const totalMessages = state.conversationHistory.length;
+      const messagesToKeep = Math.max(keepCount * 4, keepCount);
+      if (totalMessages <= messagesToKeep) {
+        return state;
+      }
+
       const newHistory = state.conversationHistory.slice(totalMessages - messagesToKeep);
-      // 服务器端会处理 retention，前端只需更新本地状态
       return {
         conversationHistory: newHistory,
       };
@@ -517,7 +3770,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         console.error('Failed to clear chat history on server:', e);
       }
     }
-    set({ conversationHistory: [] });
+    set({ conversationHistory: [], progressMessageIds: normalizeResetProgressTracking() });
   },
 
   // 设置截图
@@ -573,8 +3826,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       });
 
       set({
-        currentTaskId: result.task_id,
-        isRunning: hasActiveBackendTask(result.task_id, result.status, true),
+        currentTaskId: result.task_id || state.currentTaskId,
+        isRunning: true,
         status: normalizeStoreStatus(result.status),
         currentStepNum: 0,
         history: [],
@@ -624,125 +3877,161 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }
   },
 
+  upsertProgressMessage: (message: WsConsoleMessage) => {
+    const state = get();
+    const progress = normalizeProgressMessageConversationState(
+      {
+        conversationHistory: state.conversationHistory,
+        progressMessageIds: state.progressMessageIds,
+      },
+      message,
+    );
+
+    set({
+      conversationHistory: progress.conversationHistory,
+      progressMessageIds: progress.progressMessageIds,
+      ...normalizeProgressStatePatch(message, state.currentTaskId),
+    });
+
+    return progress.messageId;
+  },
+
+  _handleAgentProgress: (message: WsConsoleMessage) => {
+    const state = get();
+
+    if (shouldSetScreenshot(message) && message.screenshot) {
+      state.setScreenshot(message.screenshot);
+    }
+
+    if (shouldUpdateBusyStatusFromProgress(message)) {
+      useDeviceStore.getState().updateDevice(state.currentDeviceId!, buildDeviceBusyStatePatch());
+    }
+
+    state.upsertProgressMessage(message);
+
+    agentStoreLogger.debug('[handleAgentProgress] Progress processed', {
+      taskId: message.task_id,
+      stepNumber: message.step_number,
+      phase: message.phase,
+      stage: message.stage,
+    });
+  },
+
   // Internal handler for agent_step WebSocket message
   _handleAgentStep: (message: WsConsoleMessage) => {
     const state = get();
-    const { step_number, action, reasoning, result, screenshot, success } = message;
 
-    // 更新截图
-    if (screenshot) {
-      state.setScreenshot(screenshot);
+    if (message.screenshot) {
+      state.setScreenshot(message.screenshot);
     }
 
-    // Update current step
-    const step: AgentStep = {
-      id: `step_${step_number}`,
-      phase: 'action',
-      action: {
-        type: (action?.action || 'unknown') as any,
-        params: action || {},
-        description: formatActionDescription(action),
-      },
-      thinking: reasoning || '',
-      timestamp: new Date().toISOString(),
-      success: success ?? true,
-      step_number: step_number || 0,
-    };
-
+    const step = normalizeCurrentStep(message);
     state.setCurrentStep(step);
     state.appendStep(step);
-    set({ currentStepNum: step_number || 0 });
 
-    // Update progress
-    useDeviceStore.getState().updateDevice(state.currentDeviceId!, { status: 'busy' });
+    const conversationPatch = normalizeAgentStepConversationState(
+      {
+        conversationHistory: state.conversationHistory,
+        progressMessageIds: state.progressMessageIds,
+      },
+      message,
+    );
 
-    // Add agent message
-    if (action && Object.keys(action).length > 0) {
-      state.addAgentMessage(
-        formatActionDescription(action),
-        reasoning,
-        {
-          type: (action?.action || 'unknown') as any,
-          params: action || {},
-          description: formatActionDescription(action),
-        },
-        screenshot
-      );
-    } else if (result) {
-      state.addAgentMessage(result, reasoning, undefined, screenshot);
-    }
+    set({
+      currentTaskId: normalizeAgentStepCurrentTaskId(message, state.currentTaskId),
+      currentStepNum: normalizeAgentStepNumber(message),
+      conversationHistory: conversationPatch.conversationHistory,
+      progressMessageIds: conversationPatch.progressMessageIds,
+      ...updateStoreTransientForStep(),
+    });
+
+    useDeviceStore.getState().updateDevice(state.currentDeviceId!, buildDeviceBusyStatePatch());
 
     agentStoreLogger.debug('[handleAgentStep] Step processed', {
-      stepNumber: step_number,
-      hasAction: !!action,
-      success,
+      stepNumber: message.step_number,
+      hasAction: !!message.action,
+      success: message.success,
+      usedProgressMessage: shouldUseExistingProgressMessage(state, message),
     });
   },
 
   // Internal handler for agent_status WebSocket message
   _handleAgentStatus: (message: WsConsoleMessage) => {
     const state = get();
-    const { status, message: statusMessage } = message;
+    const { status } = message;
 
-    agentStoreLogger.info('[handleAgentStatus] Status update', { status, message: statusMessage });
+    agentStoreLogger.info('[handleAgentStatus] Status update', {
+      status,
+      message: message.message,
+      errorType: message.error_type || message.data?.error_type,
+    });
+
+    const conversationPatch = normalizeAgentStatusConversationState(
+      {
+        conversationHistory: state.conversationHistory,
+        progressMessageIds: state.progressMessageIds,
+      },
+      message,
+    );
 
     if (status === 'finished' || status === 'completed') {
       state.setCurrentStep(null);
       set({
-        isRunning: false,
-        status: 'completed',
-        canInterrupt: false,
-        canResume: false,
+        ...normalizeStatusCompletedState(message, state.currentTaskId),
+        conversationHistory: conversationPatch.conversationHistory,
+        progressMessageIds: conversationPatch.progressMessageIds,
+        ...updateStoreTransientForStatus(message),
       });
-      useDeviceStore.getState().updateDevice(state.currentDeviceId!, { status: 'idle' });
-
-      if (statusMessage) {
-        state.addAgentMessage(statusMessage);
-      }
-
-      // 检查是否需要遗忘
+      useDeviceStore.getState().updateDevice(state.currentDeviceId!, buildDeviceIdleStatePatch());
       state.forgetOldMessages();
-    } else if (status === 'error' || status === 'failed') {
+      return;
+    }
+
+    if (status === 'error' || status === 'failed') {
       state.setCurrentStep(null);
       set({
-        isRunning: false,
-        status: 'failed',
-        error: statusMessage || 'Task failed',
-        canInterrupt: false,
-        canResume: false,
+        ...normalizeStatusFailedState(message, state.currentTaskId),
+        error: normalizeFailureMessage(message),
+        conversationHistory: conversationPatch.conversationHistory,
+        progressMessageIds: conversationPatch.progressMessageIds,
+        ...updateStoreTransientForStatus(message),
       });
-      useDeviceStore.getState().updateDevice(state.currentDeviceId!, { status: 'error' });
+      useDeviceStore.getState().updateDevice(state.currentDeviceId!, buildDeviceErrorStatePatch());
+      return;
+    }
 
-      if (statusMessage) {
-        state.addAgentMessage(`执行失败: ${statusMessage}`);
-      }
-    } else if (status === 'interrupted') {
+    if (status === 'interrupted') {
+      state.setCurrentStep(null);
       set({
-        isRunning: false,
-        status: 'interrupted',
-        canInterrupt: false,
-        canResume: false,
+        ...normalizeStatusInterruptedState(message, state.currentTaskId),
+        conversationHistory: conversationPatch.conversationHistory,
+        progressMessageIds: conversationPatch.progressMessageIds,
+        ...updateStoreTransientForStatus(message),
       });
 
       const currentDevice = state.currentDeviceId ? useDeviceStore.getState().getDeviceById(state.currentDeviceId) : undefined;
-      useDeviceStore.getState().updateDevice(state.currentDeviceId!, {
-        status: currentDevice?.status === 'offline' ? 'offline' : 'idle',
-      });
+      useDeviceStore.getState().updateDevice(state.currentDeviceId!, buildDeviceIdleStatePatch(currentDevice?.status));
+      return;
+    }
 
-      state.addAgentMessage(statusMessage || '任务被中断');
-    } else if (status === 'pending') {
+    if (status === 'pending') {
       set({
-        isRunning: hasActiveBackendTask(state.currentTaskId, status, state.canInterrupt),
-        status: 'pending',
-        canInterrupt: Boolean(state.currentTaskId),
-        canResume: false,
+        ...normalizeStatusPendingState(message, state.currentTaskId, state.canInterrupt),
+        currentTaskId: normalizeAgentStatusCurrentTaskId(message, state.currentTaskId),
+        conversationHistory: conversationPatch.conversationHistory,
+        progressMessageIds: conversationPatch.progressMessageIds,
+        ...updateStoreTransientForStatus(message),
       });
-    } else if (status === 'running') {
+      return;
+    }
+
+    if (status === 'running') {
       set({
-        isRunning: hasActiveBackendTask(state.currentTaskId, status, true),
-        status: 'running',
-        canInterrupt: Boolean(state.currentTaskId),
-        canResume: false,
+        ...normalizeStatusRunningState(message, state.currentTaskId),
+        currentTaskId: normalizeAgentStatusCurrentTaskId(message, state.currentTaskId),
+        conversationHistory: conversationPatch.conversationHistory,
+        progressMessageIds: conversationPatch.progressMessageIds,
+        ...updateStoreTransientForStatus(message),
       });
     }
   },
@@ -770,7 +4059,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         },
         timestamp: new Date().toISOString(),
         success: true,
-        step_number: step_number || 0,
+        step_number: step_number ?? 0,
       },
     });
 
@@ -863,15 +4152,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }
   },
 
-  confirmAction: () => {
+  confirmAction: async () => {
     get().confirmPhase(true);
   },
 
-  rejectAction: () => {
+  rejectAction: async () => {
     get().confirmPhase(false);
   },
 
-  skipAction: () => {
+  skipAction: async () => {
     get().confirmPhase(false);
   },
 

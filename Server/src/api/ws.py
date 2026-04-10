@@ -110,9 +110,14 @@ async def handle_ws_message(connection_id: str, message: dict):
 
     if msg_type == "ack":
         from src.services.action_router import action_router
+        from src.services.react_scheduler import scheduler
 
         if action_router:
             await action_router.handle_ack(message)
+        # Handle bootstrap screenshot ACK for initial_screenshot_ack_received milestone
+        ref_msg_id = message.get("ref_msg_id") or message.get("payload", {}).get("ref_msg_id")
+        if device_id and ref_msg_id and scheduler:
+            await scheduler.handle_bootstrap_ack(device_id, ref_msg_id)
         if device_id:
             await device_status_manager.touch(device_id)
         logger.debug(
