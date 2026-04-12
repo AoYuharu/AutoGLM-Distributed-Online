@@ -18,7 +18,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum
 from threading import Lock
@@ -265,6 +265,24 @@ class ReActRecord:
     success: bool = True
 
 
+@dataclass
+class ObserveErrorDecisionState:
+    """Observe/action 执行错误超限后的用户决策状态"""
+    task_id: str
+    device_id: str
+    message: str
+    consecutive_count: int
+    max_retries: int
+    step_number: int
+    error_type: str = ReActErrorType.OBSERVE_ERROR.value
+    stage: str = "observe_error"
+    message_id: str = field(default_factory=lambda: f"observe_error_{uuid.uuid4().hex[:12]}")
+    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+    def to_payload(self) -> dict:
+        return asdict(self)
+
+
 # ==================== 单个设备任务类 ====================
 
 @dataclass
@@ -319,6 +337,11 @@ class DeviceTask:
 
     # 反思提示词（action解析失败时注入给下一轮AI）
     reflection_prompt: str = ""
+
+    # observe/action 执行失败恢复控制
+    max_observe_error_retries: int = 2
+    consecutive_observe_error_count: int = 0
+    pending_observe_error_decision: Optional[ObserveErrorDecisionState] = None
 
     # 时间戳
     created_at: float = field(default_factory=time.time)
@@ -420,8 +443,244 @@ do(action="操作类型", ...)
 4. 如果屏幕上的明确文本已经表明用户要求的目标已完成，必须立即输出 do(action="finish", message="任务已完成")
 5. 对于设置类任务，如果界面明确显示目标值已经等于用户要求的值，则任务已经完成，不要继续点击、滑动或进入其他页面
 6. 只有在屏幕上没有出现明确完成证据时，才继续导航查找相关设置
+7. 当上下文中出现 [ObserveError] 标签时，表示上一条 action 命令执行失败或未成功落地；你必须把它视为纠错反馈，结合最新截图重新判断，不要机械重复同一错误动作
 
 用户指令: {self.instruction}"""
+
+    def build_observe_error_reflection(self, error_message: str, advice: str = "") -> str:
+        base = (
+            f"[ObserveError] {error_message}\n"
+            "上一条 action 命令执行失败或未成功落地。请结合最新截图重新判断，"
+            "避免重复同一错误动作或同一错误目标。"
+        )
+        advice = (advice or "").strip()
+        if advice:
+            base = f"{base}\n[UserAdvice] {advice}"
+        return base
+
+    def clear_observe_error_decision(self):
+        self.pending_observe_error_decision = None
+        if self.status == TaskStatus.WAITING_CONFIRMATION and self.session_status == SessionStatus.WAIT_USER_DECISION:
+            self.status = TaskStatus.PENDING
+            self.session_status = SessionStatus.WAIT_FOR_PUSH
+
+    def mark_observe_error_recovered(self, error_message: str, advice: str = ""):
+        self.reflection_prompt = self.build_observe_error_reflection(error_message, advice)
+        self.clear_observe_error_decision()
+        self.phase = TaskPhase.REASON
+        self.status = TaskStatus.PENDING
+        self.session_status = SessionStatus.WAIT_FOR_PUSH
+        self.last_active_at = time.time()
+
+    def handle_observe_error(self, error_message: str) -> Optional[ObserveErrorDecisionState]:
+        normalized_error = (error_message or "Observation error").strip()
+        if self.react_records:
+            self.react_records[-1].success = False
+        self.consecutive_observe_error_count += 1
+        self.last_active_at = time.time()
+
+        if self.consecutive_observe_error_count <= self.max_observe_error_retries:
+            self.mark_observe_error_recovered(normalized_error)
+            return None
+
+        decision = ObserveErrorDecisionState(
+            task_id=self.task_id,
+            device_id=self.device_id,
+            message=normalized_error,
+            consecutive_count=self.consecutive_observe_error_count,
+            max_retries=self.max_observe_error_retries,
+            step_number=self.current_step,
+        )
+        self.pending_observe_error_decision = decision
+        self.phase = TaskPhase.OBSERVE
+        self.status = TaskStatus.WAITING_CONFIRMATION
+        self.session_status = SessionStatus.WAIT_USER_DECISION
+        return decision
+
+    def resolve_observe_error_decision(self, decision: str, advice: str = "") -> Optional[ObserveErrorDecisionState]:
+        pending = self.pending_observe_error_decision
+        if not pending:
+            return None
+
+        if decision == "continue":
+            self.mark_observe_error_recovered(pending.message, advice)
+        else:
+            self.status = TaskStatus.INTERRUPTED
+            self.session_status = SessionStatus.FINISHED
+            self.pending_observe_error_decision = None
+        return pending
+
+    def get_observe_error_prompt_payload(self) -> Optional[dict]:
+        if not self.pending_observe_error_decision:
+            return None
+        return self.pending_observe_error_decision.to_payload()
+
+    def is_waiting_observe_error_decision(self) -> bool:
+        return self.pending_observe_error_decision is not None
+
+    def reset_observe_error_counter(self):
+        self.consecutive_observe_error_count = 0
+        self.pending_observe_error_decision = None
+
+    def annotate_latest_record_observe_error(self, error_message: str):
+        if not self.react_records:
+            return
+        record = self.react_records[-1]
+        record.success = False
+        if error_message:
+            record.observation = error_message
+            if not record.action_result:
+                record.action_result = error_message
+
+    def update_latest_observe(self, screenshot: str, observation: str = "", success: bool = True, screenshot_path: Optional[str] = None):
+        if self.react_records:
+            record = self.react_records[-1]
+            if screenshot:
+                record.screenshot = screenshot
+            if observation:
+                record.observation = observation
+            record.success = success
+        self.phase = TaskPhase.OBSERVE
+        self.last_active_at = time.time()
+        self.session_status = SessionStatus.WAIT_OBSERVATION
+
+        try:
+            from src.services.file_storage import file_storage
+            if self.react_records and (screenshot or observation):
+                step = self.react_records[-1].step_number
+                resolved_path = screenshot_path
+                if screenshot and not resolved_path:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    resolved_path = file_storage.save_screenshot(self.device_id, step, ts, screenshot)
+                file_storage.append_react_record(self.device_id, {
+                    "step_number": step,
+                    "screenshot": resolved_path,
+                    "observation": observation,
+                    "success": success,
+                    "phase": "observe",
+                })
+        except Exception as e:
+            scheduler_logger.warning(f"[OBSERVE] Failed to save screenshot: {e}")
+
+    def get_latest_observation(self) -> str:
+        if self.react_records and self.react_records[-1].observation:
+            return self.react_records[-1].observation
+        return self.initial_observation
+
+    def get_latest_screenshot_path(self) -> Optional[str]:
+        if self.react_records and self.react_records[-1].screenshot:
+            return self.react_records[-1].screenshot
+        return self.initial_screenshot_path
+
+    def get_latest_error_reason(self) -> Optional[str]:
+        pending = self.pending_observe_error_decision
+        if pending:
+            return pending.message
+        if self.react_records and self.react_records[-1].success is False:
+            return self.react_records[-1].observation or self.react_records[-1].action_result or None
+        return None
+
+    def to_observe_error_status_message(self) -> Optional[str]:
+        pending = self.pending_observe_error_decision
+        if not pending:
+            return None
+        return (
+            f"Observe/action 连续失败 {pending.consecutive_count} 次，"
+            f"已超过上限 {pending.max_retries}，等待用户决定是否继续。"
+        )
+
+    def to_observe_error_chat_message(self) -> Optional[dict]:
+        pending = self.pending_observe_error_decision
+        if not pending:
+            return None
+        content = self.to_observe_error_status_message() or pending.message
+        return {
+            "id": pending.message_id,
+            "role": "agent",
+            "content": content,
+            "created_at": pending.created_at,
+            "task_id": pending.task_id,
+            "step_number": pending.step_number,
+            "phase": "observe",
+            "stage": "observe_error_user_decision",
+            "progress_status_text": "observe_error_user_decision",
+            "progress_message": content,
+            "error": pending.message,
+            "error_type": pending.error_type,
+            "success": False,
+            "data": pending.to_payload(),
+        }
+
+    def set_observe(self, screenshot: str, observation: str = ""):
+        self.update_latest_observe(screenshot, observation, success=True)
+
+    def complete_reason(self, reasoning: str, action: dict):
+        self.clear_observe_error_decision()
+        self.consecutive_observe_error_count = 0
+        """完成Reason阶段，记录ReAct"""
+        record = ReActRecord(
+            step_number=len(self.react_records) + 1,
+            reasoning=reasoning,
+            action=action
+        )
+        self.react_records.append(record)
+        self.current_step = len(self.react_records)
+        self.phase = TaskPhase.ACT
+        self.last_active_at = time.time()
+
+        scheduler_logger.debug(
+            f"[REASON] reason phase completed: device={self.device_id}, task={self.task_id}, "
+            f"step_number={record.step_number}, action_type={action.get('action')}, "
+            f"reasoning_preview={reasoning[:200] if reasoning else ''}"
+        )
+
+        # Save react record to file storage
+        try:
+            from src.services.file_storage import file_storage
+            file_storage.append_react_record(self.device_id, {
+                "step_number": record.step_number,
+                "reasoning": reasoning,
+                "action": action,
+                "phase": "reason",
+            })
+        except Exception as e:
+            scheduler_logger.warning(f"[REASON] Failed to save react record: {e}")
+
+    def complete_act(self, result: str):
+        """完成Act阶段"""
+        if self.react_records:
+            self.react_records[-1].action_result = result
+            if result and not self.react_records[-1].observation:
+                self.react_records[-1].observation = result
+        self.phase = TaskPhase.OBSERVE
+        self.last_active_at = time.time()
+        self.session_status = SessionStatus.WAIT_OBSERVATION
+
+        scheduler_logger.debug(f"[ACT] act completed: device={self.device_id}, task={self.task_id}, result={result[:100] if result else ''}")
+
+        # Update react record in file storage with action result
+        try:
+            from src.services.file_storage import file_storage
+            if self.react_records:
+                file_storage.append_react_record(self.device_id, {
+                    "step_number": self.react_records[-1].step_number,
+                    "action_result": result,
+                    "observation": self.react_records[-1].observation,
+                    "phase": "act",
+                })
+        except Exception as e:
+            scheduler_logger.warning(f"[ACT] Failed to update react record: {e}")
+
+    def _parse_action(self, content: str) -> tuple[str, str]:
+        """解析模型响应，分离思考和动作"""
+        if "<answer>" in content:
+            parts = content.split("<answer>")
+            thinking = parts[0].replace("<response>", "").replace("</response>", "").strip()
+            if len(parts) > 1:
+                action = parts[1].split("</answer>")[0].strip()
+            else:
+                action = content
+            return thinking, action
 
     def initialize(self):
         """初始化任务"""
@@ -1008,8 +1267,10 @@ class ReActScheduler:
         # 待确认的操作
         self._waiting_confirmations: dict[str, dict] = {}
 
-        # 首轮 bootstrap 截图等待器
+        # 首轮 bootstrap observe 等待器
         self._bootstrap_waiters: dict[str, asyncio.Future] = {}
+        # 首轮 bootstrap ACK 等待器
+        self._bootstrap_ack_waiters: dict[str, asyncio.Future] = {}
         # 首轮 bootstrap 截图请求的 msg_id，用于匹配 ACK
         self._bootstrap_screenshot_msg_ids: dict[str, str] = {}
 
@@ -1102,6 +1363,7 @@ class ReActScheduler:
         instruction: str,
         mode: str = "normal",
         max_steps: int = 100,
+        max_observe_error_retries: int = 2,
         action_executor: Optional[Callable] = None,
         status_callback: Optional[Callable] = None,
         step_callback: Optional[Callable] = None,
@@ -1116,6 +1378,7 @@ class ReActScheduler:
             instruction=instruction,
             mode=mode,
             max_steps=max_steps,
+            max_observe_error_retries=max_observe_error_retries,
             action_executor=action_executor,
             status_callback=status_callback,
             step_callback=step_callback,
@@ -1255,6 +1518,10 @@ class ReActScheduler:
         bootstrap_waiter = self._bootstrap_waiters.pop(device_id, None)
         if bootstrap_waiter and not bootstrap_waiter.done():
             bootstrap_waiter.cancel()
+        bootstrap_ack_waiter = self._bootstrap_ack_waiters.pop(device_id, None)
+        if bootstrap_ack_waiter and not bootstrap_ack_waiter.done():
+            bootstrap_ack_waiter.cancel()
+        self._bootstrap_screenshot_msg_ids.pop(device_id, None)
 
     async def _request_bootstrap_screenshot(self, task: DeviceTask) -> tuple[str, str]:
         """请求首轮截图，并返回 (screenshot, observation)。"""
@@ -1262,32 +1529,64 @@ class ReActScheduler:
             raise ObserveException(ReActErrorType.OBSERVE_TIMEOUT, "Bootstrap screenshot hub unavailable")
 
         loop = asyncio.get_running_loop()
-        waiter = loop.create_future()
+        observe_waiter = loop.create_future()
         previous_waiter = self._bootstrap_waiters.get(task.device_id)
         if previous_waiter and not previous_waiter.done():
             previous_waiter.cancel()
-        self._bootstrap_waiters[task.device_id] = waiter
+        self._bootstrap_waiters[task.device_id] = observe_waiter
+
+        ack_waiter = loop.create_future()
+        previous_ack_waiter = self._bootstrap_ack_waiters.get(task.device_id)
+        if previous_ack_waiter and not previous_ack_waiter.done():
+            previous_ack_waiter.cancel()
+        self._bootstrap_ack_waiters[task.device_id] = ack_waiter
 
         from src.network.message_types import create_request_screenshot
 
-        ws_message = create_request_screenshot(task.task_id, task.device_id)
+        ws_message = create_request_screenshot(
+            task.task_id,
+            task.device_id,
+            step_number=0,
+            phase="observe",
+            purpose="bootstrap",
+        )
         message = ws_message.to_dict()
         # 记录 bootstrap 截图请求的 msg_id，用于匹配 ACK
         self._bootstrap_screenshot_msg_ids[task.device_id] = ws_message.msg_id
 
+        scheduler_logger.info(
+            f"[BOOTSTRAP] request_screenshot dispatched: device={task.device_id}, task={task.task_id}, "
+            f"msg_id={ws_message.msg_id}, step=0"
+        )
+
         sent = self.send_to_device(task.device_id, message)
         if not sent:
             self._bootstrap_waiters.pop(task.device_id, None)
+            self._bootstrap_ack_waiters.pop(task.device_id, None)
+            self._bootstrap_screenshot_msg_ids.pop(task.device_id, None)
             raise ObserveException(ReActErrorType.OBSERVE_TIMEOUT, "Bootstrap screenshot request failed")
 
+        ack_timeout = min(float(task.observe_timeout), 15.0)
+
         try:
-            result = await asyncio.wait_for(waiter, timeout=task.observe_timeout)
-        except asyncio.TimeoutError as exc:
-            raise ObserveException(ReActErrorType.OBSERVE_TIMEOUT, "Bootstrap screenshot timeout") from exc
+            try:
+                await asyncio.wait_for(ack_waiter, timeout=ack_timeout)
+            except asyncio.TimeoutError as exc:
+                self._bootstrap_screenshot_msg_ids.pop(task.device_id, None)
+                raise ObserveException(ReActErrorType.ACK_TIMEOUT, "Bootstrap screenshot ACK timeout") from exc
+
+            try:
+                result = await asyncio.wait_for(observe_waiter, timeout=task.observe_timeout)
+            except asyncio.TimeoutError as exc:
+                raise ObserveException(ReActErrorType.OBSERVE_TIMEOUT, "Bootstrap screenshot timeout") from exc
         finally:
+            current_ack_waiter = self._bootstrap_ack_waiters.get(task.device_id)
+            if current_ack_waiter is ack_waiter:
+                self._bootstrap_ack_waiters.pop(task.device_id, None)
             current_waiter = self._bootstrap_waiters.get(task.device_id)
-            if current_waiter is waiter:
+            if current_waiter is observe_waiter:
                 self._bootstrap_waiters.pop(task.device_id, None)
+            self._bootstrap_screenshot_msg_ids.pop(task.device_id, None)
 
         return result
 
@@ -1302,14 +1601,38 @@ class ReActScheduler:
                 device_id=device_id,
                 step_number=0,
                 phase="observe",
-                stage="requesting_initial_screenshot",
-                message="正在请求初始截图",
+                stage="waiting_ack",
+                message="等待 bootstrap screenshot ACK",
             )
         await self._emit_phase_start(device_id, task.task_id, "observe", 0)
         if not await self._guard_task_ownership(device_id, task, execution_token, "after_bootstrap_phase_start"):
             return False
 
-        screenshot, observation = await self._request_bootstrap_screenshot(task)
+        try:
+            screenshot, observation = await self._request_bootstrap_screenshot(task)
+        except ObserveException as exc:
+            if self._ws_hub:
+                if exc.error_type == ReActErrorType.ACK_TIMEOUT:
+                    stage = "ack_timeout"
+                elif exc.error_type == ReActErrorType.ACK_REJECTED:
+                    stage = "ack_rejected"
+                elif exc.error_type == ReActErrorType.OBSERVE_ERROR:
+                    stage = "observe_received"
+                else:
+                    stage = "observe_timeout"
+                self.broadcast_agent_progress(
+                    task_id=task.task_id,
+                    device_id=device_id,
+                    step_number=0,
+                    phase="observe",
+                    stage=stage,
+                    message=exc.message,
+                    error=exc.message,
+                    error_type=exc.error_type.value,
+                    success=False,
+                )
+            raise
+
         if not await self._guard_task_ownership(device_id, task, execution_token, "after_bootstrap_observe"):
             return False
 
@@ -1326,7 +1649,7 @@ class ReActScheduler:
                 device_id=device_id,
                 step_number=0,
                 phase="observe",
-                stage="initial_screenshot_received",
+                stage="observe_received",
                 message="初始截图已收到",
                 result=task.initial_observation,
                 screenshot=task.initial_screenshot,
@@ -1368,8 +1691,15 @@ class ReActScheduler:
         waiter.set_result((screenshot, observation))
         return True
 
-    async def handle_bootstrap_ack(self, device_id: str, ref_msg_id: str) -> bool:
-        """处理 bootstrap 截图请求的 ACK，匹配 ref_msg_id 后发射 initial_screenshot_ack_received milestone。"""
+    async def handle_bootstrap_ack(
+        self,
+        device_id: str,
+        ref_msg_id: str,
+        *,
+        accepted: bool = True,
+        error: Optional[str] = None,
+    ) -> bool:
+        """处理 bootstrap 截图请求的 ACK，并发射 canonical transport milestones。"""
         expected_msg_id = self._bootstrap_screenshot_msg_ids.get(device_id)
         if not expected_msg_id or expected_msg_id != ref_msg_id:
             return False
@@ -1378,6 +1708,34 @@ class ReActScheduler:
 
         task = self._device_tasks.get(device_id)
         task_id = task.task_id if task else ""
+        ack_waiter = self._bootstrap_ack_waiters.get(device_id)
+        waiter = self._bootstrap_waiters.get(device_id)
+
+        if not accepted:
+            message = error or "Bootstrap screenshot ACK rejected"
+            if ack_waiter and not ack_waiter.done():
+                ack_waiter.set_exception(ObserveException(ReActErrorType.ACK_REJECTED, message))
+            if waiter and not waiter.done():
+                waiter.set_exception(ObserveException(ReActErrorType.ACK_REJECTED, message))
+            if self._ws_hub:
+                self.broadcast_agent_progress(
+                    task_id=task_id,
+                    device_id=device_id,
+                    step_number=0,
+                    phase="observe",
+                    stage="ack_rejected",
+                    message=message,
+                    error=message,
+                    error_type=ReActErrorType.ACK_REJECTED.value,
+                    success=False,
+                )
+            scheduler_logger.warning(
+                f"[BOOTSTRAP ACK] ack rejected: device={device_id}, task={task_id}, error={message}"
+            )
+            return True
+
+        if ack_waiter and not ack_waiter.done():
+            ack_waiter.set_result(True)
 
         if self._ws_hub:
             self.broadcast_agent_progress(
@@ -1385,12 +1743,20 @@ class ReActScheduler:
                 device_id=device_id,
                 step_number=0,
                 phase="observe",
-                stage="initial_screenshot_ack_received",
-                message="已获取到ACK，等待初始截图",
+                stage="ack_received",
+                message="Bootstrap screenshot ACK 已收到",
+            )
+            self.broadcast_agent_progress(
+                task_id=task_id,
+                device_id=device_id,
+                step_number=0,
+                phase="observe",
+                stage="waiting_observe",
+                message="等待 bootstrap screenshot observe_result",
             )
 
         scheduler_logger.info(
-            f"[BOOTSTRAP ACK] initial_screenshot_ack_received emitted: device={device_id}, task={task_id}"
+            f"[BOOTSTRAP ACK] canonical ACK milestones emitted: device={device_id}, task={task_id}"
         )
         return True
 
@@ -1444,6 +1810,8 @@ class ReActScheduler:
         if observation:
             record.observation = observation
         record.success = success and not error
+        if record.success:
+            task.reset_observe_error_counter()
         task.last_active_at = time.time()
 
         scheduler_logger.info(
@@ -1953,6 +2321,42 @@ class ReActScheduler:
                 f"[CYCLE] ObserveException: device={device_id}, task={task.task_id}, "
                 f"error_type={e.error_type}, message={e.message}"
             )
+            if task.current_step > 0 and e.error_type == ReActErrorType.OBSERVE_ERROR:
+                task.annotate_latest_record_observe_error(e.message)
+                pending_decision = task.handle_observe_error(e.message)
+
+                if pending_decision is not None and self._ws_hub:
+                    self.broadcast_agent_progress(
+                        task_id=task.task_id,
+                        device_id=device_id,
+                        step_number=task.current_step,
+                        phase="observe",
+                        stage="observe_error_user_decision",
+                        message=task.to_observe_error_status_message() or pending_decision.message,
+                        error=pending_decision.message,
+                        error_type=pending_decision.error_type,
+                        success=False,
+                        data=pending_decision.to_payload(),
+                    )
+
+                if pending_decision is None:
+                    scheduler_logger.info(
+                        f"[CYCLE] observe error recovered via reflection: device={device_id}, "
+                        f"task={task.task_id}, count={task.consecutive_observe_error_count}, "
+                        f"max_retries={task.max_observe_error_retries}"
+                    )
+                    if not await self._guard_task_ownership(device_id, task, execution_token, "before_requeue_after_observe_error"):
+                        return True
+                    self.requeue_task(device_id, task, execution_token)
+                    return False
+
+                scheduler_logger.info(
+                    f"[CYCLE] observe error waiting for user decision: device={device_id}, "
+                    f"task={task.task_id}, count={pending_decision.consecutive_count}, "
+                    f"max_retries={pending_decision.max_retries}"
+                )
+                return True
+
             await self._emit_failed_if_owned(task, e.message, e.error_type, execution_token)
             return True
 
@@ -2035,6 +2439,8 @@ class ReActScheduler:
         if observation:
             record.observation = observation
         record.success = success and not error
+        if record.success:
+            task.reset_observe_error_counter()
         task.last_active_at = time.time()
 
         scheduler_logger.info(
@@ -2550,6 +2956,42 @@ class ReActScheduler:
                 f"[CYCLE] ObserveException: device={device_id}, task={task.task_id}, "
                 f"error_type={e.error_type}, message={e.message}"
             )
+            if task.current_step > 0 and e.error_type == ReActErrorType.OBSERVE_ERROR:
+                task.annotate_latest_record_observe_error(e.message)
+                pending_decision = task.handle_observe_error(e.message)
+
+                if pending_decision is not None and self._ws_hub:
+                    self.broadcast_agent_progress(
+                        task_id=task.task_id,
+                        device_id=device_id,
+                        step_number=task.current_step,
+                        phase="observe",
+                        stage="observe_error_user_decision",
+                        message=task.to_observe_error_status_message() or pending_decision.message,
+                        error=pending_decision.message,
+                        error_type=pending_decision.error_type,
+                        success=False,
+                        data=pending_decision.to_payload(),
+                    )
+
+                if pending_decision is None:
+                    scheduler_logger.info(
+                        f"[CYCLE] observe error recovered via reflection: device={device_id}, "
+                        f"task={task.task_id}, count={task.consecutive_observe_error_count}, "
+                        f"max_retries={task.max_observe_error_retries}"
+                    )
+                    if not await self._guard_task_ownership(device_id, task, execution_token, "before_requeue_after_observe_error"):
+                        return True
+                    self.requeue_task(device_id, task, execution_token)
+                    return False
+
+                scheduler_logger.info(
+                    f"[CYCLE] observe error waiting for user decision: device={device_id}, "
+                    f"task={task.task_id}, count={pending_decision.consecutive_count}, "
+                    f"max_retries={pending_decision.max_retries}"
+                )
+                return True
+
             await self._emit_failed_if_owned(task, e.message, e.error_type, execution_token)
             return True
 
@@ -2632,6 +3074,8 @@ class ReActScheduler:
         if observation:
             record.observation = observation
         record.success = success and not error
+        if record.success:
+            task.reset_observe_error_counter()
         task.last_active_at = time.time()
 
         scheduler_logger.info(
@@ -2654,12 +3098,56 @@ class ReActScheduler:
         except Exception as e:
             scheduler_logger.warning(f"[OBSERVE] Failed to save observe record: {e}")
 
+    async def resolve_observe_error_decision(self, device_id: str, decision: str, advice: str = "") -> bool:
+        """处理 observe-error 超限后的用户决策。"""
+        task = self._device_tasks.get(device_id)
+        if not task or not task.is_active or not task.is_waiting_observe_error_decision():
+            return False
+
+        pending = task.resolve_observe_error_decision(decision, advice)
+        if not pending:
+            return False
+
+        if decision == "interrupt":
+            await self.interrupt_task(device_id)
+            return True
+
+        if self._ws_hub:
+            self.broadcast_agent_progress(
+                task_id=task.task_id,
+                device_id=device_id,
+                step_number=task.current_step,
+                phase="observe",
+                stage="observe_error_retry_resumed",
+                message="用户选择继续任务，准备重新推理",
+                error=pending.message,
+                error_type=pending.error_type,
+                success=False,
+                data={
+                    **pending.to_payload(),
+                    "decision": decision,
+                    "advice": advice or "",
+                },
+            )
+
+        with self._queue_lock:
+            if device_id not in self._task_queue and task.is_active:
+                self._task_queue.append(device_id)
+                self._last_queue_state = None
+
+        scheduler_logger.info(
+            f"[OBSERVE DECISION] resumed task after user continue: device={device_id}, "
+            f"task={task.task_id}, advice_present={bool((advice or '').strip())}"
+        )
+        return True
+
     async def interrupt_task(self, device_id: str):
         """中断任务"""
         task = self._device_tasks.get(device_id)
         if not task:
             return
 
+        task.pending_observe_error_decision = None
         task.status = TaskStatus.INTERRUPTED
         task.session_status = SessionStatus.FINISHED
 
@@ -2841,7 +3329,12 @@ class ReActScheduler:
                     scheduler_logger.debug(f"[WORKER_{worker_id}] Removed from running_tasks, remaining: {list(self._running_tasks.values())}")
 
                 pending_task = self.get_task(device_id)
-                if pending_task and pending_task.is_active and device_id not in self._task_queue:
+                if (
+                    pending_task
+                    and pending_task.is_active
+                    and pending_task.session_status != SessionStatus.WAIT_USER_DECISION
+                    and device_id not in self._task_queue
+                ):
                     scheduler_logger.info(
                         f"[WORKER_{worker_id}] requeueing active task after release: device={device_id}, task={pending_task.task_id}"
                     )

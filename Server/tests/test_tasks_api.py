@@ -76,6 +76,17 @@ class _SessionTask:
     instruction = "restore timeline"
     current_step = 3
     max_steps = 10
+    max_observe_error_retries = 2
+    consecutive_observe_error_count = 0
+
+    def is_waiting_observe_error_decision(self):
+        return False
+
+    def get_latest_error_reason(self):
+        return None
+
+    def get_observe_error_prompt_payload(self):
+        return None
 
 
 def test_device_session_and_chat_history_pass_through_progress_metadata(client_with_db, monkeypatch):
@@ -162,15 +173,46 @@ async def test_broadcast_agent_progress_and_status_persist_replay_milestones(mon
         device_id="device-1",
         step_number=0,
         phase="observe",
-        stage="requesting_initial_screenshot",
-        message="正在请求初始截图",
+        stage="waiting_ack",
+        message="等待 bootstrap screenshot ACK",
     )
-    # Bootstrap stages are now persisted per plan
+    # Bootstrap step 0 now persists canonical transport milestones
     assert len(persisted) == 1
     _, bootstrap_entry = persisted[-1]
     assert bootstrap_entry["task_id"] == "task-1"
     assert bootstrap_entry["step_number"] == 0
-    assert bootstrap_entry["stage"] == "requesting_initial_screenshot"
+    assert bootstrap_entry["phase"] == "observe"
+    assert bootstrap_entry["stage"] == "waiting_ack"
+    assert bootstrap_entry["progress_message"] == "等待 bootstrap screenshot ACK"
+    assert bootstrap_entry["progress_status_text"] == "waiting_ack"
+    assert bootstrap_entry.get("thinking") is None
+    assert bootstrap_entry.get("action_type") is None
+    assert bootstrap_entry.get("action_params") is None
+    assert bootstrap_entry.get("success") is None
+    assert bootstrap_entry.get("result") == ""
+    assert bootstrap_entry.get("error") is None
+    assert bootstrap_entry.get("error_type") is None
+    assert bootstrap_entry.get("version") is None
+
+    observe_message = await hub.broadcast_agent_progress(
+        task_id="task-1",
+        device_id="device-1",
+        step_number=0,
+        phase="observe",
+        stage="observe_received",
+        message="初始截图已收到",
+        result="screenshot_captured",
+        success=True,
+        screenshot="bootstrap-image",
+    )
+    assert observe_message["stage"] == "observe_received"
+    assert len(persisted) == 2
+    _, observe_entry = persisted[-1]
+    assert observe_entry["step_number"] == 0
+    assert observe_entry["stage"] == "observe_received"
+    assert observe_entry["progress_message"] == "初始截图已收到"
+    assert observe_entry["result"] == "screenshot_captured"
+    assert observe_entry["success"] is True
 
     progress_message = await hub.broadcast_agent_progress(
         task_id="task-1",
@@ -186,7 +228,7 @@ async def test_broadcast_agent_progress_and_status_persist_replay_milestones(mon
         success=True,
     )
     assert progress_message["stage"] == "ack_received"
-    assert len(persisted) == 2
+    assert len(persisted) == 3
 
     device_id, entry = persisted[-1]
     assert device_id == "device-1"
@@ -212,7 +254,7 @@ async def test_broadcast_agent_progress_and_status_persist_replay_milestones(mon
         data={"task_id": "task-1", "error_type": "observe_timeout"},
     )
     assert status_message["status"] == "failed"
-    assert len(persisted) == 3  # bootstrap + ack_received + failed status
+    assert len(persisted) == 4  # waiting_ack + observe_received + ack_received + failed status
 
     _, status_entry = persisted[-1]
     assert status_entry["task_id"] == "task-1"
@@ -227,7 +269,7 @@ async def test_broadcast_agent_progress_and_status_persist_replay_milestones(mon
         message="Task running",
         data={"task_id": "task-1"},
     )
-    assert len(persisted) == 3  # bootstrap + ack_received + failed status (running status not persisted)
+    assert len(persisted) == 4  # waiting_ack + observe_received + ack_received + failed status (running status not persisted)
 
 
 @pytest.mark.asyncio
