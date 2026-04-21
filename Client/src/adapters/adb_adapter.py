@@ -3,6 +3,7 @@ ADB Adapter - Android 设备适配器
 
 参照 phone_agent/adb/connection.py 和 phone_agent/adb/device.py 实现
 """
+import base64
 import logging
 import subprocess
 import time
@@ -30,6 +31,9 @@ DEFAULT_HOME_DELAY = 0.2
 DEFAULT_LAUNCH_DELAY = 2.0
 DEFAULT_KEYBOARD_SWITCH_DELAY = 0.3
 
+ADB_KEYBOARD_PACKAGE = "com.android.adbkeyboard"
+ADB_KEYBOARD_IME = "com.android.adbkeyboard/.AdbIME"
+
 
 @dataclass
 class ADBDeviceInfo:
@@ -37,6 +41,15 @@ class ADBDeviceInfo:
     device_id: str
     status: str
     model: Optional[str] = None
+
+
+@dataclass
+class ADBKeyboardStatus:
+    """ADB Keyboard IME 状态。"""
+    installed: bool
+    enabled: bool
+    active: bool
+    current_ime: str
 
 
 class ADBAdapter(DeviceAdapterBase):
@@ -104,75 +117,145 @@ class ADBAdapter(DeviceAdapterBase):
 
     # === 文本输入辅助方法 ===
 
-    @staticmethod
-    def _shell_escape(text: str) -> str:
-        """POSIX single-quote escaping for the Android device shell."""
-        return "'" + text.replace("'", "'\\''") + "'"
-
-    @staticmethod
-    def _is_ascii(text: str) -> bool:
-        """Check if text contains only ASCII characters."""
-        try:
-            text.encode('ascii')
-            return True
-        except UnicodeEncodeError:
-            return False
-
     def _detect_adb_keyboard(self) -> bool:
         """Check if ADB Keyboard IME is installed on the device (cached)."""
-        if self._adb_keyboard_available is not None:
-            return self._adb_keyboard_available
+        return self._get_adb_keyboard_status().installed
+
+    def _get_adb_keyboard_status(self) -> ADBKeyboardStatus:
+        """Read installed/enabled/active state for ADB Keyboard IME."""
+        installed = False
+        enabled = False
+        current_ime = ""
+
         try:
             result = self._run_adb(
                 ["shell", "ime", "list", "-a"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
-            self._adb_keyboard_available = (
-                result.returncode == 0
-                and "com.android.adbkeyboard" in (result.stdout or "")
-            )
+            installed = result.returncode == 0 and ADB_KEYBOARD_PACKAGE in (result.stdout or "")
+            self._adb_keyboard_available = installed
         except Exception:
             self._adb_keyboard_available = False
-        self._log("debug", f"[type_text] ADB Keyboard available: {self._adb_keyboard_available}")
-        return self._adb_keyboard_available
 
-    def _type_via_adb_keyboard(self, text: str) -> bool:
-        """Tier 1: Input text via ADB Keyboard broadcast (supports all Unicode)."""
+        try:
+            result = self._run_adb_checked(
+                ["shell", "settings", "get", "secure", "enabled_input_methods"],
+                action_name="type_text(get_enabled_imes)",
+                timeout=5,
+            )
+            enabled_input_methods = (result.stdout or "").strip()
+            enabled = ADB_KEYBOARD_IME in enabled_input_methods.split(":") if enabled_input_methods else False
+        except Exception:
+            enabled = False
+
+        try:
+            result = self._run_adb_checked(
+                ["shell", "settings", "get", "secure", "default_input_method"],
+                action_name="type_text(get_default_ime)",
+                timeout=5,
+            )
+            current_ime = (result.stdout or "").strip()
+        except Exception:
+            current_ime = ""
+
+        status = ADBKeyboardStatus(
+            installed=installed,
+            enabled=enabled,
+            active=current_ime == ADB_KEYBOARD_IME,
+            current_ime=current_ime,
+        )
+        self._log(
+            "debug",
+            "[type_text] ADB Keyboard readiness "
+            f"installed={status.installed} enabled={status.enabled} "
+            f"active={status.active} current_ime={status.current_ime or '<empty>'}",
+        )
+        return status
+
+    def _ensure_adb_keyboard_ready(self) -> str:
+        """Ensure ADB Keyboard is installed, enabled, and active before typing."""
+        status = self._get_adb_keyboard_status()
+        original_ime = status.current_ime
+
+        if not status.installed:
+            raise RuntimeError(
+                f"ADB Keyboard ({ADB_KEYBOARD_IME}) is not installed on the device"
+            )
+
+        if not status.enabled:
+            try:
+                self._run_adb_checked(
+                    ["shell", "ime", "enable", ADB_KEYBOARD_IME],
+                    action_name="type_text(enable_ime)",
+                    timeout=5,
+                )
+                self._sleep_after_action(DEFAULT_KEYBOARD_SWITCH_DELAY)
+            except Exception:
+                pass
+
+            status = self._get_adb_keyboard_status()
+            if not status.enabled:
+                raise RuntimeError(
+                    f"ADB Keyboard ({ADB_KEYBOARD_IME}) is installed but not enabled on the device"
+                )
+
+        if not status.active:
+            try:
+                self._run_adb_checked(
+                    ["shell", "ime", "set", ADB_KEYBOARD_IME],
+                    action_name="type_text(set_ime)",
+                    timeout=5,
+                )
+                self._sleep_after_action(DEFAULT_KEYBOARD_SWITCH_DELAY)
+            except Exception:
+                pass
+
+            status = self._get_adb_keyboard_status()
+            if not status.active:
+                current_ime = status.current_ime or "<empty>"
+                raise RuntimeError(
+                    f"ADB Keyboard ({ADB_KEYBOARD_IME}) is enabled but could not be activated; "
+                    f"current IME is {current_ime}"
+                )
+
+        return original_ime
+
+    def _type_via_adb_keyboard(self, text: str, original_ime: str) -> None:
+        """Input text via ADB Keyboard base64 broadcast (supports all Unicode)."""
+        encoded_text = base64.b64encode(text.encode("utf-8")).decode("utf-8")
+
         try:
             self._run_adb_checked(
-                ["shell", "ime set com.android.adbkeyboard/.AdbIME"],
-                action_name="type_text(set_ime)",
-            )
-            escaped = self._shell_escape(text)
-            self._run_adb_checked(
-                ["shell", f"am broadcast -a ADB_INPUT_TEXT --es msg {escaped}"],
+                [
+                    "shell",
+                    "am",
+                    "broadcast",
+                    "-a",
+                    "ADB_INPUT_B64",
+                    "--es",
+                    "msg",
+                    encoded_text,
+                ],
                 action_name="type_text(broadcast)",
+                timeout=5,
             )
             self._sleep_after_action(DEFAULT_KEYBOARD_SWITCH_DELAY)
-            self._log("debug", f"[type_text] Tier 1 (ADB Keyboard) success")
-            return True
-        except Exception as e:
-            self._log("warning", f"[type_text] ADB Keyboard broadcast failed: {e}")
-            return False
+            self._log("debug", "[type_text] ADB Keyboard broadcast success")
+        finally:
+            if original_ime and original_ime != ADB_KEYBOARD_IME:
+                try:
+                    self._run_adb_checked(
+                        ["shell", "ime", "set", original_ime],
+                        action_name="type_text(restore_ime)",
+                        timeout=5,
+                    )
+                    self._sleep_after_action(DEFAULT_KEYBOARD_SWITCH_DELAY)
+                except Exception as exc:
+                    self._log("warning", f"[type_text] Failed to restore original IME: {exc}")
 
-    def _type_via_clipboard(self, text: str) -> bool:
-        """Tier 2: Input text via clipboard set + paste (Android 12+ / API 31+)."""
-        try:
-            escaped = self._shell_escape(text)
-            self._run_adb_checked(
-                ["shell", f"cmd clipboard set_text {escaped}"],
-                action_name="type_text(clipboard_set)",
-            )
-            self._run_adb_checked(
-                ["shell", "input keyevent 279"],
-                action_name="type_text(paste)",
-            )
-            self._sleep_after_action(DEFAULT_KEYBOARD_SWITCH_DELAY)
-            self._log("debug", f"[type_text] Tier 2 (clipboard paste) success")
-            return True
-        except Exception as e:
-            self._log("warning", f"[type_text] Clipboard paste failed: {e}")
-            return False
+
 
     # === 设备连接管理 ===
 
@@ -823,31 +906,11 @@ class ADBAdapter(DeviceAdapterBase):
         return True
 
     def type_text(self, text: str) -> None:
-        """输入文本 (three-tier: ADB Keyboard → clipboard paste → adb input text)"""
+        """输入文本，仅允许通过 ADB Keyboard。"""
         if not text:
             return
 
-        # Tier 1: ADB Keyboard (supports all Unicode)
-        if self._detect_adb_keyboard():
-            if self._type_via_adb_keyboard(text):
-                return
+        original_ime = self._ensure_adb_keyboard_ready()
+        self._type_via_adb_keyboard(text, original_ime)
 
-        # Tier 2: Clipboard paste (non-ASCII fallback)
-        if not self._is_ascii(text):
-            if self._type_via_clipboard(text):
-                return
-            # No method available for non-ASCII
-            self._log("error", f"[type_text] Cannot input non-ASCII text without ADB Keyboard. "
-                       "Install: https://github.com/nicholasgasior/android-keyboard")
-            raise RuntimeError(
-                "Non-ASCII text input requires ADB Keyboard (com.android.adbkeyboard). "
-                "Install it on the device to enable Chinese text input."
-            )
-
-        # Tier 3: Standard adb input text (ASCII only, with proper escaping)
-        escaped = text.replace(" ", "%s")
-        self._send_action_command(
-            ["shell", f"input text {self._shell_escape(escaped)}"],
-            action_name="type_text",
-            delay=DEFAULT_KEYBOARD_SWITCH_DELAY,
-        )
+        return

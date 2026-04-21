@@ -1444,13 +1444,14 @@ class TestADBAdapterMethods:
         assert result.should_finish is False
         assert result.message == "Action failed: tap: device offline"
 
-    def test_execute_type_action_returns_failure_when_adb_command_fails(self):
-        """type_text 失败会通过 execute_action 返回错误"""
+    def test_execute_type_action_returns_failure_when_adb_keyboard_broadcast_fails(self):
+        """ADBKeyboard 广播失败会通过 execute_action 返回错误"""
         from src.adapters.adb_adapter import ADBAdapter
 
         adapter = ADBAdapter("test-device")
 
-        with patch.object(adapter, '_run_adb', return_value=Mock(returncode=12, stderr='input failed', stdout='')):
+        with patch.object(adapter, '_ensure_adb_keyboard_ready', return_value="com.example.ime/.ExampleIME"), \
+             patch.object(adapter, '_type_via_adb_keyboard', side_effect=RuntimeError('type_text(broadcast): receiver unavailable')):
             result = adapter.execute_action({
                 "_metadata": "do",
                 "action": "type",
@@ -1458,7 +1459,7 @@ class TestADBAdapterMethods:
             })
 
         assert result.success is False
-        assert result.message == "Action failed: type_text: input failed"
+        assert result.message == "Action failed: type_text(broadcast): receiver unavailable"
 
     def test_run_adb_checked_detects_failure_text_even_with_zero_exit(self):
         """明显 adb 错误文本也会被视为失败"""
@@ -1532,21 +1533,308 @@ class TestADBAdapterMethods:
                 "long_press",
             )
 
-    def test_type_text_uses_checked_adb_command(self):
-        """type_text tier 3 uses shell-escaped adb input text for ASCII"""
+    def test_get_adb_keyboard_status_distinguishes_installed_enabled_and_active(self):
+        """状态读取能区分 installed/enabled/active"""
         from src.adapters.adb_adapter import ADBAdapter
 
         adapter = ADBAdapter("test-device")
 
-        with patch.object(adapter, '_detect_adb_keyboard', return_value=False), \
-             patch.object(adapter, '_run_adb_checked') as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
-            adapter.type_text("hello world")
+        with patch.object(
+            adapter,
+            '_run_adb',
+            return_value=Mock(returncode=0, stdout="mId=com.android.adbkeyboard/.AdbIME\n", stderr=""),
+        ), patch.object(adapter, '_run_adb_checked') as mock_checked:
+            mock_checked.side_effect = [
+                Mock(returncode=0, stdout="com.example.ime/.ExampleIME:com.android.adbkeyboard/.AdbIME\n", stderr=""),
+                Mock(returncode=0, stdout="com.android.adbkeyboard/.AdbIME\n", stderr=""),
+            ]
+            status = adapter._get_adb_keyboard_status()
 
-            mock_run.assert_called_once_with(
-                ["shell", "input text 'hello%sworld'"],
-                "type_text",
-            )
+        assert status.installed is True
+        assert status.enabled is True
+        assert status.active is True
+        assert status.current_ime == "com.android.adbkeyboard/.AdbIME"
+        assert adapter._adb_keyboard_available is True
+
+    def test_type_text_fails_when_adb_keyboard_is_not_installed(self):
+        """ADBKeyboard 未安装时 type_text 直接失败"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_ensure_adb_keyboard_ready', side_effect=RuntimeError(
+            "ADB Keyboard (com.android.adbkeyboard/.AdbIME) is not installed on the device"
+        )), patch.object(adapter, '_type_via_adb_keyboard') as mock_type_via_adb_keyboard:
+            with pytest.raises(RuntimeError, match="ADB Keyboard \(com\.android\.adbkeyboard/\.AdbIME\) is not installed on the device"):
+                adapter.type_text("hello")
+
+        mock_type_via_adb_keyboard.assert_not_called()
+
+    def test_type_text_tries_enable_when_adb_keyboard_is_installed_but_not_enabled(self):
+        """已安装未启用时会先尝试 ime enable"""
+        from src.adapters.adb_adapter import ADBAdapter, ADBKeyboardStatus
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_get_adb_keyboard_status') as mock_status, \
+             patch.object(adapter, '_run_adb_checked') as mock_run, \
+             patch.object(adapter, '_sleep_after_action') as mock_sleep:
+            mock_status.side_effect = [
+                ADBKeyboardStatus(installed=True, enabled=False, active=False, current_ime="com.example.ime/.ExampleIME"),
+                ADBKeyboardStatus(installed=True, enabled=True, active=True, current_ime="com.android.adbkeyboard/.AdbIME"),
+            ]
+            original_ime = adapter._ensure_adb_keyboard_ready()
+
+        assert original_ime == "com.example.ime/.ExampleIME"
+        assert mock_run.call_args_list[0].args[0] == ["shell", "ime", "enable", "com.android.adbkeyboard/.AdbIME"]
+        assert mock_run.call_args_list[0].kwargs["action_name"] == "type_text(enable_ime)"
+        mock_sleep.assert_called_once()
+
+    def test_type_text_returns_installed_but_not_enabled_when_enable_does_not_make_ime_ready(self):
+        """启用失败后返回 installed but not enabled 诊断"""
+        from src.adapters.adb_adapter import ADBAdapter, ADBKeyboardStatus
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_get_adb_keyboard_status') as mock_status, \
+             patch.object(adapter, '_run_adb_checked', side_effect=RuntimeError('type_text(enable_ime): Unknown input method')) as mock_run:
+            mock_status.side_effect = [
+                ADBKeyboardStatus(installed=True, enabled=False, active=False, current_ime="com.example.ime/.ExampleIME"),
+                ADBKeyboardStatus(installed=True, enabled=False, active=False, current_ime="com.example.ime/.ExampleIME"),
+            ]
+            with pytest.raises(RuntimeError, match="ADB Keyboard \(com\.android\.adbkeyboard/\.AdbIME\) is installed but not enabled on the device"):
+                adapter._ensure_adb_keyboard_ready()
+
+        assert mock_run.call_args_list[0].args[0] == ["shell", "ime", "enable", "com.android.adbkeyboard/.AdbIME"]
+
+    def test_type_text_tries_set_when_adb_keyboard_is_enabled_but_not_active(self):
+        """已启用未激活时会执行 ime set"""
+        from src.adapters.adb_adapter import ADBAdapter, ADBKeyboardStatus
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_get_adb_keyboard_status') as mock_status, \
+             patch.object(adapter, '_run_adb_checked') as mock_run, \
+             patch.object(adapter, '_sleep_after_action') as mock_sleep:
+            mock_status.side_effect = [
+                ADBKeyboardStatus(installed=True, enabled=True, active=False, current_ime="com.example.ime/.ExampleIME"),
+                ADBKeyboardStatus(installed=True, enabled=True, active=True, current_ime="com.android.adbkeyboard/.AdbIME"),
+            ]
+            original_ime = adapter._ensure_adb_keyboard_ready()
+
+        assert original_ime == "com.example.ime/.ExampleIME"
+        assert mock_run.call_args_list[0].args[0] == ["shell", "ime", "set", "com.android.adbkeyboard/.AdbIME"]
+        assert mock_run.call_args_list[0].kwargs["action_name"] == "type_text(set_ime)"
+        mock_sleep.assert_called_once()
+
+    def test_type_text_returns_enabled_but_could_not_be_activated_when_set_does_not_activate_ime(self):
+        """已启用但激活失败时返回更精确错误"""
+        from src.adapters.adb_adapter import ADBAdapter, ADBKeyboardStatus
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_get_adb_keyboard_status') as mock_status, \
+             patch.object(adapter, '_run_adb_checked', side_effect=RuntimeError('type_text(set_ime): Unknown input method')) as mock_run:
+            mock_status.side_effect = [
+                ADBKeyboardStatus(installed=True, enabled=True, active=False, current_ime="com.example.ime/.ExampleIME"),
+                ADBKeyboardStatus(installed=True, enabled=True, active=False, current_ime="com.example.ime/.ExampleIME"),
+            ]
+            with pytest.raises(RuntimeError, match="ADB Keyboard \(com\.android\.adbkeyboard/\.AdbIME\) is enabled but could not be activated; current IME is com\.example\.ime/\.ExampleIME"):
+                adapter._ensure_adb_keyboard_ready()
+
+        assert mock_run.call_args_list[0].args[0] == ["shell", "ime", "set", "com.android.adbkeyboard/.AdbIME"]
+
+    def test_type_text_regression_installed_but_not_enabled_enables_before_any_set_attempt(self):
+        """回归：已安装未启用时先 enable，再决定是否 set"""
+        from src.adapters.adb_adapter import ADBAdapter, ADBKeyboardStatus
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_get_adb_keyboard_status') as mock_status, \
+             patch.object(adapter, '_run_adb_checked') as mock_run, \
+             patch.object(adapter, '_sleep_after_action'):
+            mock_status.side_effect = [
+                ADBKeyboardStatus(installed=True, enabled=False, active=False, current_ime="com.example.ime/.ExampleIME"),
+                ADBKeyboardStatus(installed=True, enabled=True, active=False, current_ime="com.example.ime/.ExampleIME"),
+                ADBKeyboardStatus(installed=True, enabled=True, active=True, current_ime="com.android.adbkeyboard/.AdbIME"),
+            ]
+            adapter._ensure_adb_keyboard_ready()
+
+        action_names = [call.kwargs["action_name"] for call in mock_run.call_args_list]
+        assert action_names == ["type_text(enable_ime)", "type_text(set_ime)"]
+
+    def test_type_text_uses_adb_keyboard_base64_broadcast_only(self):
+        """成功输入只走 ADBKeyboard base64 广播和可选恢复"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_run_adb_checked', return_value=Mock(returncode=0, stdout="", stderr="")) as mock_run, \
+             patch.object(adapter, '_sleep_after_action') as mock_sleep:
+            adapter._type_via_adb_keyboard("你好 world! @#$", "com.example.ime/.ExampleIME")
+
+        calls = mock_run.call_args_list
+        broadcast_args = calls[0].args[0]
+        assert broadcast_args[:6] == ["shell", "am", "broadcast", "-a", "ADB_INPUT_B64", "--es"]
+        assert broadcast_args[6] == "msg"
+        assert broadcast_args[7] == "5L2g5aW9IHdvcmxkISBAIyQ="
+        assert calls[0].kwargs["action_name"] == "type_text(broadcast)"
+        assert calls[1].args[0] == ["shell", "ime", "set", "com.example.ime/.ExampleIME"]
+        assert calls[1].kwargs["action_name"] == "type_text(restore_ime)"
+        assert len(calls) == 2
+        assert mock_sleep.call_count == 2
+
+    def test_type_text_does_not_restore_when_adb_keyboard_was_already_active(self):
+        """当前 IME 已是 ADBKeyboard 时只广播不恢复"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_run_adb_checked', return_value=Mock(returncode=0, stdout="", stderr="")) as mock_run, \
+             patch.object(adapter, '_sleep_after_action') as mock_sleep:
+            adapter._type_via_adb_keyboard("abc", "com.android.adbkeyboard/.AdbIME")
+
+        calls = mock_run.call_args_list
+        assert len(calls) == 1
+        assert calls[0].kwargs["action_name"] == "type_text(broadcast)"
+        assert calls[0].args[0][4] == "ADB_INPUT_B64"
+        assert mock_sleep.call_count == 1
+
+    def test_type_text_restore_ime_failure_is_warning_only(self):
+        """恢复原输入法失败只记 warning，不让输入失败"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        def _checked_side_effect(args, action_name, **kwargs):
+            if action_name == "type_text(restore_ime)":
+                raise RuntimeError("type_text(restore_ime): restore failed")
+            return Mock(returncode=0, stdout="", stderr="")
+
+        with patch.object(adapter, '_run_adb_checked', side_effect=_checked_side_effect) as mock_run, \
+             patch.object(adapter, '_sleep_after_action') as mock_sleep, \
+             patch.object(adapter, '_log') as mock_log:
+            adapter._type_via_adb_keyboard("hello", "com.example.ime/.ExampleIME")
+
+        warning_messages = [call.args[1] for call in mock_log.call_args_list if call.args and call.args[0] == "warning"]
+        assert any("Failed to restore original IME" in message for message in warning_messages)
+        assert any(call.kwargs.get("action_name") == "type_text(restore_ime)" for call in mock_run.call_args_list)
+        assert mock_sleep.call_count == 1
+
+    def test_type_text_propagates_broadcast_failure(self):
+        """广播失败时直接抛错"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        def _checked_side_effect(args, action_name, **kwargs):
+            if action_name == "type_text(broadcast)":
+                raise RuntimeError("type_text(broadcast): broadcast failed")
+            return Mock(returncode=0, stdout="", stderr="")
+
+        with patch.object(adapter, '_run_adb_checked', side_effect=_checked_side_effect):
+            with pytest.raises(RuntimeError, match="type_text\(broadcast\): broadcast failed"):
+                adapter._type_via_adb_keyboard("hello", "com.example.ime/.ExampleIME")
+
+    def test_type_text_uses_readiness_then_adb_keyboard_only(self):
+        """type_text 入口先做 readiness，再调用单一路径"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_ensure_adb_keyboard_ready', return_value="com.example.ime/.ExampleIME") as mock_ready, \
+             patch.object(adapter, '_type_via_adb_keyboard') as mock_type_via_adb_keyboard, \
+             patch.object(adapter, '_run_adb_checked') as mock_run:
+            adapter.type_text("hello")
+
+        mock_ready.assert_called_once_with()
+        mock_type_via_adb_keyboard.assert_called_once_with("hello", "com.example.ime/.ExampleIME")
+        mock_run.assert_not_called()
+
+    def test_type_text_returns_immediately_for_empty_text(self):
+        """空文本直接返回"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_ensure_adb_keyboard_ready') as mock_ready, \
+             patch.object(adapter, '_type_via_adb_keyboard') as mock_type_via_adb_keyboard:
+            adapter.type_text("")
+
+        mock_ready.assert_not_called()
+        mock_type_via_adb_keyboard.assert_not_called()
+
+    def test_execute_type_action_returns_failure_when_adb_keyboard_is_missing(self):
+        """ADBKeyboard 未安装时 execute_action 返回失败结果"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_ensure_adb_keyboard_ready', side_effect=RuntimeError(
+            "ADB Keyboard (com.android.adbkeyboard/.AdbIME) is not installed on the device"
+        )):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "type",
+                "text": "hello world",
+            })
+
+        assert result.success is False
+        assert result.should_finish is False
+        assert result.message == (
+            "Action failed: ADB Keyboard (com.android.adbkeyboard/.AdbIME) is not installed on the device"
+        )
+
+    def test_execute_type_action_returns_failure_when_adb_keyboard_is_installed_but_not_enabled(self):
+        """readiness 诊断会进入 execute_action 结果"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_ensure_adb_keyboard_ready', side_effect=RuntimeError(
+            "ADB Keyboard (com.android.adbkeyboard/.AdbIME) is installed but not enabled on the device"
+        )):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "type",
+                "text": "hello world",
+            })
+
+        assert result.success is False
+        assert result.message == (
+            "Action failed: ADB Keyboard (com.android.adbkeyboard/.AdbIME) is installed but not enabled on the device"
+        )
+
+    def test_execute_type_action_returns_failure_when_adb_keyboard_could_not_be_activated(self):
+        """激活失败诊断会进入 execute_action 结果"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_ensure_adb_keyboard_ready', side_effect=RuntimeError(
+            "ADB Keyboard (com.android.adbkeyboard/.AdbIME) is enabled but could not be activated; current IME is com.example.ime/.ExampleIME"
+        )):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "type",
+                "text": "hello world",
+            })
+
+        assert result.success is False
+        assert result.message == (
+            "Action failed: ADB Keyboard (com.android.adbkeyboard/.AdbIME) is enabled but could not be activated; current IME is com.example.ime/.ExampleIME"
+        )
+
+    def test_launch_app_empty_package_returns_false(self):
+        """launch_app 空包名返回 False"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            result = adapter.launch_app("")
+            assert result is False
+            mock_run.assert_not_called()
 
     def test_launch_app_empty_package_returns_false(self):
         """launch_app 空包名返回 False"""
