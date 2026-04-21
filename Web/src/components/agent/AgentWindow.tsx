@@ -29,7 +29,7 @@ import {
 import clsx from 'clsx';
 import { useAgentStore } from '../../stores/agentStore';
 import { useDeviceStore } from '../../stores/deviceStore';
-import type { ChatMessage } from '../../types';
+import type { AgentStageChain, AgentStageChainNode, ChatMessage } from '../../types';
 
 const { TextArea } = Input;
 
@@ -92,6 +92,7 @@ const getBubbleContent = (message: ChatMessage) => {
 };
 
 const shouldShowProgressBlock = (message: ChatMessage) => {
+  if (message.isTransportProgress) return false;
   return Boolean(message.isProgressMessage || message.progressStage || message.progressMessage || message.progressPhase);
 };
 
@@ -180,9 +181,14 @@ const getCompletionColor = (message: ChatMessage) => (message.error || message.s
 const getActionDescription = (message: ChatMessage) => message.action?.description || '';
 const hasActionDescription = (message: ChatMessage) => Boolean(message.action?.description);
 const isReasonBubble = (message: ChatMessage) => message.progressStage === 'reason' || message.progressStage === 'reason_start' || message.progressStage === 'reason_stream' || message.progressStage === 'reason_complete';
-// Only show thinking/action blocks for reason-detail bubbles, not for transport milestones.
-const hasThinking = (message: ChatMessage, isUser: boolean) => Boolean(message.thinking && !isUser && isReasonBubble(message));
-const hasAction = (message: ChatMessage, isUser: boolean) => Boolean(message.action && !isUser && isReasonBubble(message));
+const isVisibleReasoningMessage = (message: ChatMessage) => {
+  if (message.isTransportProgress) return false;
+  if (isReasonBubble(message)) return true;
+  return Boolean(!message.isProgressMessage && (message.thinking || message.action));
+};
+// Only show thinking/action blocks for visible reasoning/action messages, not for transport milestones.
+const hasThinking = (message: ChatMessage, isUser: boolean) => Boolean(message.thinking && !isUser && isVisibleReasoningMessage(message));
+const hasAction = (message: ChatMessage, isUser: boolean) => Boolean(message.action && !isUser && isVisibleReasoningMessage(message));
 const hasRawContent = (message: ChatMessage, isParseError: boolean) => Boolean(isParseError && message.rawContent);
 const getRawOutputTitle = () => 'AI原始输出（解析失败）';
 const getResultContainerClass = 'mt-2 ml-1 px-4 py-3 rounded-xl bg-emerald-50 dark:bg-emerald-900/40 border border-emerald-200 dark:border-emerald-700/60 text-xs max-w-90 shadow-md';
@@ -200,9 +206,214 @@ const getScreenshotDot = () => getSmallDotClass('bg-gray-500');
 const getThinkingDot = () => 'inline-flex items-center justify-center w-5 h-5 rounded-full bg-purple-500 text-white text-xs shadow-sm';
 const getActionDot = () => 'inline-flex items-center justify-center w-5 h-5 rounded-full bg-blue-500 text-white text-xs shadow-sm';
 const getRawOutputDot = () => 'inline-flex items-center justify-center w-5 h-5 rounded-full bg-orange-500 text-white text-xs shadow-sm';
-const getThinkingIcon = () => '💭';
-const getActionIcon = () => '🎯';
-const getRawOutputIcon = () => '⚠️';
+const getThinkingIcon = () => '思';
+const getActionIcon = () => '动';
+const getRawOutputIcon = () => '警';
+
+const getStageNodeLabel = (node: AgentStageChainNode) => {
+  switch (node.key) {
+    case 'reason':
+      return '模型思考';
+    case 'action':
+      return '生成动作';
+    case 'dispatch':
+      return '下发设备';
+    case 'wait_ack':
+      return '等待确认';
+    case 'wait_observe':
+      return '等待观察';
+    case 'observe':
+      return '接收结果';
+    default:
+      return node.label;
+  }
+};
+
+const getCompactPillClasses = (status: AgentStageChainNode['status']) => {
+  switch (status) {
+    case 'done':
+      return {
+        pill: 'border-emerald-300 bg-gradient-to-r from-emerald-50 to-teal-50 text-emerald-700 shadow-sm shadow-emerald-200/60 dark:border-emerald-700/70 dark:from-emerald-900/30 dark:to-teal-900/30 dark:text-emerald-300 dark:shadow-emerald-900/40',
+        dot: 'bg-emerald-500',
+      };
+    case 'active':
+      return {
+        pill: 'border-blue-300 bg-gradient-to-r from-blue-50 via-indigo-50 to-violet-50 text-blue-700 shadow-md shadow-blue-300/50 ring-1 ring-blue-300/40 dark:border-blue-700/70 dark:from-blue-900/30 dark:via-indigo-900/30 dark:to-violet-900/30 dark:text-blue-200 dark:shadow-blue-900/40 dark:ring-blue-600/40',
+        dot: 'bg-blue-500 animate-pulse',
+      };
+    case 'error':
+      return {
+        pill: 'border-red-300 bg-gradient-to-r from-red-50 to-rose-50 text-red-700 shadow-sm shadow-red-200/60 dark:border-red-700/70 dark:from-red-900/30 dark:to-rose-900/30 dark:text-red-300 dark:shadow-red-900/40',
+        dot: 'bg-red-500',
+      };
+    default:
+      return {
+        pill: 'border-gray-200 bg-white/95 text-gray-500 dark:border-gray-700 dark:bg-gray-800/80 dark:text-gray-400',
+        dot: 'bg-gray-300 dark:bg-gray-600',
+      };
+  }
+};
+
+const getCompactConnectorClass = (current: AgentStageChainNode['status'], previous?: AgentStageChainNode['status']) => {
+  if (current === 'error' || previous === 'error') return 'bg-red-300 dark:bg-red-700';
+  if (current === 'active' || previous === 'active') return 'bg-gradient-to-r from-blue-300 to-indigo-400 dark:from-blue-600 dark:to-indigo-500';
+  if (current === 'done' && previous === 'done') return 'bg-gradient-to-r from-emerald-300 to-emerald-400 dark:from-emerald-700 dark:to-emerald-600';
+  return 'bg-gray-200 dark:bg-gray-700';
+};
+
+
+const getStageNodeTooltip = (node: AgentStageChainNode, stageChain: AgentStageChain) => {
+  const stepText = stageChain.stepNumber != null ? `第 ${stageChain.stepNumber} 步` : '等待步骤';
+  const rawStageText = node.rawStage || stageChain.rawStage || '暂无阶段事件';
+  const statusText = node.status === 'done'
+    ? '已完成'
+    : node.status === 'active'
+      ? '进行中'
+      : node.status === 'error'
+        ? '异常'
+        : '待执行';
+  return `${getStageNodeLabel(node)} · ${statusText} · ${stepText} · ${rawStageText}`;
+};
+
+const getCompactPillLabel = (node: AgentStageChainNode) => {
+  switch (node.key) {
+    case 'reason': return '思考';
+    case 'action': return '动作';
+    case 'dispatch': return '下发';
+    case 'wait_ack': return '确认';
+    case 'wait_observe': return '观察';
+    case 'observe': return '结果';
+    default: return node.label.slice(0, 2);
+  }
+};
+
+const renderCompactStageChain = (stageChain: AgentStageChain) => {
+  const hasActiveNode = stageChain.nodes.some((n) => n.status === 'active');
+  return (
+    <div className="flex items-center gap-0">
+      {stageChain.stepNumber != null && (
+        <span
+          className={clsx(
+            'mr-1.5 rounded px-1 py-0.5 text-[10px] font-semibold transition-all duration-300',
+            hasActiveNode
+              ? 'bg-gradient-to-r from-blue-500 to-indigo-500 text-white shadow-sm shadow-blue-300/50'
+              : 'bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400',
+          )}
+        >
+          S{stageChain.stepNumber}
+        </span>
+      )}
+      {stageChain.nodes.map((node, index) => {
+        const classes = getCompactPillClasses(node.status);
+        const previous = index > 0 ? stageChain.nodes[index - 1] : undefined;
+        const isActive = node.status === 'active';
+        const connectorTouchesActive = node.status === 'active' || previous?.status === 'active';
+        return (
+          <React.Fragment key={node.key}>
+            {index > 0 && (
+              <div
+                className={clsx(
+                  'h-[2px] w-3 shrink-0',
+                  getCompactConnectorClass(node.status, previous?.status),
+                  connectorTouchesActive && 'animate-connectorPulse',
+                )}
+                aria-hidden="true"
+              />
+            )}
+            <Tooltip title={getStageNodeTooltip(node, stageChain)}>
+              <div
+                className={clsx(
+                  'relative inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] leading-tight transition-all duration-300',
+                  classes.pill,
+                  isActive && 'scale-[1.05]',
+                )}
+              >
+                <span className={clsx('h-1.5 w-1.5 rounded-full', classes.dot)} />
+                <span className="font-medium whitespace-nowrap">{getCompactPillLabel(node)}</span>
+                {isActive && (
+                  <span className="animate-shimmer pointer-events-none absolute inset-0 rounded-full" aria-hidden="true" />
+                )}
+              </div>
+            </Tooltip>
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+};
+
+
+const getRunningTagLabel = (isBackendTaskActive: boolean) => (isBackendTaskActive ? '执行中' : '空闲');
+const getRunningTagColor = (isBackendTaskActive: boolean) => (isBackendTaskActive ? 'processing' : 'default');
+const getBackendBusyWarning = (isBackendTaskActive: boolean) => (
+  isBackendTaskActive ? '设备正在执行后端任务，无法发送新命令' : null
+);
+const shouldRenderMessageBubble = (message: ChatMessage) => !message.isTransportProgress;
+const getEmptyConversationHint = () => '在下方输入框中输入自然语言命令，Agent将帮你执行';
+const getWaitingLockPlaceholder = () => '等待主控权，其他控制台正在操作...';
+const getReadyPlaceholder = () => '输入自然语言命令，让Agent帮你执行...';
+const getBusyPlaceholder = (isBackendTaskActive: boolean, deviceStatus?: string) => (
+  isBackendTaskActive
+    ? '后端任务执行中，请等待当前任务结束...'
+    : deviceStatus !== 'idle'
+      ? `设备${deviceStatus === 'busy' ? '忙碌中' : deviceStatus}，请等待...`
+      : '设备忙碌中，请等待...'
+);
+const getBackendRecoveryTagText = (isBackendTaskActive: boolean) => (
+  isBackendTaskActive ? '后端任务进行中' : ''
+);
+const getWaitConfirmTitle = (phase?: 'reason' | 'act' | 'observe' | null) => {
+  const label = phase === 'reason' ? '思考' : phase === 'act' ? '动作' : '观察';
+  return `确认执行 ${label} 阶段`;
+};
+const getPhaseTagText = (currentPhase: 'reason' | 'act' | 'observe' | null) => {
+  if (currentPhase === 'reason') return '思考中';
+  if (currentPhase === 'act') return '执行中';
+  if (currentPhase === 'observe') return '观察中';
+  return '';
+};
+const getPhaseTagColor = (currentPhase: 'reason' | 'act' | 'observe' | null) => {
+  if (currentPhase === 'reason') return 'purple';
+  if (currentPhase === 'act') return 'blue';
+  if (currentPhase === 'observe') return 'green';
+  return 'default';
+};
+const getThinkingPanelTitle = () => 'AI思考过程';
+const getScreenshotPlaceholderIcon = () => '设备';
+const getMaxStepsTitle = () => '达到最大步数';
+const getWaitConfirmBannerTitle = (phase?: 'reason' | 'act' | 'observe' | null) => `等待确认 ${phase === 'reason' ? '思考' : phase === 'act' ? '动作' : '观察'} 阶段`;
+const getBusyWarningText = (isBackendTaskActive: boolean) => getBackendBusyWarning(isBackendTaskActive);
+const getNoScreenshotText = () => '等待截图';
+const isCurrentScreenshotAvailable = (currentScreenshot: string | null) => Boolean(currentScreenshot);
+const getCurrentScreenshotDataUrl = (currentScreenshot: string | null) => currentScreenshot ? `data:image/png;base64,${currentScreenshot}` : '';
+const getHistoryScreenshotDataUrl = (screenshot: string | null | undefined) => screenshot ? `data:image/png;base64,${screenshot}` : '';
+const getDisplayScreenshotDataUrl = (displayScreenshot: string | null) => displayScreenshot ? `data:image/png;base64,${displayScreenshot}` : '';
+const getStartConversationTitle = () => '开始对话吧!';
+const getUnlockWarningText = () => '主控权被其他控制台占用，请等待...';
+const getInterruptButtonText = () => '中断';
+const getSendButtonText = () => '发送';
+const getObserveErrorTitle = () => 'Observe 错误处理';
+const getClearConversationTitle = () => '清空对话';
+const getFullscreenTooltip = (isFullscreen: boolean) => (isFullscreen ? '退出全屏' : '全屏');
+const getCloseTooltip = () => '关闭';
+const getCurrentScreenshotTooltip = () => '当前截图';
+const getHistoryScreenshotTooltip = (index: number) => `Step ${index + 1}`;
+const getHistoryScreenshotAlt = (index: number) => `Step ${index + 1}`;
+const getCurrentScreenshotAlt = () => 'Current';
+const getScreenshotAlt = () => 'Screenshot';
+const getObserveDecisionContinueText = () => '继续任务';
+const getObserveDecisionInterruptText = () => '中断任务';
+const getObserveDecisionResolvedText = () => '已处理';
+const getObserveDecisionPendingText = () => '等待决策';
+const getObserveDecisionResolveText = () => '标记已处理';
+const getObserveDecisionAdvicePlaceholder = () => '可选：给 AI 一条继续尝试的建议';
+const getPendingInterruptText = () => '停止任务';
+const getPendingContinueText = () => '继续执行';
+const getPendingConfirmText = () => '确认执行';
+const getPendingRejectText = () => '拒绝';
+const getPendingSkipText = () => '跳过';
+const getConfirmText = () => '确认';
+const getCancelText = () => '取消';
 
 interface AgentWindowProps {
   deviceId: string;
@@ -211,6 +422,7 @@ interface AgentWindowProps {
 
 export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) => {
   const [inputValue, setInputValue] = useState('');
+  const [observeDecisionAdvice, setObserveDecisionAdvice] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [screenshotModalOpen, setScreenshotModalOpen] = useState(false);
   const [selectedScreenshotIndex, setSelectedScreenshotIndex] = useState(-1); // -1 means current
@@ -232,8 +444,10 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
     maxSteps,
     maxParseRetries,
     setMaxParseRetries,
-    status,
+    maxObserveErrorRetries,
+    setMaxObserveErrorRetries,
     conversationHistory,
+    displayConversationHistory,
     currentScreenshot,
     currentApp,
     clearConversation,
@@ -245,16 +459,30 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
     confirmPhase,
     canInterrupt,
     currentTaskId,
+    isBackendTaskActive,
+    stageChain,
+    observeDecisionState,
+    submitObserveErrorDecision,
+    resolveObserveErrorDecisionCard,
   } = useAgentStore();
+  const resetObserveDecisionAdvice = () => setObserveDecisionAdvice('');
+
+  type ConversationScreenshotEntry = {
+    index: number;
+    screenshot: ChatMessage['screenshot'];
+    timestamp: ChatMessage['timestamp'];
+  };
+
+  const visibleConversationHistory = displayConversationHistory.filter(shouldRenderMessageBubble);
 
   // Get all screenshots from conversation history
-  const allScreenshots = conversationHistory
+  const allScreenshots: ConversationScreenshotEntry[] = conversationHistory
     .map((msg, idx) => ({
       index: idx,
-      screenshot: (msg as any).screenshot,
+      screenshot: msg.screenshot,
       timestamp: msg.timestamp,
     }))
-    .filter(item => item.screenshot)
+    .filter((item): item is ConversationScreenshotEntry => Boolean(item.screenshot))
     .reverse(); // Most recent first
 
   // Get display screenshot based on selection
@@ -274,7 +502,19 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
     if (conversationRef.current) {
       conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
     }
-  }, [conversationHistory, pendingAction]);
+  }, [visibleConversationHistory, pendingAction]);
+
+  useEffect(() => {
+    if (observeDecisionState === 'pending') {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      resetObserveDecisionAdvice();
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [observeDecisionState]);
 
   // Cleanup: 组件卸载时不再自动中断任务，避免误报
   // 任务状态由服务端管理，如果设备离线服务端会处理
@@ -286,19 +526,27 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
   //   };
   // }, [isRunning]);
 
-  // canSendCommand: can send new command only when backend truth says no active task,
-  // we hold the lock, and the device is idle.
-  const hasBackendActiveTask = Boolean(currentTaskId) && (canInterrupt || isRunning || status === 'pending' || status === 'running');
-  const canSendCommand = !hasBackendActiveTask && device?.status === 'idle';
-  // 显示中断按钮的条件：有任务ID 且 可中断 且 任务状态不是已完成
-  const showInterruptButton = canInterrupt && Boolean(currentTaskId) && status !== 'completed';
+  const canSendCommand = isLocked && !isBackendTaskActive && device?.status === 'idle';
+  const showInterruptButton = isLocked && isBackendTaskActive && canInterrupt;
   const progressPercent = maxSteps > 0 ? Math.round((currentStepNum / maxSteps) * 100) : 0;
-
-  const busyPlaceholder = hasBackendActiveTask
-    ? '后端任务仍在进行或刚恢复，请等待...'
-    : device?.status !== 'idle'
-      ? `设备${device?.status === 'busy' ? '忙碌中' : device?.status}，请等待...`
-      : '设备忙碌中，请等待...';
+  const busyPlaceholder = getBusyPlaceholder(isBackendTaskActive, device?.status);
+  const busyWarningText = getBusyWarningText(isBackendTaskActive);
+  const backendRecoveryTagText = getBackendRecoveryTagText(isBackendTaskActive);
+  const phaseTagText = getPhaseTagText(currentPhase);
+  const currentScreenshotAvailable = isCurrentScreenshotAvailable(currentScreenshot);
+  const hasActiveTaskId = Boolean(currentTaskId);
+  const showRunningTag = isBackendTaskActive || isRunning || hasActiveTaskId;
+  const showStageChain = isBackendTaskActive || stageChain.stepNumber != null || Boolean(stageChain.rawStage);
+  const sendPlaceholder = !isLocked
+    ? getWaitingLockPlaceholder()
+    : canSendCommand
+      ? getReadyPlaceholder()
+      : busyPlaceholder;
+  const inputDisabled = !canSendCommand || !isLocked;
+  const showEmptyConversationState = visibleConversationHistory.length === 0 && !pendingAction;
+  const shouldShowBackendRecoveryTag = Boolean(backendRecoveryTagText) && !showInterruptButton;
+  const shouldShowBusyWarning = Boolean(busyWarningText) && isBackendTaskActive;
+  const shouldShowCurrentScreenshotThumb = currentScreenshotAvailable && currentScreenshot;
 
   const handleSend = () => {
     if (!inputValue.trim() || !canSendCommand) return;
@@ -320,6 +568,80 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
   };
 
   // 渲染单条消息气泡
+  const renderObserveErrorDecisionCard = (message: ChatMessage) => {
+    const payload = message.observeErrorDecision;
+    if (!payload || !message.isObserveErrorDecisionCard) {
+      return null;
+    }
+
+    const isResolved = Boolean(message.observeErrorDecisionResolved);
+    const isSubmitting = observeDecisionState === 'submitting' && !isResolved;
+
+    return (
+      <div className="mt-2 ml-1 px-4 py-3 rounded-xl bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-700/60 text-xs max-w-90 shadow-md">
+        <div className="text-amber-700 dark:text-amber-300 font-semibold mb-2 flex items-center gap-2">
+          <span className="inline-flex items-center justify-center w-2.5 h-2.5 rounded-full bg-amber-500" />
+          {getObserveErrorTitle()}
+          <Tag color={isResolved ? 'success' : 'warning'} className="m-0 ml-1">
+            {isResolved ? getObserveDecisionResolvedText() : getObserveDecisionPendingText()}
+          </Tag>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 mb-2">
+          <Tag color="orange" className="m-0">连续失败 {payload.consecutive_count} 次</Tag>
+          <Tag color="gold" className="m-0">上限 {payload.max_retries} 次</Tag>
+          <Tag color="default" className="m-0">Step {payload.step_number}</Tag>
+        </div>
+        <div className={getBlockTextClass}>{payload.message}</div>
+        {!isResolved && (
+          <div className="mt-3 space-y-3">
+            <TextArea
+              value={observeDecisionAdvice}
+              onChange={(e) => setObserveDecisionAdvice(e.target.value)}
+              placeholder={getObserveDecisionAdvicePlaceholder()}
+              autoSize={{ minRows: 2, maxRows: 4 }}
+              disabled={isSubmitting}
+            />
+            <Space wrap>
+              <Button
+                type="primary"
+                size="small"
+                loading={isSubmitting}
+                onClick={() => {
+                  submitObserveErrorDecision('continue', observeDecisionAdvice);
+                  resetObserveDecisionAdvice();
+                }}
+                className="bg-green-500 border-green-500"
+              >
+                {getObserveDecisionContinueText()}
+              </Button>
+              <Button
+                danger
+                size="small"
+                loading={isSubmitting}
+                onClick={() => {
+                  submitObserveErrorDecision('interrupt');
+                  resetObserveDecisionAdvice();
+                }}
+              >
+                {getObserveDecisionInterruptText()}
+              </Button>
+              <Button
+                size="small"
+                disabled={isSubmitting}
+                onClick={() => {
+                  resolveObserveErrorDecisionCard(message.id);
+                  resetObserveDecisionAdvice();
+                }}
+              >
+                {getObserveDecisionResolveText()}
+              </Button>
+            </Space>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const renderMessageBubble = (message: ChatMessage) => {
     const isUser = message.role === 'user';
     const isParseError = message.isParseError;
@@ -431,6 +753,8 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
             </div>
           )}
 
+          {!isUser && renderObserveErrorDecisionCard(message)}
+
           {hasRawContent(message, !!isParseError) && (
             <div className="mt-2 ml-1 px-4 py-3 rounded-xl bg-orange-100 dark:bg-orange-900/60 border border-orange-300 dark:border-orange-700/60 text-xs max-w-90 shadow-md">
               <div className="text-orange-700 dark:text-orange-300 font-semibold mb-2 flex items-center gap-2">
@@ -463,7 +787,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
             <div className="text-xs text-gray-400 mb-1">Agent · {formatTime(pendingAction.step.timestamp)}</div>
             <div className="px-4 py-3 rounded-2xl rounded-bl-md bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 shadow-sm">
               <div className="text-orange-700 dark:text-orange-400 font-medium mb-2 flex items-center gap-2">
-                ⚠️ 达到最大步数
+                {getMaxStepsTitle()}
               </div>
               <div className="text-sm text-gray-700 dark:text-gray-300 mb-3">
                 {pendingAction.step.action?.description || `已达到最大步数，是否继续执行？`}
@@ -479,7 +803,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                   }}
                   className="bg-green-500 border-green-500"
                 >
-                  继续执行
+                  {getPendingContinueText()}
                 </Button>
                 <Button
                   danger
@@ -490,7 +814,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                     useAgentStore.getState().interrupt?.();
                   }}
                 >
-                  停止任务
+                  {getPendingInterruptText()}
                 </Button>
               </Space>
             </div>
@@ -511,7 +835,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
           <div className="text-xs text-gray-400 mb-1">Agent · {formatTime(pendingAction.step.timestamp)}</div>
           <div className="px-4 py-3 rounded-2xl rounded-bl-md bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 shadow-sm">
             <div className="text-yellow-700 dark:text-yellow-400 font-medium mb-2 flex items-center gap-2">
-              ⚠️ 等待确认
+              {getWaitConfirmBannerTitle(waitingConfirmPhase)}
             </div>
             <div className="text-sm text-gray-700 dark:text-gray-300 mb-3">
               即将执行: <Tag color="orange">{getActionTypeName(pendingAction.step.action?.type || 'tap')}</Tag>
@@ -525,7 +849,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                 onClick={() => confirmAction()}
                 className="bg-green-500 border-green-500"
               >
-                确认执行
+                {getPendingConfirmText()}
               </Button>
               <Button
                 danger
@@ -533,14 +857,14 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                 icon={<CloseCircleOutlined />}
                 onClick={() => rejectAction()}
               >
-                拒绝
+                {getPendingRejectText()}
               </Button>
               <Button
                 size="small"
                 icon={<FastForwardOutlined />}
                 onClick={() => skipAction()}
               >
-                跳过
+                {getPendingSkipText()}
               </Button>
             </Space>
           </div>
@@ -566,16 +890,16 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
         },
       }}
       title={
-        <div className="flex items-center justify-between w-full min-w-0">
-          <div className="flex items-center gap-2 min-w-0">
+        <div className="flex w-full min-w-0 items-center justify-between gap-3">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
             <RobotOutlined />
             <span className="truncate">Agent 交互 - {device?.device_name || deviceId}</span>
             <Tag color={mode === 'cautious' ? 'orange' : 'blue'} className="m-0">
               {mode === 'cautious' ? '谨慎模式' : '非谨慎模式'}
             </Tag>
-            {isRunning && (
-              <Tag color="processing" icon={<Spin size="small" />} className="m-0">
-                执行中
+            {showRunningTag && (
+              <Tag color={getRunningTagColor(isBackendTaskActive)} icon={isBackendTaskActive ? <Spin size="small" /> : undefined} className="m-0">
+                {getRunningTagLabel(isBackendTaskActive)}
               </Tag>
             )}
             {!isLocked && (
@@ -583,15 +907,22 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                 等待主控权
               </Tag>
             )}
-            {/* Phase indicator */}
-            {currentPhase && (
-              <Tag color={currentPhase === 'reason' ? 'purple' : currentPhase === 'act' ? 'blue' : 'green'} className="m-0">
-                {currentPhase === 'reason' ? '💭 思考中' : currentPhase === 'act' ? '🎯 执行中' : '👁 观察中'}
+            {phaseTagText && (
+              <Tag color={getPhaseTagColor(currentPhase)} className="m-0">
+                {phaseTagText}
+              </Tag>
+            )}
+            {shouldShowBackendRecoveryTag && (
+              <Tag color="default" className="m-0">
+                {backendRecoveryTagText}
               </Tag>
             )}
           </div>
+          <div className="shrink-0">
+            {showStageChain ? renderCompactStageChain(stageChain) : null}
+          </div>
           <Space size={4}>
-            <Tooltip title="清空对话">
+            <Tooltip title={getClearConversationTitle()}>
               <Button
                 type="text"
                 icon={<DeleteOutlined />}
@@ -600,7 +931,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                 size="small"
               />
             </Tooltip>
-            <Tooltip title={isFullscreen ? '退出全屏' : '全屏'}>
+            <Tooltip title={getFullscreenTooltip(isFullscreen)}>
               <Button
                 type="text"
                 icon={isFullscreen ? <CompressOutlined /> : <ExpandOutlined />}
@@ -608,7 +939,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                 size="small"
               />
             </Tooltip>
-            <Tooltip title="关闭">
+            <Tooltip title={getCloseTooltip()}>
               <Button
                 type="text"
                 icon={<CloseOutlined />}
@@ -658,8 +989,8 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
               {displayScreenshot ? (
                 <>
                   <img
-                    src={`data:image/png;base64,${displayScreenshot}`}
-                    alt="Screenshot"
+                    src={getDisplayScreenshotDataUrl(displayScreenshot)}
+                    alt={getScreenshotAlt()}
                     style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
                   />
                   <div className="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity bg-black/20">
@@ -668,8 +999,8 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                 </>
               ) : (
                 <div className="text-gray-400 text-center">
-                  <div className="text-2xl">📱</div>
-                  <div className="text-xs">等待截图</div>
+                  <div className="text-2xl">{getScreenshotPlaceholderIcon()}</div>
+                  <div className="text-xs">{getNoScreenshotText()}</div>
                 </div>
               )}
             </div>
@@ -681,26 +1012,28 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
               <div className="text-xs text-gray-500 p-2 pb-1">截图历史</div>
               <div className="flex gap-1 px-2 pb-2 flex-wrap">
                 {/* 当前截图 */}
-                <Tooltip title="当前截图">
-                  <div
-                    className={clsx(
-                      'w-10 h-10 rounded cursor-pointer border-2 overflow-hidden transition-all',
-                      selectedScreenshotIndex === -1
-                        ? 'border-blue-500 opacity-100'
-                        : 'border-transparent opacity-60 hover:opacity-80'
-                    )}
-                    onClick={() => setSelectedScreenshotIndex(-1)}
-                  >
-                    <img
-                      src={`data:image/png;base64,${currentScreenshot}`}
-                      alt="Current"
-                      style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                    />
-                  </div>
-                </Tooltip>
+                {shouldShowCurrentScreenshotThumb && (
+                  <Tooltip title={getCurrentScreenshotTooltip()}>
+                    <div
+                      className={clsx(
+                        'w-10 h-10 rounded cursor-pointer border-2 overflow-hidden transition-all',
+                        selectedScreenshotIndex === -1
+                          ? 'border-blue-500 opacity-100'
+                          : 'border-transparent opacity-60 hover:opacity-80'
+                      )}
+                      onClick={() => setSelectedScreenshotIndex(-1)}
+                    >
+                      <img
+                        src={getCurrentScreenshotDataUrl(currentScreenshot)}
+                        alt={getCurrentScreenshotAlt()}
+                        style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                      />
+                    </div>
+                  </Tooltip>
+                )}
                 {/* 历史截图 */}
                 {allScreenshots.slice(0, 5).map((item) => (
-                  <Tooltip title={`Step ${item.index + 1}`} key={item.index}>
+                  <Tooltip title={getHistoryScreenshotTooltip(item.index)} key={item.index}>
                     <div
                       className={clsx(
                         'w-10 h-10 rounded cursor-pointer border-2 overflow-hidden transition-all',
@@ -711,8 +1044,8 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                       onClick={() => setSelectedScreenshotIndex(item.index)}
                     >
                       <img
-                        src={`data:image/png;base64,${item.screenshot}`}
-                        alt={`Step ${item.index + 1}`}
+                        src={getHistoryScreenshotDataUrl(item.screenshot)}
+                        alt={getHistoryScreenshotAlt(item.index)}
                         style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                       />
                     </div>
@@ -753,7 +1086,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
           {isThinking && thinkingContent && (
             <div className="flex-shrink-0 px-4 py-3 bg-purple-50 dark:bg-purple-900/30 border-b border-purple-200 dark:border-purple-800">
               <div className="text-purple-700 dark:text-purple-300 text-xs font-semibold mb-1 flex items-center gap-1">
-                <span>💭</span> AI思考过程
+                <span>思</span> {getThinkingPanelTitle()}
               </div>
               <div className="text-gray-700 dark:text-gray-200 text-sm whitespace-pre-wrap max-h-24 overflow-y-auto">
                 {thinkingContent}
@@ -765,7 +1098,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
           {waitingForConfirm && waitingConfirmPhase && (
             <div className="flex-shrink-0 px-4 py-3 bg-yellow-50 dark:bg-yellow-900/30 border-b border-yellow-200 dark:border-yellow-800">
               <div className="text-yellow-700 dark:text-yellow-300 text-sm font-semibold mb-2 flex items-center gap-2">
-                ⚠️ 确认执行 {waitingConfirmPhase === 'reason' ? '思考' : waitingConfirmPhase === 'act' ? '动作' : '观察'} 阶段
+                提示 {getWaitConfirmTitle(waitingConfirmPhase)}
               </div>
               <Space>
                 <Button
@@ -775,7 +1108,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                   onClick={() => confirmPhase(true)}
                   className="bg-green-500 border-green-500"
                 >
-                  确认
+                  {getConfirmText()}
                 </Button>
                 <Button
                   danger
@@ -783,7 +1116,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                   icon={<CloseCircleOutlined />}
                   onClick={() => confirmPhase(false)}
                 >
-                  取消
+                  {getCancelText()}
                 </Button>
               </Space>
             </div>
@@ -795,17 +1128,17 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
             className="overflow-y-auto p-4 bg-gray-50 dark:bg-gray-900"
             style={{ flex: '1 1 auto', minHeight: 0, maxHeight: 'calc(100% - 100px)' }}
           >
-            {conversationHistory.length === 0 ? (
+            {showEmptyConversationState ? (
               <div className="h-full flex flex-col items-center justify-center text-gray-400">
                 <RobotOutlined className="text-6xl mb-4 opacity-20" />
-                <div className="text-lg mb-2">开始对话吧!</div>
+                <div className="text-lg mb-2">{getStartConversationTitle()}</div>
                 <div className="text-sm">
-                  在下方输入框中输入自然语言命令，Agent将帮你执行
+                  {getEmptyConversationHint()}
                 </div>
               </div>
             ) : (
               <>
-                {conversationHistory.map((msg) => renderMessageBubble(msg))}
+                {visibleConversationHistory.map((msg) => renderMessageBubble(msg))}
                 {renderPendingConfirmation()}
               </>
             )}
@@ -842,21 +1175,29 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
               </div>
             </div>
 
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-sm text-gray-500 font-medium">Observe 失败重试:</span>
+              <div className="flex items-center gap-3">
+                <Slider
+                  min={0}
+                  max={10}
+                  value={maxObserveErrorRetries}
+                  onChange={setMaxObserveErrorRetries}
+                  style={{ width: 100 }}
+                />
+                <span className="text-xs text-gray-600 dark:text-gray-400 w-8">{maxObserveErrorRetries}次</span>
+              </div>
+            </div>
+
             {/* Input area */}
             <div className="flex items-end gap-3">
               <TextArea
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
                 onKeyDown={handleKeyPress}
-                placeholder={
-                  !isLocked
-                    ? '等待主控权，其他控制台正在操作...'
-                    : canSendCommand
-                      ? '输入自然语言命令，让Agent帮你执行...'
-                      : busyPlaceholder
-                }
+                placeholder={sendPlaceholder}
                 autoSize={{ minRows: 1, maxRows: 3 }}
-                disabled={!canSendCommand || !isLocked}
+                disabled={inputDisabled}
                 className="flex-1 rounded-xl"
               />
               <Space direction="vertical" size={4}>
@@ -868,40 +1209,38 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
                     disabled={!isLocked}
                     block
                   >
-                    中断
+                    {getInterruptButtonText()}
                   </Button>
                 ) : (
-                  <>
-                    <Button
-                      type="primary"
-                      icon={<SendOutlined />}
-                      onClick={handleSend}
-                      disabled={!canSendCommand || !inputValue.trim() || !isLocked}
-                      block
-                    >
-                      发送
-                    </Button>
-                  </>
+                  <Button
+                    type="primary"
+                    icon={<SendOutlined />}
+                    onClick={handleSend}
+                    disabled={inputDisabled || !inputValue.trim()}
+                    block
+                  >
+                    {getSendButtonText()}
+                  </Button>
                 )}
-                {hasBackendActiveTask && !showInterruptButton && (
+                {shouldShowBackendRecoveryTag && (
                   <Tag color="default" className="m-0 text-center">
-                    后端任务恢复中
+                    {backendRecoveryTagText}
                   </Tag>
                 )}
               </Space>
             </div>
 
             {/* Busy state warning - show when agent is running */}
-            {hasBackendActiveTask && (
+            {shouldShowBusyWarning && (
               <div className="mt-2 text-xs text-yellow-600">
-                设备正在执行任务，无法发送新命令
+                {busyWarningText}
               </div>
             )}
 
             {/* Session lock warning */}
             {!isLocked && (
               <div className="mt-2 text-xs text-red-600">
-                主控权被其他控制台占用，请等待...
+                {getUnlockWarningText()}
               </div>
             )}
           </div>
@@ -916,6 +1255,22 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
         }
         .animate-fadeIn {
           animation: fadeIn 0.3s ease-out;
+        }
+        @keyframes shimmer {
+          0% { background-position: -100% 0; }
+          100% { background-position: 200% 0; }
+        }
+        .animate-shimmer {
+          background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.4) 50%, transparent 100%);
+          background-size: 200% 100%;
+          animation: shimmer 2s ease-in-out infinite;
+        }
+        @keyframes connectorPulse {
+          0%, 100% { opacity: 0.6; }
+          50% { opacity: 1; }
+        }
+        .animate-connectorPulse {
+          animation: connectorPulse 1.5s ease-in-out infinite;
         }
       `}</style>
 

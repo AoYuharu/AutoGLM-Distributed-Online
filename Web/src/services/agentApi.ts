@@ -1,9 +1,8 @@
 import axios from 'axios';
 import { wsConsoleApi } from './wsConsole';
+import type { ObserveErrorDecisionPayload } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
-const ACTIVE_TASK_STATUSES = new Set(['pending', 'running']);
-
 const api = axios.create({
   baseURL: API_BASE_URL,
   timeout: 120000,
@@ -28,7 +27,7 @@ export interface AgentStepResponse {
 export interface BatchAgentTaskResponse {
   results: Array<{
     device_id: string;
-    status: 'started' | 'skipped' | 'error';
+    status: 'requested' | 'skipped' | 'error';
     message?: string;
     session_id?: string;
     task_id?: string;
@@ -101,12 +100,18 @@ export interface DeviceSessionSnapshot {
   status: string;
   current_step: number;
   max_steps: number;
+  max_observe_error_retries: number;
+  consecutive_observe_error_count: number;
+  awaiting_observe_error_decision: boolean;
+  pending_observe_error_message: string | null;
+  pending_observe_error_prompt: ObserveErrorDecisionPayload | null;
   current_screenshot: string | null;
   current_app: string;
   has_active_task: boolean;
   can_interrupt: boolean;
   can_resume: boolean;
   latest_task: TaskDetailResponse | null;
+  chat_history: ChatHistoryMessage[];
 }
 
 export interface ChatHistoryMessage {
@@ -118,6 +123,20 @@ export interface ChatHistoryMessage {
   action_params?: Record<string, any>;
   screenshot_path?: string;
   created_at: string;
+  task_id?: string;
+  step_number?: number;
+  phase?: string;
+  stage?: string;
+  progress_status_text?: string;
+  progress_message?: string;
+  result?: string;
+  success?: boolean;
+  error?: string;
+  error_type?: string;
+  version?: number;
+  error_code?: any;
+  data?: Record<string, any>;
+  observe_error_decision?: ObserveErrorDecisionPayload;
 }
 
 interface BackendDeviceResponse {
@@ -131,15 +150,77 @@ function normalizeMode(mode?: string): 'normal' | 'cautious' {
   return mode === 'cautious' ? 'cautious' : 'normal';
 }
 
-function normalizeStatus(status?: string, fallbackTaskId?: string | null): string {
-  if (status) {
-    return status;
+function normalizeObserveErrorDecisionPayload(value: any): ObserveErrorDecisionPayload | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
   }
-  return fallbackTaskId ? 'running' : 'idle';
+
+  if (!value.task_id || !value.device_id || typeof value.message !== 'string') {
+    return undefined;
+  }
+
+  return {
+    task_id: String(value.task_id),
+    device_id: String(value.device_id),
+    message: value.message,
+    consecutive_count: Number(value.consecutive_count ?? 0),
+    max_retries: Number(value.max_retries ?? 0),
+    step_number: Number(value.step_number ?? 0),
+    error_type: typeof value.error_type === 'string' ? value.error_type : undefined,
+    stage: typeof value.stage === 'string' ? value.stage : undefined,
+    message_id: typeof value.message_id === 'string' ? value.message_id : undefined,
+    created_at: typeof value.created_at === 'string' ? value.created_at : undefined,
+  };
 }
 
-function isActiveTaskStatus(status?: string): boolean {
-  return ACTIVE_TASK_STATUSES.has(status || 'idle');
+function normalizeChatHistoryMessage(message: ChatHistoryMessage): ChatHistoryMessage {
+  const observeErrorDecision = normalizeObserveErrorDecisionPayload(
+    message.observe_error_decision ?? (message.stage === 'observe_error_user_decision' ? message.data : undefined),
+  );
+
+  return {
+    ...message,
+    step_number: message.step_number ?? undefined,
+    observe_error_decision: observeErrorDecision,
+  };
+}
+
+function normalizeChatHistoryMessages(messages?: ChatHistoryMessage[]): ChatHistoryMessage[] {
+  return (messages || []).map(normalizeChatHistoryMessage);
+}
+
+function getSnapshotScreenshot(session: { latest_screenshot?: string | null; chat_history?: ChatHistoryMessage[] }): string | null {
+  if (session.latest_screenshot) {
+    return session.latest_screenshot;
+  }
+
+  for (let i = (session.chat_history || []).length - 1; i >= 0; i -= 1) {
+    const screenshot = session.chat_history?.[i]?.screenshot_path;
+    if (screenshot) {
+      return screenshot;
+    }
+  }
+
+  return null;
+}
+
+function getSnapshotCurrentStep(session: { current_step?: number | null; chat_history?: ChatHistoryMessage[] }): number {
+  if (session.current_step != null) {
+    return session.current_step;
+  }
+
+  for (let i = (session.chat_history || []).length - 1; i >= 0; i -= 1) {
+    const stepNumber = session.chat_history?.[i]?.step_number;
+    if (stepNumber != null) {
+      return stepNumber;
+    }
+  }
+
+  return 0;
+}
+
+function getSessionMode(session: { mode?: string | null }): 'normal' | 'cautious' {
+  return normalizeMode(session.mode || undefined);
 }
 
 function getLastScreenshot(task?: TaskDetailResponse | null): string | null {
@@ -226,52 +307,10 @@ async function getDeviceById(deviceId: string): Promise<BackendDeviceResponse | 
   return devices.find((device) => device.device_id === deviceId) || null;
 }
 
-// NOTE: GET /api/v1/tasks does not exist on server.
-// Task info comes from GET /api/v1/devices/{deviceId}/session via getLatestDeviceSnapshot.
-async function getLatestTaskForDevice(_deviceId: string): Promise<TaskResponse | null> {
-  return null;
-}
-
 // NOTE: GET /api/v1/tasks/{taskId} does not exist on server.
 // Task step details are embedded in DeviceTaskSessionResponse.chat_history.
 async function getTaskDetail(_taskId: string): Promise<TaskDetailResponse | null> {
   return null;
-}
-
-// NOTE: Both getTaskDetail and getLatestTaskForDevice now return null
-// because the server has no REST endpoints for task list/detail.
-// resolveTaskDetail is kept for compatibility but always returns null.
-async function resolveTaskDetail(
-  _preferredTaskId: string | null,
-  _fallbackTaskId: string | null,
-): Promise<TaskDetailResponse | null> {
-  return null;
-}
-
-function buildSnapshotFromTask(
-  deviceId: string,
-  task: TaskDetailResponse | null,
-  preferredTaskId: string | null,
-): DeviceSessionSnapshot {
-  const taskId = task?.task_id || preferredTaskId || null;
-  const status = normalizeStatus(task?.status, taskId);
-  const hasActiveTask = !!taskId && isActiveTaskStatus(status);
-
-  return {
-    device_id: deviceId,
-    task_id: taskId,
-    instruction: task?.instruction || null,
-    mode: normalizeMode(task?.mode),
-    status,
-    current_step: task?.current_step || 0,
-    max_steps: task?.max_steps || 100,
-    current_screenshot: getLastScreenshot(task),
-    current_app: typeof task?.result?.current_app === 'string' ? task.result.current_app : '未知',
-    has_active_task: hasActiveTask,
-    can_interrupt: hasActiveTask && !!taskId,
-    can_resume: false,
-    latest_task: task,
-  };
 }
 
 export const agentApi = {
@@ -337,17 +376,27 @@ export const agentApi = {
     mode?: 'normal' | 'cautious';
     max_steps?: number;
     max_parse_retries?: number;
+    max_observe_error_retries?: number;
   }): Promise<{ task_id: string; status: string }> {
-    // Send task creation via WebSocket - server will respond with task_created message
-    wsConsoleApi.sendCreateTask(deviceId, params.instruction, params.mode || 'normal', params.max_steps || 100);
+    // Send task creation via WebSocket - server will respond with task_created message.
+    wsConsoleApi.sendCreateTask(
+      deviceId,
+      params.instruction,
+      params.mode,
+      params.max_steps || 100,
+      params.max_observe_error_retries ?? 2,
+    );
 
-    // The actual task_id will come back via WebSocket task_created message
-    // For now, return a placeholder that will be updated when the message arrives
-    // The agentStore handles the task_created message to update currentTaskId
+    // The actual task_id will arrive via WebSocket task_created.
     return {
-      task_id: '',  // Will be updated via WebSocket
+      task_id: '',
       status: 'pending',
     };
+  },
+
+  async interruptDevice(deviceId: string): Promise<{ success: boolean }> {
+    await api.post(`/api/v1/devices/${deviceId}/interrupt`);
+    return { success: true };
   },
 
   async executeStep(_deviceId: string): Promise<AgentStepResponse> {
@@ -374,20 +423,28 @@ export const agentApi = {
       const response = await api.get(`/api/v1/devices/${deviceId}/session`);
       const session = response.data;
 
+      const chatHistory = normalizeChatHistoryMessages(session.chat_history);
+
       return {
         device_id: deviceId,
         task_id: session.task_id || null,
         instruction: session.instruction || null,
-        mode: normalizeMode(),
+        mode: getSessionMode(session),
         status: session.status || 'idle',
-        current_step: session.current_step || 0,
+        current_step: getSnapshotCurrentStep({ current_step: session.current_step, chat_history: chatHistory }),
         max_steps: session.max_steps || 100,
-        current_screenshot: session.latest_screenshot || null,
+        max_observe_error_retries: session.max_observe_error_retries ?? 2,
+        consecutive_observe_error_count: session.consecutive_observe_error_count ?? 0,
+        awaiting_observe_error_decision: Boolean(session.awaiting_observe_error_decision),
+        pending_observe_error_message: session.pending_observe_error_message || null,
+        pending_observe_error_prompt: session.pending_observe_error_prompt || null,
+        current_screenshot: getSnapshotScreenshot({ latest_screenshot: session.latest_screenshot, chat_history: chatHistory }),
         current_app: '未知',
         has_active_task: Boolean(session.interruptible && session.task_id),
         can_interrupt: Boolean(session.interruptible && session.task_id),
         can_resume: false,
         latest_task: null, // Server session endpoint does not provide full task steps
+        chat_history: chatHistory,
       };
     } catch (error: any) {
       if (error?.response?.status === 404) {
@@ -400,12 +457,18 @@ export const agentApi = {
           status: 'offline',
           current_step: 0,
           max_steps: 100,
+          max_observe_error_retries: 2,
+          consecutive_observe_error_count: 0,
+          awaiting_observe_error_decision: false,
+          pending_observe_error_message: null,
+          pending_observe_error_prompt: null,
           current_screenshot: null,
           current_app: '未知',
           has_active_task: false,
           can_interrupt: false,
           can_resume: false,
           latest_task: null,
+          chat_history: [],
         };
       }
       throw error;
@@ -418,19 +481,22 @@ export const agentApi = {
     mode_policy: 'force_cautious' | 'force_normal' | 'default';
     max_steps?: number;
   }): Promise<BatchAgentTaskResponse> {
-    const mode = params.mode_policy === 'force_cautious' ? 'cautious' : 'normal';
+    const mode = params.mode_policy === 'force_cautious'
+      ? 'cautious'
+      : params.mode_policy === 'force_normal'
+        ? 'normal'
+        : undefined;
 
-    // Send task creation via WebSocket for each device
     params.device_ids.forEach((device_id) => {
       wsConsoleApi.sendCreateTask(device_id, params.instruction, mode, params.max_steps || 100);
     });
 
-    // Return pending status - actual results come via WebSocket messages
     const results = params.device_ids.map((device_id) => ({
       device_id,
-      status: 'started' as const,
-      task_id: '',  // Will be updated via WebSocket
+      status: 'requested' as const,
+      task_id: '',
       mode,
+      message: 'create_task request sent; waiting for task_created to provide task_id',
     }));
 
     return { results };
@@ -450,7 +516,7 @@ export const agentApi = {
 
       return {
         device_id: response.data.device_id,
-        messages: response.data.messages || [],
+        messages: normalizeChatHistoryMessages(response.data.messages),
         total: response.data.total || 0,
       };
     } catch (error: any) {

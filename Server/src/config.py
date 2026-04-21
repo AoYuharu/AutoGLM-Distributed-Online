@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     PHONE_AGENT_MODEL: str = "autoglm-phone"
     PHONE_AGENT_TIMEOUT: int = 120  # 模型调用超时（秒）
 
+    # CORS
+    CORS_ORIGINS: str = "*"
+
     # Logging
     LOG_LEVEL: str = "INFO"  # DEBUG, INFO, WARNING, ERROR
     LOG_FILE: str = "./logs/server.log"

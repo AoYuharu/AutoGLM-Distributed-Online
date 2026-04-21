@@ -107,6 +107,8 @@ def _should_persist_progress_stage(stage: Optional[str]) -> bool:
         "requesting_initial_screenshot",
         "initial_screenshot_ack_received",
         "initial_screenshot_received",
+        "observe_error_user_decision",
+        "observe_error_retry_resumed",
     }
 
 
@@ -116,7 +118,7 @@ def is_reason_detail_stage(stage: Optional[str]) -> bool:
 
 
 def _should_persist_status(status: Optional[str]) -> bool:
-    return status in {"completed", "failed"}
+    return status in {"completed", "failed", "interrupted"}
 
 
 def _infer_legacy_phase(stage: str) -> str:

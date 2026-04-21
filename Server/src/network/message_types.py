@@ -12,6 +12,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+from typing_extensions import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -20,6 +22,7 @@ class MessageType(str, Enum):
     DEVICE_STATUS = "device_status"
     OBSERVE_RESULT = "observe_result"
     ACTION_CMD = "action_cmd"
+    REQUEST_SCREENSHOT = "request_screenshot"
     ACK = "ack"
 
 
@@ -101,6 +104,15 @@ class ActionCmdPayload(BaseModel):
     reasoning: str = ""
 
 
+class RequestScreenshotPayload(BaseModel):
+    type: Literal["request_screenshot"] = "request_screenshot"
+    task_id: str
+    device_id: str
+    step_number: int = 0
+    phase: str = "observe"
+    purpose: str = "bootstrap"
+
+
 def create_message(msg_type: MessageType, payload: dict, version: str = "1.0") -> WSMessage:
     return WSMessage(type=msg_type, payload=payload, version=version)
 
@@ -176,6 +188,24 @@ def create_action_cmd(
         },
         version=version,
     )
+
+
+def create_request_screenshot(
+    task_id: str,
+    device_id: str,
+    *,
+    step_number: int = 0,
+    phase: str = "observe",
+    purpose: str = "bootstrap",
+) -> WSMessage:
+    payload = RequestScreenshotPayload(
+        task_id=task_id,
+        device_id=device_id,
+        step_number=step_number,
+        phase=phase,
+        purpose=purpose,
+    )
+    return create_message(MessageType.REQUEST_SCREENSHOT, payload.model_dump())
 
 
 def create_task_update(

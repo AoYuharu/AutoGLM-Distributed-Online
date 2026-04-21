@@ -159,7 +159,14 @@ class TaskCreate(BaseModel):
     instruction: str = Field(..., min_length=1)
     mode: str = Field("normal", pattern="^(cautious|normal)$")
     max_steps: int = Field(100, ge=1, le=1000)
+    max_observe_error_retries: int = Field(2, ge=0, le=20)
     priority: int = Field(1, ge=1, le=10)
+
+
+class ObserveErrorDecisionRequest(BaseModel):
+    """Schema for observe-error retry decision"""
+    decision: str = Field(..., pattern="^(continue|interrupt)$")
+    advice: Optional[str] = None
 
 
 class BatchTaskCreate(BaseModel):
@@ -204,11 +211,24 @@ class ChatMessageResponse(BaseModel):
     id: str
     role: str
     content: str
-    thinking: Optional[str]
-    action_type: Optional[str]
-    action_params: Optional[Dict[str, Any]]
-    screenshot_path: Optional[str]
+    thinking: Optional[str] = None
+    action_type: Optional[str] = None
+    action_params: Optional[Dict[str, Any]] = None
+    screenshot_path: Optional[str] = None
     created_at: datetime
+    task_id: Optional[str] = None
+    step_number: Optional[int] = None
+    phase: Optional[str] = None
+    stage: Optional[str] = None
+    progress_status_text: Optional[str] = None
+    progress_message: Optional[str] = None
+    result: Optional[str] = None
+    success: Optional[bool] = None
+    error: Optional[str] = None
+    error_type: Optional[str] = None
+    version: Optional[int] = None
+    error_code: Optional[Any] = None
+    data: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -222,6 +242,11 @@ class DeviceTaskSessionResponse(BaseModel):
     instruction: Optional[str] = None
     current_step: int = 0
     max_steps: int = 0
+    max_observe_error_retries: int = 0
+    consecutive_observe_error_count: int = 0
+    awaiting_observe_error_decision: bool = False
+    pending_observe_error_message: Optional[str] = None
+    pending_observe_error_prompt: Optional[Dict[str, Any]] = None
     latest_screenshot: Optional[str] = None
     interruptible: bool = False
     latest_error_reason: Optional[str] = None

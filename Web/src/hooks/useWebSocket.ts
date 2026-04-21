@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback } from 'react';
 import { useAppStore } from '../stores/appStore';
 import { useAgentStore } from '../stores/agentStore';
 import { useDeviceStore } from '../stores/deviceStore';
+import type { WsConsoleMessage } from '../services/wsConsole';
 import { wsLogger } from './useLogger';
 
 interface WebSocketConfig {
@@ -9,13 +10,14 @@ interface WebSocketConfig {
   onOpen?: () => void;
   onClose?: () => void;
   onError?: (error: Event) => void;
-  onMessage?: (message: any) => void;
+  onMessage?: (message: WsConsoleMessage) => void;
 }
 
 export function useWebSocket(config: WebSocketConfig) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttempts = useRef(0);
+  const connectRef = useRef<() => void>(() => undefined);
 
   const { setWsConnected } = useAppStore();
   const { addAgentMessage } = useAgentStore();
@@ -36,47 +38,57 @@ export function useWebSocket(config: WebSocketConfig) {
 
   const handleMessage = useCallback((event: MessageEvent) => {
     try {
-      const message = JSON.parse(event.data);
+      const message = JSON.parse(event.data) as WsConsoleMessage;
       const msgType = message.type || 'unknown';
 
       wsLogger.debug(`[handleMessage] Received message: ${msgType}`, { msgType });
 
       switch (message.type) {
-        case 'device_status_update':
+        case 'device_status_update': {
+          if (!message.device_id || !message.update) {
+            wsLogger.warn('[handleMessage] Ignoring malformed device status update', {
+              deviceId: message.device_id,
+              hasUpdate: Boolean(message.update),
+            });
+            break;
+          }
+
           // 更新设备状态
           wsLogger.info(`[handleMessage] Device status update: ${message.device_id}`, {
             deviceId: message.device_id,
-            status: message.update?.status,
+            status: message.update.status,
           });
           updateDevice(message.device_id, message.update);
           break;
+        }
 
-        case 'device_offline':
+        case 'device_offline': {
+          if (!message.device_id) {
+            wsLogger.warn('[handleMessage] Ignoring malformed device offline event');
+            break;
+          }
+
           // 设备离线，禁用控件
           wsLogger.warn(`[handleMessage] Device offline: ${message.device_id}`, { deviceId: message.device_id });
           setDeviceOffline(message.device_id);
           addAgentMessage(`设备 ${message.device_id} 已离线`);
           break;
+        }
 
         case 'device_reconnected':
-          // 设备重连，恢复控件
+          // 设备重连事件仅作提示，设备状态以后端同步为准
           wsLogger.info(`[handleMessage] Device reconnected: ${message.device_id}`, { deviceId: message.device_id });
-          updateDevice(message.device_id, { status: 'idle' });
           addAgentMessage(`设备 ${message.device_id} 已重连`);
+          config.onMessage?.(message);
           break;
 
         case 'task_update':
-          // 任务状态更新
+          // 任务更新交给上层处理，避免旧兼容逻辑本地强行改写设备 busy/idle
           wsLogger.debug(`[handleMessage] Task update: ${message.payload?.task_id}`, {
             taskId: message.payload?.task_id,
             status: message.payload?.status,
           });
-          if (message.payload) {
-            updateDevice(message.device_id, {
-              current_task_id: message.payload.task_id,
-              status: message.payload.status
-            });
-          }
+          config.onMessage?.(message);
           break;
 
         case 'agent_status':
@@ -134,7 +146,7 @@ export function useWebSocket(config: WebSocketConfig) {
         wsLogger.info(`[connect] Reconnecting in ${delay}ms... (attempt ${reconnectAttempts.current + 1})`);
         reconnectTimeoutRef.current = setTimeout(() => {
           reconnectAttempts.current++;
-          connect();
+          connectRef.current();
         }, delay);
       } else {
         wsLogger.error('[connect] Max reconnect attempts reached, giving up');
@@ -148,6 +160,10 @@ export function useWebSocket(config: WebSocketConfig) {
 
     ws.onmessage = handleMessage;
   }, [config, setWsConnected, handleMessage, getReconnectDelay]);
+
+  useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
 
   const disconnect = useCallback(() => {
     wsLogger.info('[disconnect] Manually disconnecting');
@@ -166,5 +182,5 @@ export function useWebSocket(config: WebSocketConfig) {
     };
   }, [disconnect]);
 
-  return { connect, disconnect, send: (data: any) => wsRef.current?.send(JSON.stringify(data)) };
+  return { connect, disconnect, send: (data: unknown) => wsRef.current?.send(JSON.stringify(data)) };
 }

@@ -2257,6 +2257,17 @@ class ReActScheduler:
                 return True
 
             task.complete_act(result_text)
+
+            # Inject observation feedback into context so the model sees action results
+            observe_parts = [f"动作: {json.dumps(parse_result.action, ensure_ascii=False)}"]
+            if dispatch_result.get("success") is False:
+                observe_parts.append("结果: 失败")
+            else:
+                observe_parts.append("结果: 成功")
+            if result_text:
+                observe_parts.append(f"观察: {result_text}")
+            task.context.add_message("user", "\n".join(observe_parts))
+
             await self._emit_phase_start(device_id, task.task_id, "observe", task.current_step)
             if not await self._guard_task_ownership(device_id, task, execution_token, "after_observe_phase_start"):
                 return True
@@ -2892,6 +2903,17 @@ class ReActScheduler:
                 return True
 
             task.complete_act(result_text)
+
+            # Inject observation feedback into context so the model sees action results
+            observe_parts = [f"动作: {json.dumps(parse_result.action, ensure_ascii=False)}"]
+            if dispatch_result.get("success") is False:
+                observe_parts.append("结果: 失败")
+            else:
+                observe_parts.append("结果: 成功")
+            if result_text:
+                observe_parts.append(f"观察: {result_text}")
+            task.context.add_message("user", "\n".join(observe_parts))
+
             await self._emit_phase_start(device_id, task.task_id, "observe", task.current_step)
             if not await self._guard_task_ownership(device_id, task, execution_token, "after_observe_phase_start"):
                 return True

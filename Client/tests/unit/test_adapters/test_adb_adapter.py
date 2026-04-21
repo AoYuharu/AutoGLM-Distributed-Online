@@ -419,17 +419,14 @@ class TestADBAdapterMethods:
 
         adapter = ADBAdapter("test-device")
 
-        with patch.object(adapter, '_run_adb') as mock_run:
-            mock_run.return_value = Mock()
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
             adapter.tap(500, 800)
 
-            mock_run.assert_called_once()
-            args = mock_run.call_args[0][0]
-            assert "shell" in args
-            assert "input" in args
-            assert "tap" in args
-            assert "500" in args
-            assert "800" in args
+            mock_run.assert_called_once_with(
+                ["shell", "input", "tap", "500", "800"],
+                "tap",
+            )
 
     def test_swipe_executes_adb_command(self):
         """swipe 方法执行正确的 ADB 命令"""
@@ -437,18 +434,14 @@ class TestADBAdapterMethods:
 
         adapter = ADBAdapter("test-device")
 
-        with patch.object(adapter, '_run_adb') as mock_run:
-            mock_run.return_value = Mock()
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
             adapter.swipe(100, 200, 100, 400, duration_ms=500)
 
-            mock_run.assert_called_once()
-            args = mock_run.call_args[0][0]
-            assert "shell" in args
-            assert "input" in args
-            assert "swipe" in args
-            assert "100" in args
-            assert "200" in args
-            assert "500" in args
+            mock_run.assert_called_once_with(
+                ["shell", "input", "swipe", "100", "200", "100", "400", "500"],
+                "swipe",
+            )
 
     def test_long_press_uses_swipe_command(self):
         """long_press 使用滑动命令模拟"""
@@ -456,15 +449,15 @@ class TestADBAdapterMethods:
 
         adapter = ADBAdapter("test-device")
 
-        with patch.object(adapter, '_run_adb') as mock_run:
-            mock_run.return_value = Mock()
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
             adapter.long_press(500, 500, duration_ms=3000)
 
-            mock_run.assert_called_once()
-            args = mock_run.call_args[0][0]
-            assert "swipe" in args
-            # 起点终点相同，时长 3000ms
-            assert args[-1] == "3000"
+            mock_run.assert_called_once_with(
+                ["shell", "input", "swipe", "500", "500", "500", "500", "3000"],
+                "long_press",
+            )
+
 
     def test_back_presses_keycode_4(self):
         """back 按下返回键 (KEYCODE_BACK = 4)"""
@@ -472,13 +465,14 @@ class TestADBAdapterMethods:
 
         adapter = ADBAdapter("test-device")
 
-        with patch.object(adapter, '_run_adb') as mock_run:
-            mock_run.return_value = Mock()
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
             adapter.back()
 
-            args = mock_run.call_args[0][0]
-            assert "keyevent" in args
-            assert "4" in args
+            mock_run.assert_called_once_with(
+                ["shell", "input", "keyevent", "4"],
+                "back",
+            )
 
     def test_home_presses_keycode_3(self):
         """home 按下 Home 键 (KEYCODE_HOME = 3)"""
@@ -486,13 +480,14 @@ class TestADBAdapterMethods:
 
         adapter = ADBAdapter("test-device")
 
-        with patch.object(adapter, '_run_adb') as mock_run:
-            mock_run.return_value = Mock()
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
             adapter.home()
 
-            args = mock_run.call_args[0][0]
-            assert "keyevent" in args
-            assert "3" in args
+            mock_run.assert_called_once_with(
+                ["shell", "input", "keyevent", "3"],
+                "home",
+            )
 
     def test_launch_app_uses_monkey_command(self):
         """launch_app 使用 monkey 命令"""
@@ -500,8 +495,8 @@ class TestADBAdapterMethods:
 
         adapter = ADBAdapter("test-device")
 
-        with patch.object(adapter, '_run_adb') as mock_run:
-            mock_run.return_value = Mock()
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
             result = adapter.launch_app("com.tencent.mm")
 
             assert result is True
@@ -511,17 +506,969 @@ class TestADBAdapterMethods:
             assert "com.tencent.mm" in args
             assert "-c" in args
             assert "android.intent.category.LAUNCHER" in args
+            assert mock_run.call_args[0][1] == "launch_app"
 
-    def test_launch_app_empty_package_returns_false(self):
-        """launch_app 空包名返回 False"""
+    def test_execute_launch_action_resolves_known_app_alias(self):
+        """Launch(app=别名) 解析为静态包名"""
         from src.adapters.adb_adapter import ADBAdapter
 
         adapter = ADBAdapter("test-device")
 
-        with patch.object(adapter, '_run_adb') as mock_run:
-            result = adapter.launch_app("")
-            assert result is False
-            mock_run.assert_not_called()
+        with patch.object(adapter, 'launch_app') as mock_launch:
+            mock_launch.return_value = True
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "WeChat",
+            })
+
+            mock_launch.assert_called_once_with("com.tencent.mm")
+            assert result.success is True
+            assert result.should_finish is False
+
+    def test_execute_launch_action_unknown_app_alias_returns_not_found(self):
+        """Launch(app=未知别名) 返回带提示的 App not found"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "resolve", return_value=None) as mock_resolve, \
+             patch.object(adapter._android_app_index, "load_cached", return_value=None) as mock_load_cached, \
+             patch.object(adapter._android_app_index, "refresh") as mock_refresh, \
+             patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "UnknownAppAlias",
+            })
+
+        assert mock_resolve.call_count == 3
+        mock_load_cached.assert_called_once_with()
+        mock_refresh.assert_called_once_with()
+        assert result.success is False
+        assert result.should_finish is False
+        assert result.message == (
+            "App not found: UnknownAppAlias | "
+            "No dynamic Android app-name mapping matched this request. "
+            "Try a more exact installed app label."
+        )
+
+    def test_execute_launch_action_not_found_includes_dynamic_suggestions(self):
+        """动态 miss 时返回可供后续 agent 复用的映射提示"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "resolve", return_value=None), \
+             patch.object(adapter._android_app_index, "load_cached", return_value=None), \
+             patch.object(adapter._android_app_index, "refresh"), \
+             patch.object(
+                 adapter._android_app_index,
+                 "get_package_suggestions",
+                 return_value=[("com.android.notes", ["原子笔记"]), ("com.tencent.mm", ["微信", "WeChat"])],
+             ):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "MissingAlias",
+            })
+
+        assert result.success is False
+        assert result.message == (
+            "App not found: MissingAlias | "
+            "Available app suggestions: 原子笔记 -> com.android.notes; 微信, WeChat -> com.tencent.mm"
+        )
+
+    def test_execute_launch_action_failed_package_includes_known_aliases(self):
+        """启动失败时返回包名及已知别名提示"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, 'launch_app', return_value=False), \
+             patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "原子笔记",
+            })
+
+        assert result.success is False
+        assert result.message == "App not found: 原子笔记 | Known aliases for com.android.notes: 原子笔记"
+
+    def test_execute_launch_action_new_static_alias_resolves_notes(self):
+        """原子笔记静态别名直接命中 com.android.notes"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, 'launch_app', return_value=True) as mock_launch, \
+             patch.object(adapter._android_app_index, "resolve") as mock_resolve:
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "原子笔记",
+            })
+
+        mock_resolve.assert_not_called()
+        mock_launch.assert_called_once_with("com.android.notes")
+        assert result.success is True
+
+    def test_execute_launch_action_dynamic_failure_message_uses_package_when_app_absent(self):
+        """仅 package 启动失败时提示包名"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, 'launch_app', return_value=False), \
+             patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "package": "com.example.missing",
+            })
+
+        assert result.success is False
+        assert result.message == "App not found: com.example.missing"
+
+    def test_execute_launch_action_dynamic_failure_message_deduplicates_aliases(self):
+        """别名提示去重，避免 observe 文本重复"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.tencent.mm", ["微信", "微信", "WeChat"])],
+        ):
+            message = adapter._build_launch_failure_message(app_name="MissingAlias")
+
+        assert message == (
+            "App not found: MissingAlias | "
+            "Available app suggestions: 微信, WeChat -> com.tencent.mm"
+        )
+
+    def test_execute_launch_action_dynamic_failure_message_deduplicates_known_aliases(self):
+        """已知包别名提示去重"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(app_name="WeChat", package="com.tencent.mm")
+
+        assert message == "App not found: WeChat | Known aliases for com.tencent.mm: 微信, WeChat, wechat"
+
+    def test_execute_launch_action_dynamic_failure_message_unknown_target_defaults(self):
+        """无 app/package 时默认 unknown"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message()
+
+        assert message == "App not found: unknown"
+
+    def test_execute_launch_action_dynamic_failure_message_prefers_app_name_target(self):
+        """app 与 package 同时存在时优先用 app 作为失败目标"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(app_name="原子笔记", package="com.android.notes")
+
+        assert message.startswith("App not found: 原子笔记")
+
+    def test_execute_launch_action_dynamic_failure_message_with_package_only_suggestions(self):
+        """无标签建议时仅输出包名"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        formatted = adapter._format_launch_suggestions([("com.example.app", [])])
+
+        assert formatted == "com.example.app"
+
+    def test_execute_launch_action_dynamic_failure_message_with_multiple_labels_formats_once(self):
+        """多个标签建议按固定格式拼接"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        formatted = adapter._format_launch_suggestions([
+            ("com.example.one", ["One"]),
+            ("com.example.two", ["Two", "Deux"]),
+        ])
+
+        assert formatted == "One -> com.example.one; Two, Deux -> com.example.two"
+
+    def test_execute_launch_action_dynamic_failure_message_static_alias_without_suggestions(self):
+        """静态别名失败时仍返回已知别名提示"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(app_name="原子笔记", package="com.android.notes")
+
+        assert message == "App not found: 原子笔记 | Known aliases for com.android.notes: 原子笔记"
+
+    def test_execute_launch_action_dynamic_failure_message_no_duplicate_parts(self):
+        """无建议且无别名时只追加一次 fallback 文案"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(app_name="MissingAlias")
+
+        assert message.count("No dynamic Android app-name mapping matched this request") == 1
+
+    def test_execute_launch_action_dynamic_failure_message_includes_aliases_and_suggestions(self):
+        """别名和建议可同时出现在失败消息中"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.tencent.mm", ["微信", "WeChat"])],
+        ):
+            message = adapter._build_launch_failure_message(app_name="WeChat", package="com.tencent.mm")
+
+        assert message == (
+            "App not found: WeChat | "
+            "Known aliases for com.tencent.mm: 微信, WeChat, wechat | "
+            "Available app suggestions: 微信, WeChat -> com.tencent.mm"
+        )
+
+    def test_execute_launch_action_dynamic_failure_message_returns_plain_package_when_no_app(self):
+        """无 app 时失败目标使用 package"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(package="com.example.pkg")
+
+        assert message == "App not found: com.example.pkg"
+
+    def test_execute_launch_action_dynamic_failure_message_omits_fallback_when_suggestions_exist(self):
+        """有建议时不再追加泛化 fallback 文案"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.android.notes", ["原子笔记"])],
+        ):
+            message = adapter._build_launch_failure_message(app_name="MissingAlias")
+
+        assert "No dynamic Android app-name mapping matched this request" not in message
+
+    def test_execute_launch_action_dynamic_failure_message_omits_fallback_when_alias_hints_exist(self):
+        """有包别名时不追加泛化 fallback 文案"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(app_name="原子笔记", package="com.android.notes")
+
+        assert "No dynamic Android app-name mapping matched this request" not in message
+
+    def test_execute_launch_action_dynamic_failure_message_with_app_only_no_suggestions(self):
+        """仅 app 且无建议时包含 fallback 文案"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(app_name="NotInstalled")
+
+        assert message == (
+            "App not found: NotInstalled | "
+            "No dynamic Android app-name mapping matched this request. "
+            "Try a more exact installed app label."
+        )
+
+    def test_execute_launch_action_dynamic_failure_message_with_package_alias_and_suggestions_formats_all(self):
+        """复杂失败消息格式保持稳定"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.android.notes", ["原子笔记"]), ("com.tencent.mm", ["微信"])],
+        ):
+            message = adapter._build_launch_failure_message(app_name="原子笔记", package="com.android.notes")
+
+        assert message == (
+            "App not found: 原子笔记 | "
+            "Known aliases for com.android.notes: 原子笔记 | "
+            "Available app suggestions: 原子笔记 -> com.android.notes; 微信 -> com.tencent.mm"
+        )
+
+    def test_execute_launch_action_dynamic_failure_message_empty_suggestion_labels_use_package_only(self):
+        """建议标签为空时只显示包名"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.empty.labels", [])],
+        ):
+            message = adapter._build_launch_failure_message(app_name="MissingAlias")
+
+        assert message == "App not found: MissingAlias | Available app suggestions: com.empty.labels"
+
+    def test_execute_launch_action_dynamic_failure_message_preserves_order(self):
+        """失败消息顺序固定为 target -> aliases -> suggestions"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.android.notes", ["原子笔记"])],
+        ):
+            message = adapter._build_launch_failure_message(app_name="原子笔记", package="com.android.notes")
+
+        assert message.split(" | ") == [
+            "App not found: 原子笔记",
+            "Known aliases for com.android.notes: 原子笔记",
+            "Available app suggestions: 原子笔记 -> com.android.notes",
+        ]
+
+    def test_execute_launch_action_dynamic_failure_message_without_package_and_without_app_returns_unknown(self):
+        """无目标时返回 unknown"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            assert adapter._build_launch_failure_message() == "App not found: unknown"
+
+    def test_execute_launch_action_dynamic_failure_message_returns_aliases_for_wechat_package(self):
+        """微信包返回完整静态别名列表"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(package="com.tencent.mm")
+
+        assert message == "App not found: com.tencent.mm | Known aliases for com.tencent.mm: 微信, WeChat, wechat"
+
+    def test_execute_launch_action_dynamic_failure_message_for_static_only_alias_target(self):
+        """静态别名目标保留用户原始 app 名称"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(app_name="WeChat", package="com.tencent.mm")
+
+        assert message.startswith("App not found: WeChat")
+
+    def test_execute_launch_action_dynamic_failure_message_no_suggestions_for_package_only(self):
+        """仅 package 且无建议时不包含 fallback 文案"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(package="com.example.pkg")
+
+        assert "No dynamic Android app-name mapping matched this request" not in message
+
+    def test_execute_launch_action_dynamic_failure_message_aliases_follow_package(self):
+        """别名提示绑定到 package"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(app_name="Alias", package="com.tencent.mm")
+
+        assert "Known aliases for com.tencent.mm" in message
+
+    def test_execute_launch_action_dynamic_failure_message_suggestions_follow_helper_output(self):
+        """建议提示直接使用 helper 输出"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.pkg.one", ["One"]), ("com.pkg.two", ["Two"])],
+        ):
+            message = adapter._build_launch_failure_message(app_name="Missing")
+
+        assert message.endswith("Available app suggestions: One -> com.pkg.one; Two -> com.pkg.two")
+
+    def test_execute_launch_action_dynamic_failure_message_app_not_found_prefix_stable(self):
+        """失败消息前缀保持稳定"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(app_name="Missing")
+
+        assert message.startswith("App not found: Missing")
+
+    def test_execute_launch_action_dynamic_failure_message_for_unknown_without_suggestions_has_two_parts(self):
+        """未知 app 无建议时固定两段"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            parts = adapter._build_launch_failure_message(app_name="Missing").split(" | ")
+
+        assert len(parts) == 2
+
+    def test_execute_launch_action_dynamic_failure_message_for_package_only_with_aliases_has_two_parts(self):
+        """仅 package 且有别名时固定两段"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            parts = adapter._build_launch_failure_message(package="com.tencent.mm").split(" | ")
+
+        assert len(parts) == 2
+
+    def test_execute_launch_action_dynamic_failure_message_for_package_alias_and_suggestion_has_three_parts(self):
+        """别名+建议时固定三段"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.android.notes", ["原子笔记"])],
+        ):
+            parts = adapter._build_launch_failure_message(package="com.tencent.mm").split(" | ")
+
+        assert len(parts) == 3
+
+    def test_execute_launch_action_dynamic_failure_message_without_aliases_uses_suggestions_only(self):
+        """无别名时只有建议段"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.android.notes", ["原子笔记"])],
+        ):
+            message = adapter._build_launch_failure_message(app_name="Missing")
+
+        assert message == "App not found: Missing | Available app suggestions: 原子笔记 -> com.android.notes"
+
+    def test_execute_launch_action_dynamic_failure_message_without_anything_is_single_part(self):
+        """unknown 无附加信息时只有一段"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            parts = adapter._build_launch_failure_message().split(" | ")
+
+        assert parts == ["App not found: unknown"]
+
+    def test_execute_launch_action_dynamic_failure_message_known_aliases_for_notes_remain_single(self):
+        """原子笔记别名保持单值"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            assert adapter._build_launch_failure_message(package="com.android.notes") == (
+                "App not found: com.android.notes | Known aliases for com.android.notes: 原子笔记"
+            )
+
+    def test_execute_launch_action_dynamic_failure_message_wechat_aliases_are_joined(self):
+        """微信多个静态别名按逗号拼接"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            assert ", " in adapter._build_launch_failure_message(package="com.tencent.mm")
+
+    def test_execute_launch_action_dynamic_failure_message_helper_format_is_used_for_empty_labels(self):
+        """helper 格式方法处理空标签"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        assert adapter._format_launch_suggestions([("pkg", [])]) == "pkg"
+
+    def test_execute_launch_action_dynamic_failure_message_helper_format_deduplicates_labels(self):
+        """helper 格式方法去重标签"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        assert adapter._format_launch_suggestions([("pkg", ["A", "A", "B"])]) == "A, B -> pkg"
+
+    def test_execute_launch_action_dynamic_failure_message_for_unknown_app_uses_fallback_text(self):
+        """未知 app 失败文案包含 fallback 提示"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            assert adapter._build_launch_failure_message(app_name="Unknown") == (
+                "App not found: Unknown | "
+                "No dynamic Android app-name mapping matched this request. "
+                "Try a more exact installed app label."
+            )
+
+    def test_execute_launch_action_dynamic_failure_message_for_static_alias_failure_has_no_fallback_text(self):
+        """静态别名失败无泛化 fallback 文案"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(app_name="WeChat", package="com.tencent.mm")
+
+        assert "No dynamic Android app-name mapping matched this request" not in message
+
+    def test_execute_launch_action_dynamic_failure_message_suggestions_can_include_same_package(self):
+        """建议中允许包含同一包"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.tencent.mm", ["微信"])],
+        ):
+            message = adapter._build_launch_failure_message(package="com.tencent.mm")
+
+        assert message.endswith("Available app suggestions: 微信 -> com.tencent.mm")
+
+    def test_execute_launch_action_dynamic_failure_message_empty_aliases_and_empty_suggestions_for_package_only(self):
+        """仅 package 且无别名无建议时仅目标"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            message = adapter._build_launch_failure_message(package="com.example.pkg")
+
+        assert message == "App not found: com.example.pkg"
+
+    def test_execute_launch_action_dynamic_failure_message_empty_aliases_but_suggestions_for_package_only(self):
+        """仅 package 且有建议时显示建议"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.android.notes", ["原子笔记"])],
+        ):
+            message = adapter._build_launch_failure_message(package="com.example.pkg")
+
+        assert message == "App not found: com.example.pkg | Available app suggestions: 原子笔记 -> com.android.notes"
+
+    def test_execute_launch_action_dynamic_failure_message_can_be_used_for_observe_result_text(self):
+        """失败消息适合直接进入 observe_result.result"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.android.notes", ["原子笔记"]), ("com.tencent.mm", ["微信", "WeChat"])],
+        ):
+            message = adapter._build_launch_failure_message(app_name="MissingAlias")
+
+        assert "|" in message
+        assert "Available app suggestions:" in message
+
+    def test_execute_launch_action_dynamic_failure_message_target_unknown_when_none(self):
+        """目标缺失时 target 为 unknown"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            assert adapter._build_launch_failure_message() == "App not found: unknown"
+
+    def test_execute_launch_action_dynamic_failure_message_with_notes_aliases_and_suggestions(self):
+        """原子笔记失败消息包含别名与建议"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.android.notes", ["原子笔记"])],
+        ):
+            message = adapter._build_launch_failure_message(app_name="原子笔记", package="com.android.notes")
+
+        assert message == (
+            "App not found: 原子笔记 | "
+            "Known aliases for com.android.notes: 原子笔记 | "
+            "Available app suggestions: 原子笔记 -> com.android.notes"
+        )
+
+    def test_execute_launch_action_dynamic_failure_message_returns_string(self):
+        """失败消息始终返回字符串"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            assert isinstance(adapter._build_launch_failure_message(app_name="Missing"), str)
+
+    def test_execute_launch_action_dynamic_failure_message_can_handle_empty_label_entries(self):
+        """空标签项会被过滤"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        assert adapter._format_launch_suggestions([("pkg", ["", "A", "", "B"])]) == "A, B -> pkg"
+
+    def test_execute_launch_action_dynamic_failure_message_for_missing_alias_with_suggestions(self):
+        """缺失别名但有建议时直接输出建议"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "get_package_suggestions",
+            return_value=[("com.android.notes", ["原子笔记"]), ("com.tencent.mm", ["微信"])],
+        ):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "MissingAlias",
+            })
+
+        assert result.message == (
+            "App not found: MissingAlias | "
+            "Available app suggestions: 原子笔记 -> com.android.notes; 微信 -> com.tencent.mm"
+        )
+
+    def test_execute_launch_action_dynamic_failure_message_static_failure_observe_safe(self):
+        """静态失败文案可以直接给 observe 使用"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, "launch_app", return_value=False), \
+             patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "WeChat",
+            })
+
+        assert result.message.startswith("App not found: WeChat")
+        assert "Known aliases for com.tencent.mm" in result.message
+
+    def test_execute_launch_action_uses_dynamic_cache_hit_without_refresh(self):
+        """静态 miss 但动态内存缓存命中时直接启动"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "resolve", return_value="com.android.notes") as mock_resolve, \
+             patch.object(adapter._android_app_index, "load_cached") as mock_load_cached, \
+             patch.object(adapter._android_app_index, "refresh") as mock_refresh, \
+             patch.object(adapter, "launch_app", return_value=True) as mock_launch:
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "OriginalNotesApp",
+            })
+
+        mock_resolve.assert_called_once_with("OriginalNotesApp")
+        mock_load_cached.assert_not_called()
+        mock_refresh.assert_not_called()
+        mock_launch.assert_called_once_with("com.android.notes")
+        assert result.success is True
+
+    def test_execute_launch_action_refreshes_after_disk_cache_miss(self):
+        """静态 miss 且缓存 miss 时会触发 refresh"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(
+            adapter._android_app_index,
+            "resolve",
+            side_effect=[None, None, "com.android.notes"],
+        ) as mock_resolve, patch.object(
+            adapter._android_app_index,
+            "load_cached",
+            return_value=None,
+        ) as mock_load_cached, patch.object(
+            adapter._android_app_index,
+            "refresh",
+        ) as mock_refresh, patch.object(
+            adapter,
+            "launch_app",
+            return_value=True,
+        ) as mock_launch:
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "OriginalNotesApp",
+            })
+
+        assert mock_resolve.call_count == 3
+        mock_load_cached.assert_called_once_with()
+        mock_refresh.assert_called_once_with()
+        mock_launch.assert_called_once_with("com.android.notes")
+        assert result.success is True
+
+    def test_execute_launch_action_retries_once_after_dynamic_launch_failure(self):
+        """动态命中后启动失败会失效缓存并重试一次"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "resolve", side_effect=["com.android.notes", "com.android.notes.new"]) as mock_resolve, \
+             patch.object(adapter._android_app_index, "invalidate") as mock_invalidate, \
+             patch.object(adapter._android_app_index, "refresh") as mock_refresh, \
+             patch.object(adapter, "launch_app", side_effect=[False, True]) as mock_launch:
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "OriginalNotesApp",
+            })
+
+        mock_invalidate.assert_called_once_with("com.android.notes")
+        mock_refresh.assert_called_once_with()
+        assert mock_launch.call_args_list[0].args == ("com.android.notes",)
+        assert mock_launch.call_args_list[1].args == ("com.android.notes.new",)
+        assert result.success is True
+
+    def test_execute_launch_action_retries_once_after_dynamic_launch_exception(self):
+        """动态命中后抛异常也会做一次失效刷新重试"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "resolve", side_effect=["com.android.notes", "com.android.notes"]) as mock_resolve, \
+             patch.object(adapter._android_app_index, "invalidate") as mock_invalidate, \
+             patch.object(adapter._android_app_index, "refresh") as mock_refresh, \
+             patch.object(adapter, "launch_app", side_effect=[RuntimeError("launch_app: failed"), True]) as mock_launch:
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "OriginalNotesApp",
+            })
+
+        mock_invalidate.assert_called_once_with("com.android.notes")
+        mock_refresh.assert_called_once_with()
+        assert mock_resolve.call_count == 2
+        assert mock_launch.call_args_list[0].args == ("com.android.notes",)
+        assert mock_launch.call_args_list[1].args == ("com.android.notes",)
+        assert result.success is True
+
+    def test_execute_launch_action_dynamic_retry_returns_not_found_when_refresh_cannot_resolve(self):
+        """动态重试刷新后仍无法解析则返回包名 not found"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "resolve", side_effect=["com.android.notes", None]) as mock_resolve, \
+             patch.object(adapter._android_app_index, "invalidate") as mock_invalidate, \
+             patch.object(adapter._android_app_index, "refresh") as mock_refresh, \
+             patch.object(adapter, "launch_app", return_value=False) as mock_launch, \
+             patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "OriginalNotesApp",
+            })
+
+        mock_invalidate.assert_called_once_with("com.android.notes")
+        mock_refresh.assert_called_once_with()
+        mock_launch.assert_called_once_with("com.android.notes")
+        assert result.success is False
+        assert result.message == "App not found: OriginalNotesApp | Known aliases for com.android.notes: 原子笔记"
+
+    def test_execute_launch_action_static_hit_does_not_use_dynamic_index(self):
+        """静态命中保持第一优先级，不触发动态索引"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "resolve") as mock_resolve, \
+             patch.object(adapter._android_app_index, "load_cached") as mock_load_cached, \
+             patch.object(adapter._android_app_index, "refresh") as mock_refresh, \
+             patch.object(adapter, "launch_app", return_value=True) as mock_launch:
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "WeChat",
+            })
+
+        mock_resolve.assert_not_called()
+        mock_load_cached.assert_not_called()
+        mock_refresh.assert_not_called()
+        mock_launch.assert_called_once_with("com.tencent.mm")
+        assert result.success is True
+
+    def test_execute_launch_action_app_still_does_not_fallback_to_package_when_dynamic_misses(self):
+        """有 app 时动态 miss 后仍不回退 package"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "resolve", return_value=None), \
+             patch.object(adapter._android_app_index, "load_cached", return_value=None), \
+             patch.object(adapter._android_app_index, "refresh"), \
+             patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "MissingAlias",
+                "package": "com.tencent.mm",
+            })
+
+        assert result.success is False
+        assert result.message == (
+            "App not found: MissingAlias | "
+            "No dynamic Android app-name mapping matched this request. "
+            "Try a more exact installed app label."
+        )
+
+    def test_execute_launch_action_dynamic_ambiguity_returns_not_found(self):
+        """动态歧义时不自动选择包名"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "resolve", return_value=None), \
+             patch.object(adapter._android_app_index, "load_cached", return_value=None), \
+             patch.object(adapter._android_app_index, "refresh") as mock_refresh, \
+             patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]), \
+             patch.object(adapter, "launch_app") as mock_launch:
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "Notes",
+            })
+
+        mock_refresh.assert_called_once_with()
+        mock_launch.assert_not_called()
+        assert result.success is False
+        assert result.message == (
+            "App not found: Notes | "
+            "No dynamic Android app-name mapping matched this request. "
+            "Try a more exact installed app label."
+        )
+
+    def test_execute_launch_action_prefers_app_over_package(self):
+        """有 app 时不回退使用 package"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter._android_app_index, "get_package_suggestions", return_value=[]):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "app": "MissingAlias",
+                "package": "com.tencent.mm",
+            })
+
+        assert result.success is False
+        assert result.message == (
+            "App not found: MissingAlias | "
+            "No dynamic Android app-name mapping matched this request. "
+            "Try a more exact installed app label."
+        )
+
+    def test_execute_launch_action_uses_package_when_app_absent(self):
+        """app 缺失时回退使用 package"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, 'launch_app', return_value=True) as mock_launch:
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "launch",
+                "package": "com.example.app",
+            })
+
+        mock_launch.assert_called_once_with("com.example.app")
+        assert result.success is True
+
+    def test_execute_tap_action_returns_failure_when_adb_command_fails(self):
+        """ADB 非零返回会让 execute_action 失败"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_run_adb', return_value=Mock(returncode=1, stderr='device offline', stdout='')):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "tap",
+                "element": {"x": 100, "y": 200},
+            })
+
+        assert result.success is False
+        assert result.should_finish is False
+        assert result.message == "Action failed: tap: device offline"
+
+    def test_execute_type_action_returns_failure_when_adb_command_fails(self):
+        """type_text 失败会通过 execute_action 返回错误"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_run_adb', return_value=Mock(returncode=12, stderr='input failed', stdout='')):
+            result = adapter.execute_action({
+                "_metadata": "do",
+                "action": "type",
+                "text": "hello world",
+            })
+
+        assert result.success is False
+        assert result.message == "Action failed: type_text: input failed"
+
+    def test_run_adb_checked_detects_failure_text_even_with_zero_exit(self):
+        """明显 adb 错误文本也会被视为失败"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_run_adb', return_value=Mock(returncode=0, stderr='Error: no devices/emulators found', stdout='')):
+            with pytest.raises(RuntimeError, match="type_text: Error: no devices/emulators found"):
+                adapter._run_adb_checked(["shell", "input", "text", "hello"], action_name="type_text")
 
     def test_double_tap_sends_two_taps(self):
         """double_tap 发送两次 tap"""
@@ -529,16 +1476,88 @@ class TestADBAdapterMethods:
 
         adapter = ADBAdapter("test-device")
 
-        with patch.object(adapter, '_run_adb') as mock_run:
-            mock_run.return_value = Mock()
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
             adapter.double_tap(500, 500)
 
             assert mock_run.call_count == 2
-            # 验证两次 tap 的坐标相同
             for call in mock_run.call_args_list:
                 args = call[0][0]
                 assert "tap" in args
                 assert "500" in args
+                assert call.kwargs["action_name"] == "double_tap"
+
+    def test_tap_uses_checked_adb_command(self):
+        """tap 使用 checked adb helper"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
+            adapter.tap(10, 20)
+
+            mock_run.assert_called_once_with(
+                ["shell", "input", "tap", "10", "20"],
+                "tap",
+            )
+
+    def test_swipe_uses_checked_adb_command(self):
+        """swipe 使用 checked adb helper"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
+            adapter.swipe(1, 2, 3, 4, duration_ms=500)
+
+            mock_run.assert_called_once_with(
+                ["shell", "input", "swipe", "1", "2", "3", "4", "500"],
+                "swipe",
+            )
+
+    def test_long_press_uses_checked_adb_command(self):
+        """long_press 使用 checked adb helper"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
+            adapter.long_press(1, 2, duration_ms=700)
+
+            mock_run.assert_called_once_with(
+                ["shell", "input", "swipe", "1", "2", "1", "2", "700"],
+                "long_press",
+            )
+
+    def test_type_text_uses_checked_adb_command(self):
+        """type_text tier 3 uses shell-escaped adb input text for ASCII"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_detect_adb_keyboard', return_value=False), \
+             patch.object(adapter, '_run_adb_checked') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
+            adapter.type_text("hello world")
+
+            mock_run.assert_called_once_with(
+                ["shell", "input text 'hello%sworld'"],
+                "type_text",
+            )
+
+    def test_launch_app_empty_package_returns_false(self):
+        """launch_app 空包名返回 False"""
+        from src.adapters.adb_adapter import ADBAdapter
+
+        adapter = ADBAdapter("test-device")
+
+        with patch.object(adapter, '_run_adb_checked') as mock_run:
+            result = adapter.launch_app("")
+            assert result is False
+            mock_run.assert_not_called()
 
 
 class TestCoordinateConversion:

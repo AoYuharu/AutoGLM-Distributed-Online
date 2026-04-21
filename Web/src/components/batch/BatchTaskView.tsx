@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Card,
   Button,
@@ -25,7 +25,7 @@ import {
 import clsx from 'clsx';
 import { useDeviceStore } from '../../stores/deviceStore';
 import { useAppStore } from '../../stores/appStore';
-import { useBatchStore } from '../../stores/batchStore';
+import { useBatchStore, type BatchTaskExecution } from '../../stores/batchStore';
 
 const { TextArea } = Input;
 
@@ -58,27 +58,43 @@ export const BatchTaskView: React.FC = () => {
     interruptAll,
   } = useBatchStore();
 
-  // Initialize batch session when entering step 2
   useEffect(() => {
-    if (step === 2 && selectedDevices.length > 0) {
-      initBatchSession(selectedDevices);
+    if (step !== 2 || selectedDevices.length === 0) {
+      return;
     }
 
+    initBatchSession(selectedDevices);
     return () => {
-      // Cleanup when leaving the view
-      if (step === 2) {
-        endBatchSession();
-      }
+      endBatchSession();
     };
-  }, [step]);
+  }, [step, selectedDevices, initBatchSession, endBatchSession]);
+
+  useEffect(() => {
+    return () => {
+      endBatchSession();
+    };
+  }, [endBatchSession]);
 
   const availableDevices = Object.values(devices).filter(
-    (d) => d.status === 'idle' || d.status === 'error'
+    (device) => device.status === 'idle' || device.status === 'error'
   );
 
-  const selectedDevicesData = selectedDevices
-    .map((id) => devices[id])
-    .filter(Boolean);
+  const selectedDevicesData = selectedDevices.map((id) => devices[id]).filter(Boolean);
+
+  const executionsArray = useMemo(() => Object.values(executions), [executions]);
+  const sortedExecutions = useMemo(
+    () => [...executionsArray].sort((a, b) => a.deviceId.localeCompare(b.deviceId)),
+    [executionsArray]
+  );
+  const hasExecutions = executionsArray.length > 0;
+  const canShowResetActions = hasExecutions && !isRunning;
+
+  const resetBatchFlow = () => {
+    endBatchSession();
+    setStep(0);
+    setSelectedDevices([]);
+    setTaskConfig({ instruction: '', modePolicy: 'default', stopOnError: false });
+  };
 
   const handleDeviceToggle = (deviceId: string) => {
     setSelectedDevices((prev) =>
@@ -92,7 +108,7 @@ export const BatchTaskView: React.FC = () => {
     if (selectedDevices.length === availableDevices.length) {
       setSelectedDevices([]);
     } else {
-      setSelectedDevices(availableDevices.map((d) => d.device_id));
+      setSelectedDevices(availableDevices.map((device) => device.device_id));
     }
   };
 
@@ -105,11 +121,16 @@ export const BatchTaskView: React.FC = () => {
       message.warning('请输入任务指令');
       return;
     }
-    setStep(step + 1);
+    setStep((prev) => prev + 1);
   };
 
   const handleBack = () => {
-    setStep(step - 1);
+    setStep((prev) => prev - 1);
+  };
+
+  const handleCancelBatch = () => {
+    endBatchSession();
+    setViewMode('monitor');
   };
 
   const handleStartExecution = async () => {
@@ -123,20 +144,25 @@ export const BatchTaskView: React.FC = () => {
       instruction: taskConfig.instruction,
       mode_policy: taskConfig.modePolicy,
       max_steps: 100,
+      stop_on_error: taskConfig.stopOnError,
     });
 
-    message.success(`已向 ${selectedDevices.length} 台设备发送任务`);
+    message.success(
+      `已向 ${selectedDevices.length} 台设备提交启动请求，等待 task_created 回填任务信息`
+    );
   };
 
   const handleInterruptAll = async () => {
     await interruptAll();
-    message.success('已中断所有任务');
+    message.success('已向所有运行中的设备发送中断请求');
   };
 
   const getStatusIcon = (status: string) => {
     switch (status) {
       case 'pending':
         return <ClockCircleOutlined className="text-gray-400" />;
+      case 'starting':
+        return <ClockCircleOutlined className="text-blue-400" />;
       case 'running':
         return <LoadingOutlined className="text-blue-500" />;
       case 'completed':
@@ -153,6 +179,7 @@ export const BatchTaskView: React.FC = () => {
   const getStatusText = (status: string) => {
     const texts: Record<string, string> = {
       pending: '等待中',
+      starting: '等待创建任务',
       running: '执行中',
       completed: '已完成',
       failed: '失败',
@@ -161,13 +188,74 @@ export const BatchTaskView: React.FC = () => {
     return texts[status] || status;
   };
 
-  // Get executions as array
-  const executionsArray = Object.values(executions);
-  const hasExecutions = executionsArray.length > 0;
+  const getStatusTagColor = (status: string) => {
+    switch (status) {
+      case 'completed':
+        return 'success';
+      case 'failed':
+        return 'error';
+      case 'running':
+        return 'processing';
+      case 'starting':
+        return 'blue';
+      case 'interrupted':
+        return 'orange';
+      default:
+        return 'default';
+    }
+  };
+
+  const getExecutionStepText = (
+    status: string,
+    currentStep: number,
+    maxSteps: number,
+    hasTaskId: boolean
+  ) => {
+    if (status === 'starting' && !hasTaskId) {
+      return '等待 task_created';
+    }
+
+    if (!hasTaskId && status === 'pending') {
+      return '等待启动';
+    }
+
+    return `${currentStep} / ${maxSteps} 步`;
+  };
+
+  const getExecutionPercent = (currentStep: number, maxSteps: number) => {
+    if (!maxSteps || maxSteps <= 0) {
+      return 0;
+    }
+    return Math.min(100, Math.round((currentStep / maxSteps) * 100));
+  };
+
+  const getExecutionProgressStatus = (status: string) => {
+    if (status === 'failed') {
+      return 'exception' as const;
+    }
+    if (status === 'completed') {
+      return 'success' as const;
+    }
+    return undefined;
+  };
+
+  const getExecutionDetailText = (execution: BatchTaskExecution) => {
+    if (execution.statusMessage) {
+      return execution.statusMessage;
+    }
+    if (execution.error) {
+      return execution.error;
+    }
+    return null;
+  };
+
+  const stopOnErrorEnabled = taskConfig.stopOnError;
+  const stepThreeHelpText = stopOnErrorEnabled
+    ? '已启用：任一设备失败时将自动中断其余运行中的设备'
+    : '未启用失败联停；单设备失败不会自动中断其他设备';
 
   return (
     <div className="p-6">
-      {/* Steps */}
       <div className="mb-6">
         <Steps
           current={step}
@@ -179,7 +267,6 @@ export const BatchTaskView: React.FC = () => {
         />
       </div>
 
-      {/* Step 0: Select devices */}
       {step === 0 && (
         <Card title="选择设备">
           <div className="flex items-center justify-between mb-4">
@@ -212,9 +299,7 @@ export const BatchTaskView: React.FC = () => {
                     <div className="font-medium">{device.device_name}</div>
                     <div className="text-xs text-gray-500">{device.device_id}</div>
                   </div>
-                  <Tag
-                    color={device.status === 'idle' ? 'success' : 'warning'}
-                  >
+                  <Tag color={device.status === 'idle' ? 'success' : 'warning'}>
                     {device.status === 'idle' ? '空闲' : '异常'}
                   </Tag>
                 </div>
@@ -233,7 +318,7 @@ export const BatchTaskView: React.FC = () => {
 
           <div className="flex justify-end mt-6">
             <Space>
-              <Button onClick={() => setViewMode('monitor')}>取消</Button>
+              <Button onClick={handleCancelBatch}>取消</Button>
               <Button
                 type="primary"
                 onClick={handleNext}
@@ -246,7 +331,6 @@ export const BatchTaskView: React.FC = () => {
         </Card>
       )}
 
-      {/* Step 1: Configure task */}
       {step === 1 && (
         <Card title="配置任务">
           <div className="space-y-4">
@@ -274,9 +358,9 @@ export const BatchTaskView: React.FC = () => {
               >
                 <Space direction="vertical">
                   <Radio value="default">
-                    <span>跟随会话设置（默认非谨慎）</span>
+                    <span>跟随会话设置（保留服务端默认行为）</span>
                     <span className="text-xs text-gray-500 ml-2">
-                      各设备保持原有的模式设置
+                      不主动改写 create_task 的默认 mode
                     </span>
                   </Radio>
                   <Radio value="force_normal">
@@ -323,7 +407,7 @@ export const BatchTaskView: React.FC = () => {
           <div className="flex justify-end mt-6">
             <Space>
               <Button onClick={handleBack}>上一步</Button>
-              <Button onClick={() => setViewMode('monitor')}>取消</Button>
+              <Button onClick={handleCancelBatch}>取消</Button>
               <Button type="primary" onClick={handleNext}>
                 开始执行 <ArrowRightOutlined />
               </Button>
@@ -332,7 +416,6 @@ export const BatchTaskView: React.FC = () => {
         </Card>
       )}
 
-      {/* Step 2: Execute and monitor */}
       {step === 2 && (
         <Card
           title="执行进度"
@@ -341,9 +424,7 @@ export const BatchTaskView: React.FC = () => {
               <Tag color="blue">
                 {completedCount} / {totalDevices} 完成
               </Tag>
-              {failedCount > 0 && (
-                <Tag color="red">{failedCount} 失败</Tag>
-              )}
+              {failedCount > 0 && <Tag color="red">{failedCount} 失败</Tag>}
               {isRunning && (
                 <Button danger icon={<StopOutlined />} onClick={handleInterruptAll}>
                   全部中断
@@ -352,8 +433,14 @@ export const BatchTaskView: React.FC = () => {
             </Space>
           }
         >
+          <div className="mb-4 text-sm text-gray-500">{stepThreeHelpText}</div>
+
           {!hasExecutions && (
-            <div className="text-center py-12">
+            <div className="text-center py-12 space-y-4">
+              <div className="text-sm text-gray-500">
+                当前还没有执行项。点击“开始执行”后，会先按设备提交 create_task，再等待
+                task_created 回填真实 taskId。
+              </div>
               <Button
                 type="primary"
                 size="large"
@@ -367,76 +454,61 @@ export const BatchTaskView: React.FC = () => {
 
           {hasExecutions && (
             <div className="space-y-4">
-              {executionsArray.map((exec) => {
-                const progress = Math.round((exec.currentStep / exec.maxSteps) * 100);
+              {sortedExecutions.map((execution) => {
+                const progress = getExecutionPercent(
+                  execution.currentStep,
+                  execution.maxSteps
+                );
+                const detailText = getExecutionDetailText(execution);
                 return (
-                  <Card key={exec.deviceId} size="small">
+                  <Card key={execution.deviceId} size="small">
                     <div className="flex items-center gap-4">
-                      <div className="w-8">{getStatusIcon(exec.status)}</div>
+                      <div className="w-8">{getStatusIcon(execution.status)}</div>
                       <div className="flex-1">
-                        <div className="flex items-center gap-2 mb-2">
-                          <span className="font-medium">{devices[exec.deviceId]?.device_name || exec.deviceId}</span>
-                          <Tag>{exec.deviceId}</Tag>
-                          <Tag
-                            color={
-                              exec.status === 'completed'
-                                ? 'success'
-                                : exec.status === 'failed'
-                                ? 'error'
-                                : exec.status === 'running'
-                                ? 'processing'
-                                : 'default'
-                            }
-                          >
-                            {getStatusText(exec.status)}
+                        <div className="flex items-center gap-2 mb-2 flex-wrap">
+                          <span className="font-medium">
+                            {devices[execution.deviceId]?.device_name || execution.deviceId}
+                          </span>
+                          <Tag>{execution.deviceId}</Tag>
+                          <Tag color={getStatusTagColor(execution.status)}>
+                            {getStatusText(execution.status)}
                           </Tag>
+                          {execution.taskId && (
+                            <Tag color="geekblue">taskId: {execution.taskId}</Tag>
+                          )}
                         </div>
                         <Progress
                           percent={progress}
                           size="small"
-                          status={
-                            exec.status === 'failed'
-                              ? 'exception'
-                              : exec.status === 'completed'
-                              ? 'success'
-                              : undefined
-                          }
+                          status={getExecutionProgressStatus(execution.status)}
                         />
-                        {exec.error && (
-                          <div className="text-xs text-red-500 mt-1">{exec.error}</div>
+                        {detailText && (
+                          <div
+                            className={`text-xs mt-1 ${execution.status === 'failed' ? 'text-red-500' : 'text-gray-500'}`}
+                          >
+                            {detailText}
+                          </div>
                         )}
                       </div>
-                      <div className="text-sm text-gray-500">
-                        {exec.taskId ? `${exec.currentStep} / ${exec.maxSteps} 步` : '-'}
+                      <div className="text-sm text-gray-500 text-right min-w-[120px]">
+                        <div>
+                          {getExecutionStepText(
+                            execution.status,
+                            execution.currentStep,
+                            execution.maxSteps,
+                            !!execution.taskId
+                          )}
+                        </div>
                       </div>
                     </div>
                   </Card>
                 );
               })}
 
-              {!isRunning && (
+              {canShowResetActions && (
                 <div className="flex justify-center gap-4 mt-6">
-                  <Button
-                    onClick={() => {
-                      // Reset and go back to step 0
-                      setStep(0);
-                      setSelectedDevices([]);
-                      setTaskConfig({ instruction: '', modePolicy: 'default', stopOnError: false });
-                    }}
-                  >
-                    重新选择设备
-                  </Button>
-                  <Button
-                    type="primary"
-                    icon={<PlusOutlined />}
-                    onClick={() => {
-                      // Reset and start new batch
-                      useBatchStore.getState().endBatchSession();
-                      setStep(0);
-                      setSelectedDevices([]);
-                      setTaskConfig({ instruction: '', modePolicy: 'default', stopOnError: false });
-                    }}
-                  >
+                  <Button onClick={resetBatchFlow}>重新选择设备</Button>
+                  <Button type="primary" icon={<PlusOutlined />} onClick={resetBatchFlow}>
                     新建批处理
                   </Button>
                 </div>

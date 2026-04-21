@@ -3,6 +3,23 @@ import type { Device, DeviceStatus } from '../types';
 import { deviceApi } from '../services/api';
 import { deviceStoreLogger } from '../hooks/useLogger';
 
+function mergeDeviceState(existing: Device | undefined, incoming: Partial<Device> & Pick<Device, 'device_id'>): Device {
+  const merged = {
+    ...existing,
+    ...incoming,
+  } as Device;
+
+  if (incoming.current_task_id === undefined && existing?.current_task_id !== undefined) {
+    merged.current_task_id = existing.current_task_id;
+  }
+
+  if (incoming.status === 'idle' && merged.current_task_id) {
+    merged.current_task_id = undefined;
+  }
+
+  return merged;
+}
+
 interface DeviceState {
   devices: Record<string, Device>;
   selectedDevices: Set<string>;
@@ -54,8 +71,9 @@ export const useDeviceStore = create<DeviceState>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const response = await deviceApi.list();
+      const currentDevices = get().devices;
       const devicesMap = response.devices.reduce((acc: Record<string, Device>, device: Device) => {
-        acc[device.device_id] = device;
+        acc[device.device_id] = mergeDeviceState(currentDevices[device.device_id], device);
         return acc;
       }, {});
       deviceStoreLogger.info('[fetchDevices] Devices fetched', { count: response.devices.length, devices: JSON.stringify(response.devices) });
@@ -78,22 +96,24 @@ export const useDeviceStore = create<DeviceState>((set, get) => ({
   updateDevice: (deviceId, data) => {
     const oldDevice = get().devices[deviceId];
     const oldStatus = oldDevice?.status;
-    const newStatus = data.status;
+    const nextDevice = mergeDeviceState(oldDevice, {
+      ...(oldDevice || { device_id: deviceId } as Device),
+      ...data,
+      device_id: deviceId,
+    });
+    const newStatus = nextDevice.status;
 
     deviceStoreLogger.info('[updateDevice] Device status changed', {
       deviceId,
       oldStatus,
       newStatus,
-      hasTask: !!data.current_task_id,
+      hasTask: !!nextDevice.current_task_id,
     });
 
     set((state) => ({
       devices: {
         ...state.devices,
-        [deviceId]: {
-          ...state.devices[deviceId],
-          ...data,
-        },
+        [deviceId]: nextDevice,
       },
     }));
   },

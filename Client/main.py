@@ -18,6 +18,7 @@ from src.network.http_client import HttpClient
 from src.polling.manager import PollingManager
 from src.polling.factory import PlatformType
 from src.adapters import ADBAdapter, HDCAdapter, WDAAdapter, DeviceAdapterBase
+from src.adapters.base import ActionResult
 from src.screenshot import ScreenshotManager, ScreenshotConfig
 from src.logging import ClientLogger, LogConfig
 from src.network.messages import (
@@ -270,9 +271,9 @@ class DistributedClient:
                 f"version={round_version}, action={action.get('action')}"
             )
 
-            version_key = f"{device_id}:{round_version}"
+            version_key = f"{device_id}:{task_id}:{round_version}"
 
-            # 幂等性检查：已执行的 version 直接返回 ack
+            # 幂等性检查：同一任务内已执行的 version 直接返回 ack（防止网络重试导致的重复）
             if version_key in self._executed_versions:
                 logger.info(
                     f"Duplicate action_cmd ignored: task_id={task_id}, device_id={device_id}, "
@@ -320,24 +321,21 @@ class DistributedClient:
 
             logger.info(f"[DEBUG] Step 1/4 - Starting action execution: task_id={task_id}, device_id={device_id}, step={step_number}, version={round_version}, action={action}")
 
-            # 执行 action
             adapter = self.device_adapters[device_id]
+            result, screenshot, screenshot_error = await self._execute_action_with_observe_capture(
+                adapter=adapter,
+                action=action,
+                task_id=task_id,
+                device_id=device_id,
+                step_number=step_number,
+                round_version=round_version,
+            )
 
-            try:
-                logger.info(f"[DEBUG] Step 2/4 - adapter.execute_action() starting...")
-                result = adapter.execute_action(action)
-                logger.info(f"[DEBUG] Step 2/4 - adapter.execute_action() DONE: result.success={result.success}, result.message={result.message}")
-            except Exception as e:
-                logger.error(f"[DEBUG] Step 2/4 - adapter.execute_action() EXCEPTION: {e}")
-                raise
-
-            try:
-                logger.info(f"[DEBUG] Step 3/4 - adapter.get_screenshot() starting...")
-                screenshot = adapter.get_screenshot()
-                logger.info(f"[DEBUG] Step 3/4 - adapter.get_screenshot() DONE: has_screenshot={screenshot is not None}, size={len(screenshot) if screenshot else 0}")
-            except Exception as e:
-                logger.error(f"[DEBUG] Step 3/4 - adapter.get_screenshot() EXCEPTION: {e}")
-                raise
+            observe_payload = self._build_observe_payload(
+                result=result,
+                screenshot=screenshot,
+                screenshot_error=screenshot_error,
+            )
 
             # 发送 observe_result
             try:
@@ -346,10 +344,10 @@ class DistributedClient:
                     task_id=task_id,
                     device_id=device_id,
                     step_number=step_number,
-                    screenshot=base64.b64encode(screenshot).decode() if screenshot else None,
-                    result=str(result),
-                    success=result.success,
-                    error=None if result.success else result.message,
+                    screenshot=base64.b64encode(observe_payload["screenshot"]).decode() if observe_payload["screenshot"] else None,
+                    result=observe_payload["result"],
+                    success=observe_payload["success"],
+                    error=observe_payload["error"],
                     version=round_version,
                 )
                 logger.info(f"[DEBUG] Step 4/4 - send_observe_result() DONE")
@@ -359,36 +357,163 @@ class DistributedClient:
 
             logger.info(
                 f"Action execution finished: task_id={task_id}, device_id={device_id}, "
-                f"step={step_number}, version={round_version}, result={str(result)[:200]}"
+                f"step={step_number}, version={round_version}, result={observe_payload['result'][:200]}"
             )
 
         except Exception as e:
             logger.error(f"Failed to handle action_cmd: {e}")
 
-    async def _handle_request_screenshot(self, message: dict) -> None:
-        """处理 request_screenshot - 截取屏幕并发送 observe_result"""
+    async def _execute_action_with_observe_capture(
+        self,
+        adapter: DeviceAdapterBase,
+        action: dict,
+        task_id: str,
+        device_id: str,
+        step_number: int,
+        round_version: int,
+    ) -> tuple[ActionResult, Optional[bytes], Optional[str]]:
+        """Execute an action and capture screenshot best-effort for observe_result."""
         try:
-            device_id = message.get("device_id", "")
-            task_id = message.get("task_id", "")
+            logger.info(f"[DEBUG] Step 2/4 - adapter.execute_action() starting...")
+            result = adapter.execute_action(action)
+            logger.info(f"[DEBUG] Step 2/4 - adapter.execute_action() DONE: result.success={result.success}, result.message={result.message}")
+        except Exception as e:
+            logger.error(f"[DEBUG] Step 2/4 - adapter.execute_action() EXCEPTION: {e}")
+            result = ActionResult(
+                success=False,
+                should_finish=False,
+                message=f"Action failed: {e}",
+            )
 
-            if device_id not in self.device_adapters:
-                logger.warning(f"Screenshot requested for unknown device: {device_id}")
-                return
+        # 等待1.5秒让界面稳定后再截图
+        logger.info(f"[DEBUG] Step 2.5/4 - Waiting 1.5s for UI to stabilize...")
+        await asyncio.sleep(1.5)
+        logger.info(f"[DEBUG] Step 2.5/4 - Wait complete")
 
-            adapter = self.device_adapters[device_id]
+        screenshot = None
+        screenshot_error = None
+        try:
+            logger.info(f"[DEBUG] Step 3/4 - adapter.get_screenshot() starting...")
             screenshot = adapter.get_screenshot()
+            logger.info(f"[DEBUG] Step 3/4 - adapter.get_screenshot() DONE: has_screenshot={screenshot is not None}, size={len(screenshot) if screenshot else 0}")
+        except Exception as e:
+            screenshot_error = str(e)
+            logger.error(f"[DEBUG] Step 3/4 - adapter.get_screenshot() EXCEPTION: {screenshot_error}")
+
+        return result, screenshot, screenshot_error
+
+    def _result_to_text(self, result: ActionResult) -> str:
+        """Convert ActionResult into a compact observe_result text."""
+        if result.message:
+            return result.message
+        return "Action succeeded" if result.success else "Action failed"
+
+    def _merge_result_error_text(self, base_text: str, extra_text: str) -> str:
+        """Append extra failure detail to an observe/result text string."""
+        if not base_text:
+            return extra_text
+        if extra_text in base_text:
+            return base_text
+        return f"{base_text}; {extra_text}"
+
+    def _build_observe_payload(
+        self,
+        result: ActionResult,
+        screenshot: Optional[bytes],
+        screenshot_error: Optional[str] = None,
+    ) -> dict:
+        """Build observe_result payload fields from action result and screenshot state."""
+        result_text = self._result_to_text(result)
+        error = None if result.success else result.message
+
+        if screenshot_error:
+            screenshot_note = f"Screenshot failed: {screenshot_error}"
+            result_text = self._merge_result_error_text(result_text, screenshot_note)
+            error = self._merge_result_error_text(error or "", screenshot_note)
+
+        return {
+            "screenshot": screenshot,
+            "result": result_text,
+            "success": result.success,
+            "error": error,
+        }
+
+
+    async def _handle_request_screenshot(self, message: dict) -> None:
+        """处理 request_screenshot - 先 ACK，再截取屏幕并发送 observe_result"""
+        payload = message.get("payload", {})
+        task_id = payload.get("task_id", "")
+        device_id = payload.get("device_id", "")
+        step_number = int(payload.get("step_number", 0) or 0)
+        phase = payload.get("phase", "observe")
+        purpose = payload.get("purpose", "bootstrap")
+        ref_msg_id = message.get("msg_id", "")
+
+        logger.info(
+            f"Received request_screenshot: task_id={task_id}, device_id={device_id}, "
+            f"step_number={step_number}, phase={phase}, purpose={purpose}, ref_msg_id={ref_msg_id}"
+        )
+
+        if device_id not in self.device_adapters:
+            logger.warning(
+                f"Screenshot requested for unknown device: task_id={task_id}, device_id={device_id}"
+            )
+            if ref_msg_id:
+                await self._send_ack(
+                    ref_msg_id=ref_msg_id,
+                    accepted=False,
+                    device_id=device_id,
+                    error="Device not found",
+                    error_code=AckErrorCode.DEVICE_OFFLINE.value,
+                )
+            return
+
+        if ref_msg_id:
+            await self._send_ack(
+                ref_msg_id=ref_msg_id,
+                accepted=True,
+                device_id=device_id,
+            )
+            logger.info(
+                f"Bootstrap screenshot ACK sent: task_id={task_id}, device_id={device_id}, ref_msg_id={ref_msg_id}"
+            )
+
+        try:
+            adapter = self.device_adapters[device_id]
+            loop = asyncio.get_running_loop()
+            logger.info(
+                f"Bootstrap screenshot capture started: task_id={task_id}, device_id={device_id}"
+            )
+            # Run blocking get_screenshot() in thread pool to avoid blocking the event loop
+            screenshot = await loop.run_in_executor(None, adapter.get_screenshot)
+            logger.info(
+                f"Bootstrap screenshot capture finished: task_id={task_id}, device_id={device_id}, has_screenshot={bool(screenshot)}"
+            )
 
             await self.send_observe_result(
                 task_id=task_id,
                 device_id=device_id,
-                step_number=0,
+                step_number=step_number,
                 screenshot=base64.b64encode(screenshot).decode() if screenshot else None,
                 result="screenshot_captured",
                 success=True,
             )
-            logger.info(f"Screenshot sent for device={device_id}, task={task_id}")
-        except Exception as e:
-            logger.error(f"Failed to handle request_screenshot: {e}")
+            logger.info(
+                f"Bootstrap screenshot sent successfully: task_id={task_id}, device_id={device_id}"
+            )
+        except Exception as exc:
+            logger.exception(
+                f"Failed to handle request_screenshot: task_id={task_id}, device_id={device_id}"
+            )
+            await self.send_observe_result(
+                task_id=task_id,
+                device_id=device_id,
+                step_number=step_number,
+                screenshot=None,
+                result=f"screenshot_capture_failed: {exc}",
+                success=False,
+                error=str(exc),
+            )
 
     # === 消息发送 ===
 

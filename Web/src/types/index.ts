@@ -49,6 +49,34 @@ export interface ChatMessage {
   errorType?: string;
   isProgressMessage?: boolean;
   isCompleted?: boolean;
+  isTransportProgress?: boolean;
+  observeErrorDecision?: ObserveErrorDecisionPayload;
+  isObserveErrorDecisionCard?: boolean;
+  observeErrorDecisionResolved?: boolean;
+}
+
+export type ObserveDecisionState = 'idle' | 'pending' | 'submitting';
+export type AgentStageNodeStatus = 'pending' | 'active' | 'done' | 'error';
+export type AgentStageNodeKey = 'reason' | 'action' | 'dispatch' | 'wait_ack' | 'wait_observe' | 'observe';
+
+export interface AgentStageChainNode {
+  key: AgentStageNodeKey;
+  label: string;
+  status: AgentStageNodeStatus;
+  rawStage?: string;
+}
+
+export interface AgentStageChain {
+  stepNumber: number | null;
+  rawStage: string | null;
+  nodes: AgentStageChainNode[];
+}
+
+export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'interrupted' | 'waiting_confirmation';
+
+export interface AgentTaskConfig {
+  max_steps?: number;
+  max_observe_error_retries?: number;
 }
 
 // 历史步骤类型（兼容旧格式）
@@ -97,6 +125,19 @@ export interface PendingAction {
   isMaxStepsPrompt?: boolean; // 是否为 max_steps 到达时的询问
 }
 
+export interface ObserveErrorDecisionPayload {
+  task_id: string;
+  device_id: string;
+  message: string;
+  consecutive_count: number;
+  max_retries: number;
+  step_number: number;
+  error_type?: string;
+  stage?: string;
+  message_id?: string;
+  created_at?: string;
+}
+
 // Log Types
 export type LogLevel = 'info' | 'success' | 'warning' | 'error';
 export type LogSource = 'chat_history' | 'react_records' | 'device_logs' | 'artifacts' | 'imported';
@@ -130,8 +171,6 @@ export interface DeviceArtifacts {
 }
 
 // Task Types
-export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'interrupted';
-
 export interface Task {
   id: string;
   task_id: string;

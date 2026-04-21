@@ -41,15 +41,33 @@ router = APIRouter(prefix="/api/v1", tags=["device_sessions"])
 
 
 def _build_chat_message_response(message: dict):
+    progress_message = message.get("progress_message", message.get("message"))
+    content = message.get("content")
+    if content is None:
+        content = progress_message or message.get("result") or message.get("error") or ""
+
     return {
         "id": message.get("id", ""),
         "role": message.get("role", ""),
-        "content": message.get("content", ""),
+        "content": content,
         "thinking": message.get("thinking"),
         "action_type": message.get("action_type"),
         "action_params": message.get("action_params"),
         "screenshot_path": message.get("screenshot_path"),
         "created_at": message.get("created_at"),
+        "task_id": message.get("task_id"),
+        "step_number": message.get("step_number"),
+        "phase": message.get("phase"),
+        "stage": message.get("stage"),
+        "progress_status_text": message.get("progress_status_text"),
+        "progress_message": progress_message,
+        "result": message.get("result"),
+        "success": message.get("success"),
+        "error": message.get("error"),
+        "error_type": message.get("error_type"),
+        "version": message.get("version"),
+        "error_code": message.get("error_code"),
+        "data": message.get("data"),
     }
 
 
@@ -129,9 +147,10 @@ async def handle_observe_result_http(message: dict, db: Session) -> dict:
             error=error,
         )
 
-    # Let action router handle the observe result
+    # Let action router handle the observe result, except bootstrap screenshots
     handled = False
-    if action_router and round_version is not None and device_id:
+    is_bootstrap_observe = step_number == 0
+    if action_router and round_version is not None and device_id and not is_bootstrap_observe:
         handled = await action_router.handle_observe_result(
             {
                 **payload,
@@ -175,9 +194,14 @@ async def get_device_task_session(
             instruction=active_task.instruction,
             current_step=active_task.current_step,
             max_steps=active_task.max_steps,
+            max_observe_error_retries=active_task.max_observe_error_retries,
+            consecutive_observe_error_count=active_task.consecutive_observe_error_count,
+            awaiting_observe_error_decision=active_task.is_waiting_observe_error_decision(),
+            pending_observe_error_message=active_task.get_latest_error_reason(),
+            pending_observe_error_prompt=active_task.get_observe_error_prompt_payload(),
             latest_screenshot=latest_screenshot,
             interruptible=True,
-            latest_error_reason=None,
+            latest_error_reason=active_task.get_latest_error_reason(),
             chat_history=[_build_chat_message_response(msg) for msg in chat_history[-50:]],
         )
 
@@ -189,6 +213,11 @@ async def get_device_task_session(
         instruction=None,
         current_step=0,
         max_steps=0,
+        max_observe_error_retries=0,
+        consecutive_observe_error_count=0,
+        awaiting_observe_error_decision=False,
+        pending_observe_error_message=None,
+        pending_observe_error_prompt=None,
         latest_screenshot=None,
         interruptible=False,
         latest_error_reason=None,
@@ -239,6 +268,19 @@ async def add_chat_message(
         "action_params": payload.get("action_params"),
         "screenshot_path": payload.get("screenshot_path"),
         "created_at": datetime.now().isoformat(),
+        "task_id": payload.get("task_id"),
+        "step_number": payload.get("step_number"),
+        "phase": payload.get("phase"),
+        "stage": payload.get("stage"),
+        "progress_status_text": payload.get("progress_status_text"),
+        "progress_message": payload.get("progress_message", payload.get("message")),
+        "result": payload.get("result"),
+        "success": payload.get("success"),
+        "error": payload.get("error"),
+        "error_type": payload.get("error_type"),
+        "version": payload.get("version"),
+        "error_code": payload.get("error_code"),
+        "data": payload.get("data"),
     }
 
     file_storage.append_chat_message(device_id, message)

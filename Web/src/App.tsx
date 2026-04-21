@@ -15,7 +15,7 @@ const { Content } = Layout;
 
 const App: React.FC = () => {
   const { viewMode, theme: currentTheme } = useAppStore();
-  const { initSession, currentDeviceId } = useAgentStore();
+  const { initSession, currentDeviceId, endSession } = useAgentStore();
   const { fetchDevices } = useDeviceStore();
 
   const [agentWindowVisible, setAgentWindowVisible] = useState(false);
@@ -88,6 +88,11 @@ const App: React.FC = () => {
     setLogPanelVisible(true);
   };
 
+  const handleCloseAgentWindow = () => {
+    endSession();
+    setAgentWindowVisible(false);
+  };
+
   const renderContent = () => {
     switch (viewMode) {
       case 'monitor':
@@ -112,6 +117,21 @@ const App: React.FC = () => {
                     }
                   }}
                 />
+              </div>
+            </div>
+            <DeviceList
+              onAgentClick={handleAgentClick}
+              onLogClick={handleLogClick}
+            />
+          </div>
+        );
+      case 'agent':
+        return (
+          <div className="p-6">
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h1 className="text-2xl font-bold m-0">Agent 控制</h1>
+                <p className="text-sm text-gray-500 mt-2 mb-0">选择设备后打开 Agent 会话窗口。</p>
               </div>
             </div>
             <DeviceList
@@ -157,7 +177,7 @@ const App: React.FC = () => {
       {/* Agent Window Modal */}
       <Modal
         open={agentWindowVisible}
-        onCancel={() => setAgentWindowVisible(false)}
+        onCancel={handleCloseAgentWindow}
         footer={null}
         width="90vw"
         style={{ top: 20 }}
@@ -167,7 +187,7 @@ const App: React.FC = () => {
       >
         <AgentWindow
           deviceId={currentDeviceId || ''}
-          onClose={() => setAgentWindowVisible(false)}
+          onClose={handleCloseAgentWindow}
         />
       </Modal>
 

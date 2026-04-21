@@ -1,5 +1,15 @@
 import { create } from 'zustand';
-import type { AgentStep, AgentMode, PendingAction, TaskStatus, ChatMessage, AgentAction } from '../types';
+import type {
+  AgentStep,
+  AgentMode,
+  PendingAction,
+  TaskStatus,
+  ChatMessage,
+  AgentAction,
+  ObserveDecisionState,
+  ObserveErrorDecisionPayload,
+  AgentStageChain,
+} from '../types';
 import { agentApi } from '../services/agentApi';
 import { wsConsoleApi, type WsConsoleMessage } from '../services/wsConsole';
 import { useDeviceStore } from './deviceStore';
@@ -7,7 +17,42 @@ import { agentStoreLogger } from '../hooks/useLogger';
 
 const MAX_MEMORY_ROUNDS = 10; // 最大记忆轮数
 
+function normalizeObserveErrorDecisionPayload(value: any): ObserveErrorDecisionPayload | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  if (!value.task_id || !value.device_id || typeof value.message !== 'string') {
+    return null;
+  }
+
+  return {
+    task_id: String(value.task_id),
+    device_id: String(value.device_id),
+    message: value.message,
+    consecutive_count: Number(value.consecutive_count ?? 0),
+    max_retries: Number(value.max_retries ?? 0),
+    step_number: Number(value.step_number ?? 0),
+    error_type: typeof value.error_type === 'string' ? value.error_type : undefined,
+    stage: typeof value.stage === 'string' ? value.stage : undefined,
+    message_id: typeof value.message_id === 'string' ? value.message_id : undefined,
+    created_at: typeof value.created_at === 'string' ? value.created_at : undefined,
+  };
+}
+
+function isObserveErrorDecisionStage(stage?: string): boolean {
+  return stage === 'observe_error_user_decision';
+}
+
+function isObserveErrorRetryResumedStage(stage?: string): boolean {
+  return stage === 'observe_error_retry_resumed';
+}
+
 function toConversationMessage(msg: Awaited<ReturnType<typeof agentApi.getChatHistory>>['messages'][number]): ChatMessage {
+  const observeErrorDecision = normalizeObserveErrorDecisionPayload(
+    msg.observe_error_decision ?? (isObserveErrorDecisionStage(msg.stage) ? msg.data : undefined),
+  );
+
   return {
     id: msg.id,
     role: msg.role as 'user' | 'agent',
@@ -30,12 +75,17 @@ function toConversationMessage(msg: Awaited<ReturnType<typeof agentApi.getChatHi
     success: msg.success,
     error: msg.error,
     errorType: msg.error_type,
+    observeErrorDecision: observeErrorDecision || undefined,
+    isObserveErrorDecisionCard: Boolean(observeErrorDecision),
+    observeErrorDecisionResolved: isObserveErrorRetryResumedStage(msg.stage),
     isProgressMessage: Boolean(msg.stage || msg.progress_message || msg.progress_status_text),
-    isCompleted: msg.success === false
-      ? true
-      : Boolean(msg.stage && ['observe_received', 'ack_timeout', 'observe_timeout', 'ack_rejected'].includes(msg.stage)),
+    isCompleted: isObserveErrorDecisionStage(msg.stage)
+      ? false
+      : msg.success === false
+        ? true
+        : Boolean(msg.stage && ['observe_received', 'ack_timeout', 'observe_timeout', 'ack_rejected', 'observe_error_retry_resumed'].includes(msg.stage)),
     progressKey: msg.task_id && msg.step_number != null && msg.stage
-      ? `${msg.task_id}:${msg.step_number}:${msg.stage}`
+      ? `${msg.task_id}:${msg.step_number}:${isReasonStage(msg.stage) ? 'reason' : msg.stage}`
       : undefined,
   };
 }
@@ -100,14 +150,233 @@ async function loadConversationHistoryFromAPI(deviceId: string, taskId?: string 
 }
 
 function normalizeStoreStatus(status?: string): TaskStatus {
-  if (status === 'completed' || status === 'failed' || status === 'interrupted' || status === 'running') {
+  if (
+    status === 'completed'
+    || status === 'failed'
+    || status === 'interrupted'
+    || status === 'running'
+    || status === 'waiting_confirmation'
+  ) {
     return status;
   }
   return 'pending';
 }
 
 function hasActiveBackendTask(taskId?: string | null, status?: string, canInterrupt?: boolean): boolean {
-  return Boolean(taskId) && (Boolean(canInterrupt) || status === 'pending' || status === 'running');
+  return Boolean(taskId) && (
+    Boolean(canInterrupt)
+    || status === 'pending'
+    || status === 'running'
+    || status === 'waiting_confirmation'
+  );
+}
+
+function deriveBackendTaskActive(taskId?: string | null, status?: string, canInterrupt?: boolean): boolean {
+  return hasActiveBackendTask(taskId, status, canInterrupt);
+}
+
+const AGENT_STAGE_CHAIN_TEMPLATE: AgentStageChain['nodes'] = [
+  { key: 'reason', label: 'Reason', status: 'pending' },
+  { key: 'action', label: 'Action', status: 'pending' },
+  { key: 'dispatch', label: 'Dispatch', status: 'pending' },
+  { key: 'wait_ack', label: 'Wait ACK', status: 'pending' },
+  { key: 'wait_observe', label: 'Wait Observe', status: 'pending' },
+  { key: 'observe', label: 'Observe', status: 'pending' },
+];
+
+const TRANSPORT_PROGRESS_STAGES = new Set([
+  'action_dispatched',
+  'waiting_ack',
+  'ack_received',
+  'waiting_observe',
+  'observe_received',
+  'ack_timeout',
+  'observe_timeout',
+  'ack_rejected',
+]);
+
+function cloneStageChainNodes(): AgentStageChain['nodes'] {
+  return AGENT_STAGE_CHAIN_TEMPLATE.map((node) => ({ ...node }));
+}
+
+function isTransportProgressStage(stage?: string | null): boolean {
+  return Boolean(stage && TRANSPORT_PROGRESS_STAGES.has(stage));
+}
+
+function markStageNodeRange(
+  nodes: AgentStageChain['nodes'],
+  endIndex: number,
+  status: 'done' | 'error',
+) {
+  for (let index = 0; index <= endIndex && index < nodes.length; index += 1) {
+    nodes[index] = {
+      ...nodes[index],
+      status,
+    };
+  }
+}
+
+function createDefaultStageChain(): AgentStageChain {
+  return {
+    stepNumber: null,
+    rawStage: null,
+    nodes: cloneStageChainNodes(),
+  };
+}
+
+function deriveStageChain(
+  stepNumber: number | null,
+  rawStage: string | null,
+  currentPhase: 'reason' | 'act' | 'observe' | null,
+  status?: string,
+): AgentStageChain {
+  const chain: AgentStageChain = {
+    stepNumber,
+    rawStage,
+    nodes: cloneStageChainNodes(),
+  };
+
+  const activateNode = (key: AgentStageChain['nodes'][number]['key']) => {
+    chain.nodes = chain.nodes.map((node) => (
+      node.key === key
+        ? { ...node, status: 'active', rawStage: rawStage || undefined }
+        : node
+    ));
+  };
+
+  const completeNode = (key: AgentStageChain['nodes'][number]['key']) => {
+    chain.nodes = chain.nodes.map((node) => (
+      node.key === key
+        ? { ...node, status: 'done', rawStage: rawStage || undefined }
+        : node
+    ));
+  };
+
+  switch (rawStage) {
+    case 'reason_start':
+    case 'reason_stream':
+    case 'reason':
+      activateNode('reason');
+      return chain;
+    case 'reason_complete':
+      completeNode('reason');
+      activateNode('action');
+      return chain;
+    case 'action_dispatched':
+      markStageNodeRange(chain.nodes, 1, 'done');
+      activateNode('dispatch');
+      return chain;
+    case 'waiting_ack':
+      markStageNodeRange(chain.nodes, 2, 'done');
+      activateNode('wait_ack');
+      return chain;
+    case 'ack_received':
+      markStageNodeRange(chain.nodes, 3, 'done');
+      activateNode('wait_observe');
+      return chain;
+    case 'waiting_observe':
+      markStageNodeRange(chain.nodes, 3, 'done');
+      activateNode('wait_observe');
+      return chain;
+    case 'observe_received':
+      markStageNodeRange(chain.nodes, 4, 'done');
+      activateNode('observe');
+      return chain;
+    case 'ack_timeout':
+    case 'ack_rejected':
+      markStageNodeRange(chain.nodes, 2, 'done');
+      chain.nodes[3] = { ...chain.nodes[3], status: 'error', rawStage: rawStage || undefined };
+      return chain;
+    case 'observe_timeout':
+      markStageNodeRange(chain.nodes, 4, 'done');
+      chain.nodes[5] = { ...chain.nodes[5], status: 'error', rawStage: rawStage || undefined };
+      return chain;
+    default:
+      break;
+  }
+
+  if (status === 'completed') {
+    chain.nodes = chain.nodes.map((node) => ({ ...node, status: 'done', rawStage: rawStage || undefined }));
+    return chain;
+  }
+
+  if (status === 'failed' || status === 'error' || status === 'interrupted') {
+    const fallbackIndex = currentPhase === 'observe' ? 5 : currentPhase === 'act' ? 2 : 0;
+    if (fallbackIndex > 0) {
+      markStageNodeRange(chain.nodes, fallbackIndex - 1, 'done');
+    }
+    chain.nodes[fallbackIndex] = { ...chain.nodes[fallbackIndex], status: 'error', rawStage: rawStage || undefined };
+    return chain;
+  }
+
+  if (currentPhase === 'observe') {
+    markStageNodeRange(chain.nodes, 4, 'done');
+    activateNode('observe');
+  } else if (currentPhase === 'act') {
+    markStageNodeRange(chain.nodes, 1, 'done');
+    activateNode('dispatch');
+  } else if (currentPhase === 'reason') {
+    activateNode('reason');
+  }
+
+  return chain;
+}
+
+function buildDerivedAgentStatePatch(
+  patch: Partial<Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>>,
+  base: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+): Pick<AgentState, 'isBackendTaskActive' | 'stageChain'> {
+  const currentTaskId = patch.currentTaskId !== undefined ? patch.currentTaskId : base.currentTaskId;
+  const status = patch.status !== undefined ? patch.status : base.status;
+  const canInterrupt = patch.canInterrupt !== undefined ? patch.canInterrupt : base.canInterrupt;
+  const currentStepNum = patch.currentStepNum !== undefined ? patch.currentStepNum : base.currentStepNum;
+  const currentPhase = patch.currentPhase !== undefined ? patch.currentPhase : base.currentPhase;
+  const isBackendTaskActive = deriveBackendTaskActive(currentTaskId, status, canInterrupt);
+
+  return {
+    isBackendTaskActive,
+    stageChain: isBackendTaskActive
+      ? deriveStageChain(currentStepNum, null, currentPhase, status)
+      : createDefaultStageChain(),
+  };
+}
+
+function buildStatePatch(
+  patch: Partial<AgentState>,
+  base: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+): Partial<AgentState> {
+  const derived = buildDerivedAgentStatePatch(patch, base);
+  return {
+    ...derived,
+    ...patch,
+    isBackendTaskActive: derived.isBackendTaskActive,
+  };
+}
+
+function buildStatePatchFromCurrent(state: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>, patch: Partial<AgentState>): Partial<AgentState> {
+  return buildStatePatch(patch, state);
+}
+
+function buildStageChainPatchFromProgress(message: WsConsoleMessage) {
+  return {
+    stageChain: deriveStageChain(
+      normalizeProgressStepNumber(message),
+      normalizeProgressStage(message),
+      normalizeProgressPhase(message),
+      undefined,
+    ),
+  };
+}
+
+function buildStageChainPatchFromStatus(message: WsConsoleMessage, currentStepNum: number, currentPhase: 'reason' | 'act' | 'observe' | null) {
+  return {
+    stageChain: deriveStageChain(
+      currentStepNum,
+      null,
+      currentPhase,
+      message.status,
+    ),
+  };
 }
 
 function buildHistoryFromSnapshot(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>): AgentStep[] {
@@ -166,9 +435,659 @@ function getProgressStatusText(stage?: string): string {
       return '初始截图请求';
     case 'initial_screenshot_received':
       return '已获取到初始截图';
+    case 'observe_error_user_decision':
+      return '等待用户决策';
+    case 'observe_error_retry_resumed':
+      return '已继续重试';
     default:
       return stage || '进行中';
   }
+}
+
+function markObserveErrorDecisionResolved(history: ChatMessage[], taskId?: string | null, messageId?: string): ChatMessage[] {
+  return history.map((item) => {
+    const shouldResolve = messageId
+      ? item.id === messageId
+      : Boolean(item.isObserveErrorDecisionCard && item.taskId && taskId && item.taskId === taskId && !item.observeErrorDecisionResolved);
+
+    if (!shouldResolve) {
+      return item;
+    }
+
+    return {
+      ...item,
+      observeErrorDecisionResolved: true,
+      isCompleted: true,
+      progressStatusText: item.progressStatusText || '已处理',
+    };
+  });
+}
+
+function getPendingObserveErrorDecisionFromConversation(messages: ChatMessage[]): ObserveErrorDecisionPayload | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.isObserveErrorDecisionCard && !message.observeErrorDecisionResolved && message.observeErrorDecision) {
+      return message.observeErrorDecision;
+    }
+  }
+  return null;
+}
+
+function getObserveDecisionStateFromConversation(messages: ChatMessage[]): ObserveDecisionState {
+  return getPendingObserveErrorDecisionFromConversation(messages) ? 'pending' : 'idle';
+}
+
+function buildObserveErrorDecisionAppliedMessage(message: WsConsoleMessage): string {
+  if (message.success === false) {
+    return message.message || '提交 Observe 错误决策失败';
+  }
+  return message.decision === 'interrupt'
+    ? '已提交中断任务请求'
+    : '已提交继续任务请求，等待下一轮推理';
+}
+
+function buildObserveErrorDecisionAppliedBubble(message: WsConsoleMessage): ChatMessage {
+  return {
+    id: generateId(),
+    role: 'agent',
+    content: buildObserveErrorDecisionAppliedMessage(message),
+    timestamp: new Date().toISOString(),
+    taskId: message.task_id,
+    success: message.success !== false,
+    error: message.success === false ? buildObserveErrorDecisionAppliedMessage(message) : undefined,
+    isCompleted: true,
+  };
+}
+
+function normalizeProgressDecisionPayload(message: WsConsoleMessage): ObserveErrorDecisionPayload | null {
+  return normalizeObserveErrorDecisionPayload(message.observe_error_decision ?? message.data);
+}
+
+function isWaitingConfirmationStatus(status?: string): boolean {
+  return status === 'waiting_confirmation';
+}
+
+function clearObserveDecisionSubmissionState() {
+  return {
+    observeDecisionState: 'idle' as const,
+    pendingObserveErrorDecision: null,
+  };
+}
+
+function buildObserveDecisionStatePatchFromHistory(history: ChatMessage[]) {
+  return {
+    observeDecisionState: getObserveDecisionStateFromConversation(history),
+    pendingObserveErrorDecision: getPendingObserveErrorDecisionFromConversation(history),
+  };
+}
+
+function buildObserveDecisionStatePatchFromProgress(message: WsConsoleMessage) {
+  const payload = normalizeProgressDecisionPayload(message);
+  if (isObserveErrorDecisionStage(message.stage) && payload) {
+    return {
+      observeDecisionState: 'pending' as const,
+      pendingObserveErrorDecision: payload,
+      status: 'waiting_confirmation' as const,
+      isRunning: true,
+      canInterrupt: true,
+    };
+  }
+
+  if (isObserveErrorRetryResumedStage(message.stage)) {
+    return {
+      observeDecisionState: 'idle' as const,
+      pendingObserveErrorDecision: null,
+      status: 'running' as const,
+      isRunning: true,
+    };
+  }
+
+  return {};
+}
+
+function buildObserveDecisionStatePatchFromStatus(message: WsConsoleMessage) {
+  if (isWaitingConfirmationStatus(message.status)) {
+    return {
+      observeDecisionState: 'pending' as const,
+      status: 'waiting_confirmation' as const,
+      isRunning: true,
+    };
+  }
+
+  if (isTerminalAgentStatus(message.status) || isRunningStatus(message.status) || isPendingStatus(message.status)) {
+    return clearObserveDecisionSubmissionState();
+  }
+
+  return {};
+}
+
+function normalizeStatusTaskIdSafe(message: WsConsoleMessage): string | null {
+  return normalizeStatusTaskId(message);
+}
+
+function normalizeStatusWaitingConfirmationPatch(message: WsConsoleMessage, currentTaskId: string | null) {
+  return {
+    isRunning: true,
+    status: 'waiting_confirmation' as const,
+    currentTaskId: updateCurrentTaskIdFromMessage(normalizeStatusTaskIdSafe(message), currentTaskId),
+    canInterrupt: Boolean(normalizeStatusTaskIdSafe(message) || currentTaskId),
+    canResume: false,
+  };
+}
+
+function clearObserveDecisionHistoryState(history: ChatMessage[], taskId: string | null, messageId?: string): ChatMessage[] {
+  return markObserveErrorDecisionResolved(history, taskId, messageId);
+}
+
+function buildObserveErrorDecisionUserMessage(decision: 'continue' | 'interrupt', advice?: string): string {
+  if (decision === 'interrupt') {
+    return '用户选择中断任务';
+  }
+  return advice ? `用户选择继续任务，并给出建议：${advice}` : '用户选择继续任务';
+}
+
+function isObserveDecisionAppliedSuccess(message: WsConsoleMessage): boolean {
+  return message.success !== false;
+}
+
+function buildObserveDecisionCardStateFromSnapshot(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, history: ChatMessage[]) {
+  const restored = snapshot.pending_observe_error_prompt || getPendingObserveErrorDecisionFromConversation(history);
+  return {
+    observeDecisionState: snapshot.awaiting_observe_error_decision ? 'pending' as const : getObserveDecisionStateFromConversation(history),
+    pendingObserveErrorDecision: snapshot.awaiting_observe_error_decision ? restored : getPendingObserveErrorDecisionFromConversation(history),
+  };
+}
+
+function normalizeObserveDecisionCardMessage(payload: ObserveErrorDecisionPayload): ChatMessage {
+  return {
+    id: payload.message_id || generateId(),
+    role: 'agent',
+    content: payload.message,
+    timestamp: payload.created_at || new Date().toISOString(),
+    taskId: payload.task_id,
+    stepNumber: payload.step_number,
+    progressPhase: 'observe',
+    progressStage: 'observe_error_user_decision',
+    progressMessage: payload.message,
+    progressStatusText: '等待用户决策',
+    error: payload.message,
+    errorType: payload.error_type,
+    success: false,
+    observeErrorDecision: payload,
+    isObserveErrorDecisionCard: true,
+    observeErrorDecisionResolved: false,
+    isProgressMessage: true,
+    isCompleted: false,
+    progressKey: `${payload.task_id}:${payload.step_number}:observe_error_user_decision`,
+  };
+}
+
+function ensureObserveDecisionCard(history: ChatMessage[], payload: ObserveErrorDecisionPayload | null): ChatMessage[] {
+  if (!payload) {
+    return history;
+  }
+
+  const existing = history.find((item) => item.id === payload.message_id || (item.isObserveErrorDecisionCard && item.taskId === payload.task_id && item.stepNumber === payload.step_number && !item.observeErrorDecisionResolved));
+  if (existing) {
+    return history.map((item) => item === existing ? mergeProgressMessage(item, normalizeObserveDecisionCardMessage(payload)) : item);
+  }
+
+  return [...history, normalizeObserveDecisionCardMessage(payload)];
+}
+
+function normalizeConversationAfterSnapshot(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, restoredHistory: ChatMessage[]): ChatMessage[] {
+  return ensureObserveDecisionCard(restoredHistory, snapshot.awaiting_observe_error_decision ? snapshot.pending_observe_error_prompt : null);
+}
+
+function normalizeConversationForDisplay(history: ChatMessage[]): ChatMessage[] {
+  return history.filter((message) => !message.isTransportProgress);
+}
+
+function annotateTransportProgressMessage(message: ChatMessage): ChatMessage {
+  return {
+    ...message,
+    isTransportProgress: Boolean(message.isProgressMessage && isTransportProgressStage(message.progressStage)),
+  };
+}
+
+function buildConversationHistoryPatch(history: ChatMessage[]) {
+  const conversationHistory = history.map(annotateTransportProgressMessage);
+  return {
+    conversationHistory,
+    displayConversationHistory: normalizeConversationForDisplay(conversationHistory),
+  };
+}
+
+function getStageChainStepNumber(currentStepNum: number): number | null {
+  return currentStepNum > 0 ? currentStepNum : null;
+}
+
+function deriveCurrentPhaseFromConversation(messages: ChatMessage[]): 'reason' | 'act' | 'observe' | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (!message.isProgressMessage || message.isCompleted) {
+      continue;
+    }
+    return message.progressPhase || null;
+  }
+  return null;
+}
+
+function deriveStageChainFromConversation(messages: ChatMessage[], fallbackStepNum = 0, fallbackStatus?: string): AgentStageChain {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (!message.taskId || !message.isProgressMessage || message.isCompleted) {
+      continue;
+    }
+
+    return deriveStageChain(
+      message.stepNumber ?? getStageChainStepNumber(fallbackStepNum),
+      message.progressStage || null,
+      message.progressPhase || null,
+      fallbackStatus,
+    );
+  }
+
+  if (fallbackStatus === 'completed' || fallbackStatus === 'failed' || fallbackStatus === 'interrupted') {
+    return deriveStageChain(getStageChainStepNumber(fallbackStepNum), null, null, fallbackStatus);
+  }
+
+  return createDefaultStageChain();
+}
+
+function deriveStageChainFromSnapshot(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, history: ChatMessage[]): AgentStageChain {
+  if (!hasActiveBackendTask(snapshot.task_id, snapshot.status, snapshot.can_interrupt)) {
+    return createDefaultStageChain();
+  }
+
+  const fromHistory = deriveStageChainFromConversation(history, snapshot.current_step, snapshot.status);
+  if (fromHistory.rawStage || fromHistory.stepNumber !== null) {
+    return fromHistory;
+  }
+
+  return deriveStageChain(
+    getStageChainStepNumber(snapshot.current_step),
+    null,
+    deriveCurrentPhaseFromConversation(history),
+    snapshot.status,
+  );
+}
+
+function buildStatePatchWithConversation(
+  base: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+  patch: Partial<AgentState> & { conversationHistory?: ChatMessage[] },
+): Partial<AgentState> {
+  const conversationPatch = patch.conversationHistory
+    ? buildConversationHistoryPatch(patch.conversationHistory)
+    : {};
+  return buildStatePatch({ ...patch, ...conversationPatch }, base);
+}
+
+function buildStatePatchForProgressMessage(
+  state: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+  patch: Partial<AgentState>,
+  message: WsConsoleMessage,
+): Partial<AgentState> {
+  return buildStatePatch({
+    ...patch,
+    stageChain: deriveStageChain(
+      normalizeProgressStepNumber(message),
+      normalizeProgressStage(message),
+      normalizeProgressPhase(message),
+      patch.status ?? state.status,
+    ),
+  }, state);
+}
+
+function buildStatePatchForStatusMessage(
+  state: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+  patch: Partial<AgentState>,
+  message: WsConsoleMessage,
+): Partial<AgentState> {
+  return buildStatePatch({
+    ...patch,
+    stageChain: deriveStageChain(
+      getStageChainStepNumber(state.currentStepNum),
+      null,
+      patch.currentPhase ?? state.currentPhase,
+      message.status,
+    ),
+  }, state);
+}
+
+function buildStatePatchForSnapshot(
+  patch: Partial<AgentState>,
+  snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>,
+  history: ChatMessage[],
+): Partial<AgentState> {
+  const currentPhase = deriveCurrentPhaseFromConversation(history);
+  return {
+    ...buildStatePatch({
+      ...patch,
+      currentPhase,
+    }, {
+      currentTaskId: snapshot.task_id,
+      status: normalizeStoreStatus(snapshot.status),
+      canInterrupt: snapshot.can_interrupt,
+      currentStepNum: snapshot.current_step,
+      currentPhase,
+    }),
+    stageChain: deriveStageChainFromSnapshot(snapshot, history),
+  };
+}
+
+function buildResetStatePatch(
+  base: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+  patch: Partial<AgentState>,
+): Partial<AgentState> {
+  return buildStatePatch({
+    ...patch,
+    stageChain: createDefaultStageChain(),
+  }, base);
+}
+
+function withTransportMetadata(message: ChatMessage): ChatMessage {
+  return annotateTransportProgressMessage(message);
+}
+
+function withTransportMetadataUpdates(message: Partial<ChatMessage>): Partial<ChatMessage> {
+  return message.progressStage
+    ? { ...message, isTransportProgress: isTransportProgressStage(message.progressStage) }
+    : message;
+}
+
+function buildCurrentPhaseAndStageChainPatch(history: ChatMessage[], fallbackStepNum = 0, fallbackStatus?: string) {
+  const currentPhase = deriveCurrentPhaseFromConversation(history);
+  return {
+    currentPhase,
+    stageChain: deriveStageChainFromConversation(history, fallbackStepNum, fallbackStatus),
+  };
+}
+
+function shouldCreateVisibleStepBubble(): boolean {
+  return true;
+}
+
+function shouldCreateVisibleStatusBubble(): boolean {
+  return true;
+}
+
+function shouldCreateVisibleProgressBubble(message: WsConsoleMessage): boolean {
+  return !isTransportProgressStage(normalizeProgressStage(message));
+}
+
+function buildDerivedFlagsPatch(taskId?: string | null, status?: string, canInterrupt?: boolean) {
+  return {
+    isBackendTaskActive: deriveBackendTaskActive(taskId, status, canInterrupt),
+  };
+}
+
+function buildSnapshotDerivedPatch(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, history: ChatMessage[]) {
+  return {
+    ...buildDerivedFlagsPatch(snapshot.task_id, normalizeStoreStatus(snapshot.status), snapshot.can_interrupt),
+    ...buildCurrentPhaseAndStageChainPatch(history, snapshot.current_step, snapshot.status),
+  };
+}
+
+function buildConversationAndDerivedPatch(
+  state: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+  history: ChatMessage[],
+  extraPatch: Partial<AgentState> = {},
+): Partial<AgentState> {
+  return buildStatePatchWithConversation(state, {
+    ...extraPatch,
+    ...buildCurrentPhaseAndStageChainPatch(history, extraPatch.currentStepNum ?? state.currentStepNum, extraPatch.status ?? state.status),
+    conversationHistory: history,
+  });
+}
+
+function buildTaskCreatedDerivedStatePatch(
+  base: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+  patch: Partial<AgentState>,
+): Partial<AgentState> {
+  return buildStatePatch({
+    ...patch,
+    stageChain: createDefaultStageChain(),
+  }, base);
+}
+
+function buildBackendActivityStatePatch(taskId?: string | null, status?: string, canInterrupt?: boolean) {
+  return buildDerivedFlagsPatch(taskId, status, canInterrupt);
+}
+
+function buildVisibleConversationStatePatch(history: ChatMessage[]) {
+  return {
+    displayConversationHistory: normalizeConversationForDisplay(history),
+  };
+}
+
+function buildCurrentStageChainStatePatch(state: Pick<AgentState, 'currentStepNum' | 'currentPhase' | 'status'>) {
+  return {
+    stageChain: deriveStageChain(getStageChainStepNumber(state.currentStepNum), null, state.currentPhase, state.status),
+  };
+}
+
+function buildSnapshotConversationStatePatch(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, history: ChatMessage[]) {
+  return {
+    ...buildConversationHistoryPatch(history),
+    ...buildSnapshotDerivedPatch(snapshot, history),
+  };
+}
+
+function buildIdleDerivedPatch() {
+  return {
+    isBackendTaskActive: false,
+    stageChain: createDefaultStageChain(),
+  };
+}
+
+function buildTransportAwareProgressMessage(message: WsConsoleMessage, progressKey: string): ChatMessage {
+  return withTransportMetadata(buildProgressBaseMessage(message, progressKey));
+}
+
+function buildTransportAwareStepMessage(message: WsConsoleMessage): ChatMessage {
+  return withTransportMetadata(buildStandaloneAgentStepMessage(message));
+}
+
+function buildTransportAwareStatusMessage(message: WsConsoleMessage): ChatMessage {
+  return withTransportMetadata(buildStandaloneStatusMessage(message));
+}
+
+function buildTransportAwareProgressUpdates(message: WsConsoleMessage): Partial<ChatMessage> {
+  return withTransportMetadataUpdates(buildProgressConversationUpdates(message));
+}
+
+function deriveDisplayConversationHistory(history: ChatMessage[]) {
+  return normalizeConversationForDisplay(history);
+}
+
+function buildDisplayConversationPatch(history: ChatMessage[]) {
+  return {
+    displayConversationHistory: deriveDisplayConversationHistory(history),
+  };
+}
+
+function buildActiveStageChainPatch(state: Pick<AgentState, 'currentStepNum' | 'currentPhase' | 'status'>) {
+  return buildCurrentStageChainStatePatch(state);
+}
+
+function buildBackendTruthPatch(taskId?: string | null, status?: string, canInterrupt?: boolean) {
+  return buildBackendActivityStatePatch(taskId, status, canInterrupt);
+}
+
+function buildHydratedHistoryPatch(history: ChatMessage[]) {
+  return buildConversationHistoryPatch(history);
+}
+
+function buildMessageVisibilityPatch(history: ChatMessage[]) {
+  return buildVisibleConversationStatePatch(history);
+}
+
+function buildSnapshotInitPatch(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, history: ChatMessage[]) {
+  return buildSnapshotConversationStatePatch(snapshot, history);
+}
+
+function buildTaskActiveDerivedPatch(taskId?: string | null, status?: string, canInterrupt?: boolean) {
+  return buildBackendTruthPatch(taskId, status, canInterrupt);
+}
+
+function buildDisplayDerivedPatch(history: ChatMessage[]) {
+  return buildDisplayConversationPatch(history);
+}
+
+function buildDerivedPatchFromConversation(history: ChatMessage[]) {
+  return buildConversationHistoryPatch(history);
+}
+
+function buildTaskCreatedVisibilityPatch(history: ChatMessage[]) {
+  return buildVisibleConversationStatePatch(history);
+}
+
+function buildSnapshotHydratedPatch(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, history: ChatMessage[]) {
+  return buildSnapshotInitPatch(snapshot, history);
+}
+
+function buildCurrentStageChainPatch(message: WsConsoleMessage) {
+  return {
+    stageChain: deriveStageChain(
+      normalizeProgressStepNumber(message),
+      normalizeProgressStage(message),
+      normalizeProgressPhase(message),
+      undefined,
+    ),
+  };
+}
+
+function buildDisplayHistoryPatch(history: ChatMessage[]) {
+  return buildVisibleConversationStatePatch(history);
+}
+
+function buildConversationUIStatePatch(history: ChatMessage[]) {
+  return buildDisplayHistoryPatch(history);
+}
+
+function buildConversationFilterStatePatch(history: ChatMessage[]) {
+  return buildVisibleConversationStatePatch(history);
+}
+
+function buildSnapshotUIStatePatch(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, history: ChatMessage[]) {
+  return buildSnapshotHydratedPatch(snapshot, history);
+}
+
+function buildBackendActivityPatch(taskId?: string | null, status?: string, canInterrupt?: boolean) {
+  return buildBackendActivityStatePatch(taskId, status, canInterrupt);
+}
+
+function buildDerivedResetPatch() {
+  return buildIdleDerivedPatch();
+}
+
+function buildResetPatch(
+  base: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+  patch: Partial<AgentState>,
+) {
+  return buildResetStatePatch(base, patch);
+}
+
+function buildConversationVisibilityPatch(history: ChatMessage[]) {
+  return {
+    ...buildConversationHistoryPatch(history),
+    ...buildVisibleConversationStatePatch(history),
+  };
+}
+
+function buildActiveStatePatch(taskId?: string | null, status?: string, canInterrupt?: boolean) {
+  return buildBackendActivityStatePatch(taskId, status, canInterrupt);
+}
+
+function buildCurrentDerivedStatePatch(state: Pick<AgentState, 'currentStepNum' | 'currentPhase' | 'status'>) {
+  return buildActiveStageChainPatch(state);
+}
+
+function buildSnapshotRestorePatch(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, history: ChatMessage[]) {
+  return buildSnapshotInitPatch(snapshot, history);
+}
+
+function buildVisibleHistoryPatch(history: ChatMessage[]) {
+  return buildVisibleConversationStatePatch(history);
+}
+
+function buildTaskActivityPatch(taskId?: string | null, status?: string, canInterrupt?: boolean) {
+  return buildBackendActivityStatePatch(taskId, status, canInterrupt);
+}
+
+function buildFilteredConversationStatePatch(history: ChatMessage[]) {
+  return buildVisibleConversationStatePatch(history);
+}
+
+function buildActivityDerivedPatch(taskId?: string | null, status?: string, canInterrupt?: boolean) {
+  return buildBackendActivityStatePatch(taskId, status, canInterrupt);
+}
+
+function normalizeProgressStateWithObserveDecision(message: WsConsoleMessage, currentTaskId: string | null) {
+  return {
+    ...normalizeAgentProgressPatch(message, currentTaskId),
+    ...buildObserveDecisionStatePatchFromProgress(message),
+  };
+}
+
+function normalizeStatusStateWithObserveDecision(message: WsConsoleMessage, currentTaskId: string | null, canInterrupt: boolean) {
+  if (isWaitingConfirmationStatus(message.status)) {
+    return normalizeStatusWaitingConfirmationPatch(message, currentTaskId);
+  }
+  return {
+    ...normalizeAgentStatusPatch(message, currentTaskId, canInterrupt),
+    ...buildObserveDecisionStatePatchFromStatus(message),
+  };
+}
+
+function normalizeTaskCreatedObserveDecisionState() {
+  return clearObserveDecisionSubmissionState();
+}
+
+function normalizeSendCommandObserveDecisionState() {
+  return clearObserveDecisionSubmissionState();
+}
+
+function normalizeInterruptObserveDecisionState() {
+  return clearObserveDecisionSubmissionState();
+}
+
+function normalizeEndSessionObserveDecisionState() {
+  return clearObserveDecisionSubmissionState();
+}
+
+function normalizeInitObserveDecisionState(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, history: ChatMessage[]) {
+  return buildObserveDecisionCardStateFromSnapshot(snapshot, history);
+}
+
+function normalizeObserveDecisionStateAfterResolution(messageId?: string, taskId?: string | null) {
+  return {
+    messageId,
+    taskId: taskId || null,
+  };
+}
+
+function mergeProgressMessage(message: ChatMessage, updates: Partial<ChatMessage>): ChatMessage {
+  return {
+    ...message,
+    ...updates,
+    thinking: updates.thinking ?? message.thinking,
+    action: updates.action ?? message.action,
+    screenshot: updates.screenshot ?? message.screenshot,
+    result: updates.result ?? message.result,
+    error: updates.error ?? message.error,
+    errorType: updates.errorType ?? message.errorType,
+    progressStatusText: updates.progressStatusText ?? message.progressStatusText,
+    progressMessage: updates.progressMessage ?? message.progressMessage,
+    observeErrorDecision: updates.observeErrorDecision ?? message.observeErrorDecision,
+    isObserveErrorDecisionCard: updates.isObserveErrorDecisionCard ?? message.isObserveErrorDecisionCard,
+    observeErrorDecisionResolved: updates.observeErrorDecisionResolved ?? message.observeErrorDecisionResolved,
+  };
+}
+
+function isReasonStage(stage?: string | null): boolean {
+  return stage === 'reason_start' || stage === 'reason_stream' || stage === 'reason_complete' || stage === 'reason';
 }
 
 function getProgressContent(message: WsConsoleMessage): string {
@@ -215,20 +1134,6 @@ function buildStatusInterruptionMessage(statusMessage?: string, data?: Record<st
   return statusMessage || '任务被中断';
 }
 
-function mergeProgressMessage(message: ChatMessage, updates: Partial<ChatMessage>): ChatMessage {
-  return {
-    ...message,
-    ...updates,
-    thinking: updates.thinking ?? message.thinking,
-    action: updates.action ?? message.action,
-    screenshot: updates.screenshot ?? message.screenshot,
-    result: updates.result ?? message.result,
-    error: updates.error ?? message.error,
-    errorType: updates.errorType ?? message.errorType,
-    progressStatusText: updates.progressStatusText ?? message.progressStatusText,
-    progressMessage: updates.progressMessage ?? message.progressMessage,
-  };
-}
 
 function upsertConversationProgress(
   history: ChatMessage[],
@@ -425,9 +1330,6 @@ function buildAgentStepMessageContent(action?: Record<string, any>, result?: str
   return result || '步骤完成';
 }
 
-function buildProgressBubbleContent(message: WsConsoleMessage): string {
-  return getProgressContent(message);
-}
 
 function updateProgressTracking(
   map: Record<string, string>,
@@ -505,8 +1407,13 @@ function normalizeProgressKey(message: WsConsoleMessage): string | null {
   );
 }
 
+
 function shouldFinalizeProgressMessage(message: WsConsoleMessage): boolean {
   return shouldMarkProgressCompleted(message.stage);
+}
+
+function buildProgressBubbleContent(message: WsConsoleMessage): string {
+  return getProgressContent(message);
 }
 
 function normalizeProgressStatus(message: WsConsoleMessage): string {
@@ -583,6 +1490,8 @@ function markAllStepProgressCompleted(
     }
 
     return mergeProgressMessage(item, {
+      thinking: normalizeAgentStepThinking(message),
+      action: normalizeAgentStepAction(message),
       screenshot: normalizeAgentStepScreenshot(message),
       result: normalizeAgentStepResult(message),
       success: normalizeAgentStepSuccess(message),
@@ -846,8 +1755,8 @@ function shouldUpdateScreenshotFromMessage(message: WsConsoleMessage): boolean {
   return Boolean(message.screenshot);
 }
 
-function shouldUpdateDeviceBusyStatus(message: WsConsoleMessage): boolean {
-  return message.type === 'agent_progress' || message.type === 'agent_step';
+function shouldUpdateDeviceBusyStatus(_message: WsConsoleMessage): boolean {
+  return false;
 }
 
 function isTerminalAgentStatus(status?: string): boolean {
@@ -1240,11 +2149,11 @@ function normalizeSavedHistory(messages: ChatMessage[]): ChatMessage[] {
   return mergeSavedHistory(messages);
 }
 
-function shouldUpdateBusyStatusFromProgress(_message: WsConsoleMessage): boolean {
+function shouldUpdateBusyStatusFromProgress(): boolean {
   return true;
 }
 
-function shouldUpdateBusyStatusFromStep(_message: WsConsoleMessage): boolean {
+function shouldUpdateBusyStatusFromStep(): boolean {
   return true;
 }
 
@@ -1587,10 +2496,6 @@ function normalizeProgressKeyValue(message: WsConsoleMessage): string | null {
   return normalizeProgressKey(message);
 }
 
-/** Returns true for stages that are part of the reason phase and should share a single bubble. */
-function isReasonStage(stage?: string | null): boolean {
-  return stage === 'reason_start' || stage === 'reason_stream' || stage === 'reason_complete' || stage === 'reason';
-}
 
 function normalizeStepProgressKeyValue(message: WsConsoleMessage): string | null {
   return normalizeAgentStepProgressKey(message);
@@ -1677,12 +2582,13 @@ function normalizeAgentStepConversationState(
   state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
   message: WsConsoleMessage,
 ) {
-  const nextHistory = shouldUseExistingProgressMessage(state, message)
+  const usedProgressMessage = shouldUseExistingProgressMessage(state, message);
+  const nextHistory = usedProgressMessage
     ? markAllStepProgressCompleted(state.conversationHistory, message)
-    : state.conversationHistory;
+    : [...state.conversationHistory, buildStandaloneAgentStepMessage(message)];
 
   return {
-    conversationHistory: [...nextHistory, buildStandaloneAgentStepMessage(message)],
+    conversationHistory: nextHistory,
     progressMessageIds: removeStepProgressTracking(state.progressMessageIds, message),
   };
 }
@@ -3321,6 +4227,41 @@ export const agentStoreLegacyCompatRegistry = {
   normalizeAddMessageHistory,
   normalizeUpdateMessageHistory,
   normalizeForgetHistory,
+  buildStageChainPatchFromProgress,
+  buildStageChainPatchFromStatus,
+  buildStatePatchForProgressMessage,
+  buildStatePatchForStatusMessage,
+  buildStatePatchForSnapshot,
+  shouldCreateVisibleStepBubble,
+  shouldCreateVisibleStatusBubble,
+  shouldCreateVisibleProgressBubble,
+  buildTaskCreatedDerivedStatePatch,
+  buildTransportAwareProgressMessage,
+  buildTransportAwareStepMessage,
+  buildTransportAwareStatusMessage,
+  buildTransportAwareProgressUpdates,
+  buildHydratedHistoryPatch,
+  buildMessageVisibilityPatch,
+  buildTaskActiveDerivedPatch,
+  buildDisplayDerivedPatch,
+  buildDerivedPatchFromConversation,
+  buildTaskCreatedVisibilityPatch,
+  buildCurrentStageChainPatch,
+  buildConversationUIStatePatch,
+  buildConversationFilterStatePatch,
+  buildSnapshotUIStatePatch,
+  buildBackendActivityPatch,
+  buildDerivedResetPatch,
+  buildResetPatch,
+  buildConversationVisibilityPatch,
+  buildActiveStatePatch,
+  buildCurrentDerivedStatePatch,
+  buildSnapshotRestorePatch,
+  buildVisibleHistoryPatch,
+  buildTaskActivityPatch,
+  buildFilteredConversationStatePatch,
+  buildActivityDerivedPatch,
+  shouldUpdateBusyStatusFromProgress,
 };
 
 interface AgentState {
@@ -3346,12 +4287,14 @@ interface AgentState {
   currentStepNum: number;
   maxSteps: number;
   maxParseRetries: number; // 动作解析失败最大重试次数
+  maxObserveErrorRetries: number;
 
   // Error handling
   error: string | null;
 
   // 对话历史（气泡式对话）
   conversationHistory: ChatMessage[];
+  displayConversationHistory: ChatMessage[];
 
   // 实时截图
   currentScreenshot: string | null;
@@ -3366,21 +4309,30 @@ interface AgentState {
   waitingForConfirm: boolean;
   waitingConfirmPhase: 'reason' | 'act' | 'observe' | null;
 
+  // Observe error decision state
+  observeDecisionState: ObserveDecisionState;
+  pendingObserveErrorDecision: ObserveErrorDecisionPayload | null;
+
   // WebSocket console callback reference
   _wsCallback: ((msg: WsConsoleMessage) => void) | null;
 
   // Derived backend-truth flags
   canInterrupt: boolean;
   canResume: boolean;
+  isBackendTaskActive: boolean;
+  stageChain: AgentStageChain;
 
   // Actions
   initSession: (deviceId: string, mode?: AgentMode) => void;
   endSession: () => void;
   setMode: (mode: AgentMode) => void;
   setMaxParseRetries: (retries: number) => void;
+  setMaxObserveErrorRetries: (retries: number) => void;
 
   // Command - starts task (WS-driven, no polling)
   sendCommand: (command: string) => Promise<void>;
+  submitObserveErrorDecision: (decision: 'continue' | 'interrupt', advice?: string) => Promise<void>;
+  resolveObserveErrorDecisionCard: (messageId?: string) => void;
 
   // Step management
   appendStep: (step: AgentStep) => void;
@@ -3445,8 +4397,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   currentStepNum: 0,
   maxSteps: 100,
   maxParseRetries: 2,
+  maxObserveErrorRetries: 2,
   error: null,
   conversationHistory: [],
+  displayConversationHistory: [],
   currentScreenshot: null,
   currentApp: '未知',
   currentPhase: null,
@@ -3454,9 +4408,13 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   isThinking: false,
   waitingForConfirm: false,
   waitingConfirmPhase: null,
+  observeDecisionState: 'idle',
+  pendingObserveErrorDecision: null,
   _wsCallback: null,
   canInterrupt: false,
   canResume: false,
+  isBackendTaskActive: false,
+  stageChain: createDefaultStageChain(),
 
   initSession: async (deviceId, mode = 'normal') => {
     const wsCallback = useAgentStore.getState()._handleWsMessage;
@@ -3476,11 +4434,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         snapshot.chat_history.map(toConversationMessage),
         savedHistory,
       );
+      const hydratedHistory = normalizeConversationAfterSnapshot(snapshot, restoredHistory);
       const history = buildHistoryFromSnapshot(snapshot);
       const currentStep = getCurrentStepFromHistory(history);
       const normalizedStatus = normalizeStoreStatus(snapshot.status);
       const isRunning = hasActiveBackendTask(snapshot.task_id, snapshot.status, snapshot.can_interrupt);
-      const transientState = transientStateFromConversation(restoredHistory);
+      const transientState = transientStateFromConversation(hydratedHistory);
 
       set({
         currentDeviceId: deviceId,
@@ -3496,15 +4455,17 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         status: normalizedStatus,
         currentStepNum: snapshot.current_step,
         maxSteps: snapshot.max_steps,
+        maxObserveErrorRetries: snapshot.max_observe_error_retries ?? 2,
         error: null,
-        conversationHistory: restoredHistory,
-        currentScreenshot: snapshot.current_screenshot || latestScreenshotFromConversation(restoredHistory),
+        ...buildSnapshotConversationStatePatch(snapshot, hydratedHistory),
+        currentScreenshot: snapshot.current_screenshot || latestScreenshotFromConversation(hydratedHistory),
         currentApp: snapshot.current_app || '未知',
         waitingForConfirm: false,
         waitingConfirmPhase: null,
         canInterrupt: snapshot.can_interrupt,
         canResume: snapshot.can_resume,
-        progressMessageIds: progressTrackingFromConversation(restoredHistory),
+        progressMessageIds: progressTrackingFromConversation(hydratedHistory),
+        ...normalizeInitObserveDecisionState(snapshot, hydratedHistory),
         ...transientState,
       });
     } catch (error: any) {
@@ -3525,6 +4486,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         maxSteps: 100,
         error: error.message || 'Failed to initialize session',
         conversationHistory: [],
+        displayConversationHistory: [],
         currentScreenshot: null,
         currentApp: '未知',
         currentPhase: null,
@@ -3532,8 +4494,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         isThinking: false,
         waitingForConfirm: false,
         waitingConfirmPhase: null,
+        maxObserveErrorRetries: 2,
+        ...normalizeEndSessionObserveDecisionState(),
         canInterrupt: false,
         canResume: false,
+        isBackendTaskActive: false,
+        stageChain: createDefaultStageChain(),
         progressMessageIds: normalizeResetProgressTracking(),
       });
     }
@@ -3565,6 +4531,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       status: 'pending',
       history: [],
       conversationHistory: [],
+      displayConversationHistory: [],
       currentScreenshot: null,
       currentApp: '未知',
       currentPhase: null,
@@ -3574,6 +4541,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       waitingConfirmPhase: null,
       canInterrupt: false,
       canResume: false,
+      isBackendTaskActive: false,
+      stageChain: createDefaultStageChain(),
       progressMessageIds: normalizeResetProgressTracking(),
     });
   },
@@ -3584,6 +4553,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
   setMaxParseRetries: (retries) => {
     set({ maxParseRetries: retries });
+  },
+
+  setMaxObserveErrorRetries: (retries) => {
+    set({ maxObserveErrorRetries: retries });
   },
 
   // WebSocket message handler
@@ -3659,7 +4632,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             taskId: message.task_id,
             deviceId: message.device_id,
           });
-          set({
+          set((currentState) => buildStatePatchFromCurrent(currentState, {
             currentTaskId: message.task_id,
             isRunning: true,
             status: 'running',
@@ -3671,7 +4644,42 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             canInterrupt: true,
             canResume: false,
             progressMessageIds: normalizeTaskCreatedProgressState(),
+            ...normalizeTaskCreatedObserveDecisionState(),
             ...normalizeStatusStateReset(),
+          }));
+        }
+        break;
+
+      case 'observe_error_decision_applied':
+        if (message.device_id === deviceId) {
+          const pendingDecision = state.pendingObserveErrorDecision;
+          const taskId = pendingDecision?.task_id || state.currentTaskId;
+          const decisionCardMessageId = pendingDecision?.message_id;
+          const appliedBubble = buildObserveErrorDecisionAppliedBubble({
+            ...message,
+            task_id: taskId || undefined,
+          });
+          const appliedSuccessfully = isObserveDecisionAppliedSuccess(message);
+
+          set((currentState) => {
+            let conversationHistory = [...currentState.conversationHistory, appliedBubble];
+
+            if (appliedSuccessfully) {
+              conversationHistory = clearObserveDecisionHistoryState(
+                conversationHistory,
+                taskId,
+                decisionCardMessageId,
+              );
+            }
+
+                return buildConversationAndDerivedPatch(currentState, conversationHistory, {
+              ...(appliedSuccessfully
+                ? buildObserveDecisionStatePatchFromHistory(conversationHistory)
+                : {
+                    observeDecisionState: 'pending' as const,
+                    pendingObserveErrorDecision: currentState.pendingObserveErrorDecision,
+                  }),
+            });
           });
         }
         break;
@@ -3687,7 +4695,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       timestamp: new Date().toISOString(),
     };
     const state = get();
-    set({ conversationHistory: [...state.conversationHistory, message] });
+    const nextHistory = [...state.conversationHistory, message];
+    set((currentState) => buildConversationAndDerivedPatch(currentState, nextHistory));
 
     // 保存到 API
     if (state.currentDeviceId) {
@@ -3709,7 +4718,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       isParseError,
     };
     const state = get();
-    set({ conversationHistory: [...state.conversationHistory, message] });
+    const nextHistory = [...state.conversationHistory, message];
+    set((currentState) => buildConversationAndDerivedPatch(currentState, nextHistory));
 
     // 保存到 API (截图先保存到本地，之后可以上传)
     if (state.currentDeviceId) {
@@ -3719,11 +4729,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
   // 更新Agent消息（用于流式更新）
   updateAgentMessage: (messageId: string, updates: Partial<ChatMessage>) => {
-    set((state) => ({
-      conversationHistory: state.conversationHistory.map((msg) =>
-        msg.id === messageId ? { ...msg, ...updates } : msg
-      ),
-    }));
+    set((state) => {
+      const nextHistory = state.conversationHistory.map((msg) =>
+        msg.id === messageId ? { ...msg, ...withTransportMetadataUpdates(updates) } : msg
+      );
+      return buildConversationAndDerivedPatch(state, nextHistory);
+    });
   },
 
   // 创建流式Agent消息并返回ID
@@ -3736,7 +4747,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       thinking: '',
     };
     const state = get();
-    set({ conversationHistory: [...state.conversationHistory, message] });
+    const nextHistory = [...state.conversationHistory, message];
+    set((currentState) => buildConversationAndDerivedPatch(currentState, nextHistory));
     return message.id;
   },
 
@@ -3754,9 +4766,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       }
 
       const newHistory = state.conversationHistory.slice(totalMessages - messagesToKeep);
-      return {
-        conversationHistory: newHistory,
-      };
+      return buildConversationAndDerivedPatch(state, newHistory);
     });
   },
 
@@ -3770,7 +4780,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         console.error('Failed to clear chat history on server:', e);
       }
     }
-    set({ conversationHistory: [], progressMessageIds: normalizeResetProgressTracking() });
+    set((currentState) => buildConversationAndDerivedPatch(currentState, [], {
+      progressMessageIds: normalizeResetProgressTracking(),
+      ...normalizeEndSessionObserveDecisionState(),
+    }));
   },
 
   // 设置截图
@@ -3803,6 +4816,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       pendingAction: null,
       waitingForConfirm: false,
       waitingConfirmPhase: null,
+      ...normalizeSendCommandObserveDecisionState(),
     });
 
     // 添加用户消息到对话历史
@@ -3818,6 +4832,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         mode: state.mode,
         max_steps: state.maxSteps,
         max_parse_retries: state.maxParseRetries,
+        max_observe_error_retries: state.maxObserveErrorRetries,
       });
 
       agentStoreLogger.info('[sendCommand] Task starting', {
@@ -3825,7 +4840,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         deviceId: state.currentDeviceId,
       });
 
-      set({
+      set((currentState) => buildStatePatchFromCurrent(currentState, {
         currentTaskId: result.task_id || state.currentTaskId,
         isRunning: true,
         status: normalizeStoreStatus(result.status),
@@ -3836,7 +4851,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         currentApp: '未知',
         canInterrupt: true,
         canResume: false,
-      });
+      }));
 
       // Task execution is now driven by WebSocket messages (agent_step, agent_status)
       // No more polling/executeStepsLoop
@@ -3887,11 +4902,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       message,
     );
 
-    set({
-      conversationHistory: progress.conversationHistory,
+    set((currentState) => buildConversationAndDerivedPatch(currentState, progress.conversationHistory, {
       progressMessageIds: progress.progressMessageIds,
-      ...normalizeProgressStatePatch(message, state.currentTaskId),
-    });
+      ...normalizeProgressStateWithObserveDecision(message, state.currentTaskId),
+    }));
 
     return progress.messageId;
   },
@@ -3901,10 +4915,6 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
     if (shouldSetScreenshot(message) && message.screenshot) {
       state.setScreenshot(message.screenshot);
-    }
-
-    if (shouldUpdateBusyStatusFromProgress(message)) {
-      useDeviceStore.getState().updateDevice(state.currentDeviceId!, buildDeviceBusyStatePatch());
     }
 
     state.upsertProgressMessage(message);
@@ -3937,15 +4947,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       message,
     );
 
-    set({
+    set((currentState) => buildConversationAndDerivedPatch(currentState, conversationPatch.conversationHistory, {
       currentTaskId: normalizeAgentStepCurrentTaskId(message, state.currentTaskId),
       currentStepNum: normalizeAgentStepNumber(message),
-      conversationHistory: conversationPatch.conversationHistory,
       progressMessageIds: conversationPatch.progressMessageIds,
       ...updateStoreTransientForStep(),
-    });
-
-    useDeviceStore.getState().updateDevice(state.currentDeviceId!, buildDeviceBusyStatePatch());
+    }));
 
     agentStoreLogger.debug('[handleAgentStep] Step processed', {
       stepNumber: message.step_number,
@@ -3976,63 +4983,47 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
     if (status === 'finished' || status === 'completed') {
       state.setCurrentStep(null);
-      set({
+      set((currentState) => buildConversationAndDerivedPatch(currentState, conversationPatch.conversationHistory, {
         ...normalizeStatusCompletedState(message, state.currentTaskId),
-        conversationHistory: conversationPatch.conversationHistory,
         progressMessageIds: conversationPatch.progressMessageIds,
+        ...clearObserveDecisionSubmissionState(),
         ...updateStoreTransientForStatus(message),
-      });
-      useDeviceStore.getState().updateDevice(state.currentDeviceId!, buildDeviceIdleStatePatch());
+      }));
       state.forgetOldMessages();
       return;
     }
 
     if (status === 'error' || status === 'failed') {
       state.setCurrentStep(null);
-      set({
+      set((currentState) => buildConversationAndDerivedPatch(currentState, conversationPatch.conversationHistory, {
         ...normalizeStatusFailedState(message, state.currentTaskId),
         error: normalizeFailureMessage(message),
-        conversationHistory: conversationPatch.conversationHistory,
         progressMessageIds: conversationPatch.progressMessageIds,
+        ...clearObserveDecisionSubmissionState(),
         ...updateStoreTransientForStatus(message),
-      });
-      useDeviceStore.getState().updateDevice(state.currentDeviceId!, buildDeviceErrorStatePatch());
+      }));
       return;
     }
 
     if (status === 'interrupted') {
       state.setCurrentStep(null);
-      set({
+      set((currentState) => buildConversationAndDerivedPatch(currentState, conversationPatch.conversationHistory, {
         ...normalizeStatusInterruptedState(message, state.currentTaskId),
-        conversationHistory: conversationPatch.conversationHistory,
         progressMessageIds: conversationPatch.progressMessageIds,
+        ...clearObserveDecisionSubmissionState(),
         ...updateStoreTransientForStatus(message),
-      });
+      }));
 
-      const currentDevice = state.currentDeviceId ? useDeviceStore.getState().getDeviceById(state.currentDeviceId) : undefined;
-      useDeviceStore.getState().updateDevice(state.currentDeviceId!, buildDeviceIdleStatePatch(currentDevice?.status));
       return;
     }
 
-    if (status === 'pending') {
-      set({
-        ...normalizeStatusPendingState(message, state.currentTaskId, state.canInterrupt),
+    if (status === 'pending' || status === 'running' || status === 'waiting_confirmation') {
+      set((currentState) => buildConversationAndDerivedPatch(currentState, conversationPatch.conversationHistory, {
+        ...normalizeStatusStateWithObserveDecision(message, state.currentTaskId, state.canInterrupt),
         currentTaskId: normalizeAgentStatusCurrentTaskId(message, state.currentTaskId),
-        conversationHistory: conversationPatch.conversationHistory,
         progressMessageIds: conversationPatch.progressMessageIds,
         ...updateStoreTransientForStatus(message),
-      });
-      return;
-    }
-
-    if (status === 'running') {
-      set({
-        ...normalizeStatusRunningState(message, state.currentTaskId),
-        currentTaskId: normalizeAgentStatusCurrentTaskId(message, state.currentTaskId),
-        conversationHistory: conversationPatch.conversationHistory,
-        progressMessageIds: conversationPatch.progressMessageIds,
-        ...updateStoreTransientForStatus(message),
-      });
+      }));
     }
   },
 
@@ -4063,11 +5054,13 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       },
     });
 
-    set({
-      isRunning: false,
+    set((currentState) => buildStatePatchFromCurrent(currentState, {
+      isRunning: true,
       waitingForConfirm: true,
       waitingConfirmPhase: 'act',
-    });
+      status: 'waiting_confirmation',
+      canInterrupt: true,
+    }));
   },
 
   // Internal handler for session_locked WebSocket message
@@ -4102,11 +5095,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const phase = message.phase as 'reason' | 'act' | 'observe';
     agentStoreLogger.info('[handlePhaseStart] Phase started', { phase, stepNumber: message.step_number });
 
-    set({
+    set((currentState) => buildStatePatchFromCurrent(currentState, {
       currentPhase: phase,
       isThinking: phase === 'reason',
       thinkingContent: phase === 'reason' ? '思考中...' : '',
-    });
+    }));
   },
 
   // Internal handler for agent_phase_end WebSocket message
@@ -4114,11 +5107,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const phase = message.phase as 'reason' | 'act' | 'observe';
     agentStoreLogger.info('[handlePhaseEnd] Phase ended', { phase, stepNumber: message.step_number });
 
-    set({
+    set((currentState) => buildStatePatchFromCurrent(currentState, {
       currentPhase: phase,
       isThinking: false,
       thinkingContent: '',
-    });
+    }));
   },
 
   // Internal handler for agent_thinking WebSocket message
@@ -4138,12 +5131,14 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
     wsConsoleApi.sendConfirmPhase(state.currentDeviceId, approved);
 
-    set({
+    set((currentState) => buildStatePatchFromCurrent(currentState, {
       pendingAction: null,
       waitingForConfirm: false,
       waitingConfirmPhase: null,
-      isRunning: approved,  // Continue running if approved
-    });
+      isRunning: true,
+      status: approved ? 'running' : 'waiting_confirmation',
+      canInterrupt: true,
+    }));
 
     if (approved) {
       state.addAgentMessage(`用户确认执行 ${phaseToConfirm} 阶段`);
@@ -4164,6 +5159,57 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     get().confirmPhase(false);
   },
 
+  submitObserveErrorDecision: async (decision: 'continue' | 'interrupt', advice: string = '') => {
+    const state = get();
+    if (!state.currentDeviceId) {
+      set({ error: 'No device selected' });
+      return;
+    }
+
+    const trimmedAdvice = advice.trim();
+    const pendingDecision = state.pendingObserveErrorDecision;
+
+    set({ observeDecisionState: 'submitting' });
+
+    const userMessage = buildObserveErrorDecisionUserMessage(decision, trimmedAdvice || undefined);
+    state.addUserMessage(userMessage);
+
+    wsConsoleApi.sendObserveErrorDecision(state.currentDeviceId, decision, trimmedAdvice);
+
+    if (decision === 'interrupt') {
+      set((currentState) => buildStatePatchFromCurrent(currentState, {
+        isRunning: true,
+        status: 'waiting_confirmation',
+        canInterrupt: true,
+        observeDecisionState: 'submitting',
+        pendingObserveErrorDecision: pendingDecision,
+      }));
+      return;
+    }
+
+    set((currentState) => buildStatePatchFromCurrent(currentState, {
+      isRunning: true,
+      status: 'waiting_confirmation',
+      canInterrupt: true,
+      observeDecisionState: 'submitting',
+      pendingObserveErrorDecision: pendingDecision,
+    }));
+  },
+
+  resolveObserveErrorDecisionCard: (messageId?: string) => {
+    const state = get();
+    const resolution = normalizeObserveDecisionStateAfterResolution(messageId, state.currentTaskId);
+    const conversationHistory = clearObserveDecisionHistoryState(
+      state.conversationHistory,
+      resolution.taskId,
+      resolution.messageId,
+    );
+
+    set((currentState) => buildConversationAndDerivedPatch(currentState, conversationHistory, {
+      ...buildObserveDecisionStatePatchFromHistory(conversationHistory),
+    }));
+  },
+
   interrupt: async () => {
     const state = get();
     if (!state.currentDeviceId) {
@@ -4178,13 +5224,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       // 添加中断消息
       state.addAgentMessage('用户中断了任务执行');
 
-      set({
-        isRunning: false,
+      set((currentState) => buildStatePatchFromCurrent(currentState, {
+        isRunning: true,
         pendingAction: null,
-        status: 'interrupted',
-        canInterrupt: false,
-        canResume: false,
-      });
+        waitingForConfirm: false,
+        waitingConfirmPhase: null,
+        status: currentState.status === 'waiting_confirmation' ? 'waiting_confirmation' : 'running',
+        canInterrupt: true,
+        ...normalizeInterruptObserveDecisionState(),
+      }));
     } catch (error: any) {
       console.error('Failed to interrupt:', error);
       set({ error: error.message });

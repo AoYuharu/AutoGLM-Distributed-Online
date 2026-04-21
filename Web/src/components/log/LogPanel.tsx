@@ -502,7 +502,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({ deviceId, visible = true, on
 
         <div className="flex-1 min-h-0">
           <Table
-            dataSource={filteredLogs}
+            dataSource={[...filteredLogs].reverse()}
             columns={columns}
             rowKey="id"
             size="small"

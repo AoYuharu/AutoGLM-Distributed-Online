@@ -9,6 +9,7 @@ class SessionStatus(Enum):
     """会话状态"""
     WAIT_FOR_PUSH = "wait_for_push"       # 等待推理
     WAIT_OBSERVATION = "wait_observation"  # 等待观察结果
+    WAIT_USER_DECISION = "wait_user_decision"  # 等待用户决策
     FINISHED = "finished"                  # 任务结束
 
 

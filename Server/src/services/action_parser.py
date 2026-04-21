@@ -64,10 +64,31 @@ class ActionParser:
     @property
     def model_client(self) -> OpenAI:
         if self._model_client is None:
-            self._model_client = OpenAI(
-                base_url=settings.PHONE_AGENT_BASE_URL,
-                api_key=settings.PHONE_AGENT_API_KEY,
-            )
+            import httpx
+            import os
+            proxies = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+            if not proxies:
+                try:
+                    import winreg
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+                    proxy_enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+                    if proxy_enable:
+                        proxy_server, _ = winreg.QueryValueEx(key, "ProxyServer")
+                        proxies = f"http://{proxy_server}"
+                except Exception:
+                    pass
+            if proxies:
+                self._model_client = OpenAI(
+                    base_url=settings.PHONE_AGENT_BASE_URL,
+                    api_key=settings.PHONE_AGENT_API_KEY,
+                    http_client=httpx.Client(proxy=proxies),
+                )
+            else:
+                self._model_client = OpenAI(
+                    base_url=settings.PHONE_AGENT_BASE_URL,
+                    api_key=settings.PHONE_AGENT_API_KEY,
+                    http_client=httpx.Client(trust_env=False),
+                )
         return self._model_client
 
     async def parse_and_validate(

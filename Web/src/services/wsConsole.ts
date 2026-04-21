@@ -14,6 +14,7 @@
 
 import { wsConsoleLogger } from '../hooks/useLogger';
 import { useDeviceStore } from '../stores/deviceStore';
+import type { Device, ObserveErrorDecisionPayload } from '../types';
 
 // Message types from Server -> Web
 export interface WsConsoleMessage {
@@ -30,12 +31,18 @@ export interface WsConsoleMessage {
     | 'subscribed'
     | 'error'
     | 'device_sync'
+    | 'device_status_update'
+    | 'device_offline'
+    | 'device_reconnected'
     | 'task_created'
+    | 'task_update'
     | 'task_interrupted'
     | 'agent_phase_start'
     | 'agent_phase_end'
     | 'agent_thinking'
-    | 'phase_confirmed';
+    | 'phase_confirmed'
+    | 'observe_error_decision_applied'
+    | 'pong';
   task_id?: string;
   device_id?: string;
   step_number?: number;
@@ -53,6 +60,12 @@ export interface WsConsoleMessage {
   controller_id?: string;
   version?: number;
   data?: Record<string, any>;
+  payload?: {
+    task_id?: string;
+    status?: string;
+    [key: string]: unknown;
+  };
+  update?: Partial<Device>;
   devices?: Array<{
     device_id: string;
     status: string;
@@ -60,17 +73,24 @@ export interface WsConsoleMessage {
   }>;
   phase?: 'reason' | 'act' | 'observe';
   thinking?: string;
+  approved?: boolean;
+  decision?: 'continue' | 'interrupt';
+  advice?: string;
+  observe_error_decision?: ObserveErrorDecisionPayload;
 }
 
 // Message types from Web -> Server
 export interface WsConsoleSendMessage {
-  type: 'subscribe' | 'unsubscribe' | 'sync' | 'confirm_phase' | 'create_task' | 'interrupt_task';
+  type: 'subscribe' | 'unsubscribe' | 'sync' | 'confirm_phase' | 'create_task' | 'interrupt_task' | 'observe_error_decision';
   device_id?: string;
   approved?: boolean;
   instruction?: string;
   mode?: string;
   max_steps?: number;
+  max_observe_error_retries?: number;
   task_id?: string;
+  decision?: 'continue' | 'interrupt';
+  advice?: string;
 }
 
 type MessageCallback = (message: WsConsoleMessage) => void;
@@ -219,6 +239,7 @@ class WsConsoleService {
               useDeviceStore.getState().updateDevice(deviceData.device_id, {
                 status: deviceData.status as any,
                 last_seen: deviceData.last_update,
+                ...(deviceData.status === 'idle' ? { current_task_id: undefined } : {}),
               });
             });
             wsConsoleLogger.info('[handleMessage] device_sync applied', {
@@ -369,17 +390,35 @@ class WsConsoleService {
   /**
    * Send create_task message to server
    */
-  sendCreateTask(deviceId: string, instruction: string, mode: string = 'normal', maxSteps: number = 100): void {
+  sendCreateTask(
+    deviceId: string,
+    instruction: string,
+    mode?: string,
+    maxSteps: number = 100,
+    maxObserveErrorRetries: number = 2,
+  ): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       const message: WsConsoleSendMessage = {
         type: 'create_task',
         device_id: deviceId,
         instruction,
-        mode,
         max_steps: maxSteps,
+        max_observe_error_retries: maxObserveErrorRetries,
       };
+
+      if (mode) {
+        message.mode = mode;
+      }
+
       this.ws.send(JSON.stringify(message));
-      wsConsoleLogger.debug('[sendCreateTask] Create task sent', { deviceId, instruction: instruction.substring(0, 50), consoleId: this.consoleId });
+      wsConsoleLogger.debug('[sendCreateTask] Create task sent', {
+        deviceId,
+        mode: mode || 'server-default',
+        maxSteps,
+        maxObserveErrorRetries,
+        instruction: instruction.substring(0, 50),
+        consoleId: this.consoleId,
+      });
     } else {
       wsConsoleLogger.warn('[sendCreateTask] Cannot send create task, not connected');
     }
@@ -399,6 +438,26 @@ class WsConsoleService {
       wsConsoleLogger.debug('[sendInterruptTask] Interrupt task sent', { deviceId, taskId, consoleId: this.consoleId });
     } else {
       wsConsoleLogger.warn('[sendInterruptTask] Cannot send interrupt task, not connected');
+    }
+  }
+
+  sendObserveErrorDecision(deviceId: string, decision: 'continue' | 'interrupt', advice: string = ''): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      const message: WsConsoleSendMessage = {
+        type: 'observe_error_decision',
+        device_id: deviceId,
+        decision,
+        advice,
+      };
+      this.ws.send(JSON.stringify(message));
+      wsConsoleLogger.debug('[sendObserveErrorDecision] Observe-error decision sent', {
+        deviceId,
+        decision,
+        advicePresent: Boolean(advice.trim()),
+        consoleId: this.consoleId,
+      });
+    } else {
+      wsConsoleLogger.warn('[sendObserveErrorDecision] Cannot send observe-error decision, not connected');
     }
   }
 

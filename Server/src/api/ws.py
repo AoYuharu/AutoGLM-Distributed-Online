@@ -112,18 +112,27 @@ async def handle_ws_message(connection_id: str, message: dict):
         from src.services.action_router import action_router
         from src.services.react_scheduler import scheduler
 
+        payload = message.get("payload") or {}
+        accepted = payload.get("accepted", True)
+        error = payload.get("error")
+
         if action_router:
             await action_router.handle_ack(message)
-        # Handle bootstrap screenshot ACK for initial_screenshot_ack_received milestone
-        ref_msg_id = message.get("ref_msg_id") or message.get("payload", {}).get("ref_msg_id")
+        ref_msg_id = message.get("ref_msg_id") or payload.get("ref_msg_id")
         if device_id and ref_msg_id and scheduler:
-            await scheduler.handle_bootstrap_ack(device_id, ref_msg_id)
+            await scheduler.handle_bootstrap_ack(
+                device_id,
+                ref_msg_id,
+                accepted=accepted,
+                error=error,
+            )
         if device_id:
             await device_status_manager.touch(device_id)
         logger.debug(
             "ACK received from client",
             device_id=device_id,
             msg_id=message.get("msg_id"),
+            accepted=accepted,
         )
     else:
         logger.debug(
@@ -230,6 +239,7 @@ async def handle_console_message(console_id: str, message: dict):
         instruction = message.get("instruction")
         mode = message.get("mode", "normal")
         max_steps = message.get("max_steps", 100)
+        max_observe_error_retries = message.get("max_observe_error_retries", 2)
 
         ws_console_logger.info(
             f"[ws_console_create_task] Creating task: console={console_id}, device={device_id}, "
@@ -243,6 +253,7 @@ async def handle_console_message(console_id: str, message: dict):
             instruction=instruction,
             max_steps=max_steps,
             mode=mode,
+            max_observe_error_retries=max_observe_error_retries,
         )
 
         if not device_id or not instruction:
@@ -276,6 +287,7 @@ async def handle_console_message(console_id: str, message: dict):
                 instruction=instruction,
                 mode=mode,
                 max_steps=max_steps,
+                max_observe_error_retries=max_observe_error_retries,
             )
 
             ws_console_logger.info(f"[ws_console_create_task] Task created: {task_id}")
@@ -286,6 +298,7 @@ async def handle_console_message(console_id: str, message: dict):
                 device_id=device_id,
                 instruction=instruction,
                 max_steps=max_steps,
+                max_observe_error_retries=max_observe_error_retries,
             )
             if console_id in ws_hub._web_consoles:
                 await ws_hub._web_consoles[console_id].send_json(
@@ -344,6 +357,36 @@ async def handle_console_message(console_id: str, message: dict):
         if console_id in ws_hub._web_consoles:
             await ws_hub._web_consoles[console_id].send_json(
                 {"type": "phase_confirmed", "device_id": device_id, "approved": approved}
+            )
+
+    elif msg_type == "observe_error_decision":
+        device_id = message.get("device_id")
+        decision = message.get("decision")
+        advice = message.get("advice", "")
+
+        ws_console_logger.info(
+            f"[ws_console_observe_error_decision] console={console_id}, device={device_id}, decision={decision}"
+        )
+
+        if not device_id or decision not in {"continue", "interrupt"}:
+            if console_id in ws_hub._web_consoles:
+                await ws_hub._web_consoles[console_id].send_json(
+                    {"type": "error", "message": "device_id and decision(continue|interrupt) are required"}
+                )
+            return
+
+        from src.services.react_scheduler import scheduler
+
+        handled = await scheduler.resolve_observe_error_decision(device_id, decision, advice)
+        if console_id in ws_hub._web_consoles:
+            await ws_hub._web_consoles[console_id].send_json(
+                {
+                    "type": "observe_error_decision_applied",
+                    "device_id": device_id,
+                    "decision": decision,
+                    "advice": advice,
+                    "success": handled,
+                }
             )
 
     else:

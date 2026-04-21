@@ -9,12 +9,14 @@ import time
 from typing import Optional
 from dataclasses import dataclass
 
+from src.adapters.android_app_index import AndroidAppIndex
 from src.adapters.base import (
     DeviceAdapterBase,
     DeviceCapabilities,
     Platform,
     ActionResult,
 )
+from src.config.apps import get_app_aliases, get_package_name
 
 # 模块日志器
 _logger = logging.getLogger(__name__)
@@ -56,6 +58,8 @@ class ADBAdapter(DeviceAdapterBase):
         super().__init__(device_id, logger)
         self.adb_path = adb_path
         self._platform = Platform.ANDROID
+        self._adb_keyboard_available: Optional[bool] = None
+        self._android_app_index = AndroidAppIndex(self)
         self._log("info", f"[ADBAdapter] Initialized for device {device_id}", extra={"device_id": device_id})
 
     @property
@@ -75,6 +79,100 @@ class ADBAdapter(DeviceAdapterBase):
         """运行 ADB 命令并返回输出"""
         cmd = self._adb_prefix + args
         return subprocess.check_output(cmd, **kwargs)
+
+    def _run_adb_checked(self, args: list, action_name: str, **kwargs) -> subprocess.CompletedProcess:
+        """运行关键 ADB 命令，并在失败时抛出异常。"""
+        result = self._run_adb(args, capture_output=True, text=True, **kwargs)
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        failure_text = stderr or stdout
+
+        failed = result.returncode != 0
+        lower_text = failure_text.lower()
+        if not failed and any(token in lower_text for token in ("error", "failed", "exception", "no devices")):
+            failed = True
+
+        if failed:
+            detail = failure_text or f"adb exit code {result.returncode}"
+            raise RuntimeError(f"{action_name}: {detail}")
+
+        return result
+
+    def _sleep_after_action(self, delay: float) -> None:
+        """Sleep after a successful action execution."""
+        time.sleep(delay)
+
+    # === 文本输入辅助方法 ===
+
+    @staticmethod
+    def _shell_escape(text: str) -> str:
+        """POSIX single-quote escaping for the Android device shell."""
+        return "'" + text.replace("'", "'\\''") + "'"
+
+    @staticmethod
+    def _is_ascii(text: str) -> bool:
+        """Check if text contains only ASCII characters."""
+        try:
+            text.encode('ascii')
+            return True
+        except UnicodeEncodeError:
+            return False
+
+    def _detect_adb_keyboard(self) -> bool:
+        """Check if ADB Keyboard IME is installed on the device (cached)."""
+        if self._adb_keyboard_available is not None:
+            return self._adb_keyboard_available
+        try:
+            result = self._run_adb(
+                ["shell", "ime", "list", "-a"],
+                capture_output=True, text=True, timeout=5,
+            )
+            self._adb_keyboard_available = (
+                result.returncode == 0
+                and "com.android.adbkeyboard" in (result.stdout or "")
+            )
+        except Exception:
+            self._adb_keyboard_available = False
+        self._log("debug", f"[type_text] ADB Keyboard available: {self._adb_keyboard_available}")
+        return self._adb_keyboard_available
+
+    def _type_via_adb_keyboard(self, text: str) -> bool:
+        """Tier 1: Input text via ADB Keyboard broadcast (supports all Unicode)."""
+        try:
+            self._run_adb_checked(
+                ["shell", "ime set com.android.adbkeyboard/.AdbIME"],
+                action_name="type_text(set_ime)",
+            )
+            escaped = self._shell_escape(text)
+            self._run_adb_checked(
+                ["shell", f"am broadcast -a ADB_INPUT_TEXT --es msg {escaped}"],
+                action_name="type_text(broadcast)",
+            )
+            self._sleep_after_action(DEFAULT_KEYBOARD_SWITCH_DELAY)
+            self._log("debug", f"[type_text] Tier 1 (ADB Keyboard) success")
+            return True
+        except Exception as e:
+            self._log("warning", f"[type_text] ADB Keyboard broadcast failed: {e}")
+            return False
+
+    def _type_via_clipboard(self, text: str) -> bool:
+        """Tier 2: Input text via clipboard set + paste (Android 12+ / API 31+)."""
+        try:
+            escaped = self._shell_escape(text)
+            self._run_adb_checked(
+                ["shell", f"cmd clipboard set_text {escaped}"],
+                action_name="type_text(clipboard_set)",
+            )
+            self._run_adb_checked(
+                ["shell", "input keyevent 279"],
+                action_name="type_text(paste)",
+            )
+            self._sleep_after_action(DEFAULT_KEYBOARD_SWITCH_DELAY)
+            self._log("debug", f"[type_text] Tier 2 (clipboard paste) success")
+            return True
+        except Exception as e:
+            self._log("warning", f"[type_text] Clipboard paste failed: {e}")
+            return False
 
     # === 设备连接管理 ===
 
@@ -511,19 +609,116 @@ class ADBAdapter(DeviceAdapterBase):
     def _handle_type(self, action: dict) -> ActionResult:
         """处理文本输入"""
         text = action.get("text", "")
+        if not text:
+            return ActionResult(False, False, "No text provided for type action")
         self.type_text(text)
         return ActionResult(True, False)
 
     def _handle_launch(self, action: dict) -> ActionResult:
         """处理启动应用"""
-        package = action.get("app") or action.get("package")
-        if not package:
-            return ActionResult(False, False, "No app/package specified")
+        app_name = action.get("app")
+        resolved_dynamically = False
+        package = None
+        if app_name:
+            package = get_package_name(app_name)
+            if not package:
+                package = self._resolve_dynamic_app_package(app_name)
+                resolved_dynamically = package is not None
+            if not package:
+                return ActionResult(False, False, self._build_launch_failure_message(app_name=app_name))
+        else:
+            package = action.get("package")
+            if not package:
+                return ActionResult(False, False, "No app/package specified")
 
-        success = self.launch_app(package)
+        try:
+            success = self.launch_app(package)
+        except Exception:
+            if app_name and resolved_dynamically and self._retry_dynamic_launch(app_name, package):
+                return ActionResult(True, False)
+            raise
+
         if success:
             return ActionResult(True, False)
-        return ActionResult(False, False, f"App not found: {package}")
+
+        if app_name and resolved_dynamically:
+            success = self._retry_dynamic_launch(app_name, package)
+            if success:
+                return ActionResult(True, False)
+
+        return ActionResult(
+            False,
+            False,
+            self._build_launch_failure_message(app_name=app_name, package=package),
+        )
+
+    def _format_launch_suggestions(self, suggestions: list[tuple[str, list[str]]]) -> str:
+        formatted: list[str] = []
+        for package, labels in suggestions:
+            display_labels = ", ".join(dict.fromkeys(label for label in labels if label))
+            if display_labels:
+                formatted.append(f"{display_labels} -> {package}")
+            else:
+                formatted.append(package)
+        return "; ".join(formatted)
+
+    def _build_launch_failure_message(self, app_name: str | None = None, package: str | None = None) -> str:
+        target = app_name or package or "unknown"
+        parts = [f"App not found: {target}"]
+
+        alias_hints: list[str] = []
+        if package:
+            alias_hints = get_app_aliases(package)
+        if alias_hints:
+            alias_hint_text = ", ".join(dict.fromkeys(alias_hints))
+            parts.append(f"Known aliases for {package}: {alias_hint_text}")
+
+        suggestions = self._android_app_index.get_package_suggestions()
+        if suggestions:
+            parts.append(
+                "Available app suggestions: "
+                f"{self._format_launch_suggestions(suggestions)}"
+            )
+
+        if app_name and not suggestions and not alias_hints:
+            parts.append(
+                "No dynamic Android app-name mapping matched this request. "
+                "Try a more exact installed app label."
+            )
+
+        return " | ".join(parts)
+
+    def _resolve_dynamic_app_package(self, app_name: str) -> str | None:
+        """Resolve Android app names using cached and refreshed dynamic indexes."""
+        package = self._android_app_index.resolve(app_name)
+        if package:
+            return package
+
+        self._android_app_index.load_cached()
+        package = self._android_app_index.resolve(app_name)
+        if package:
+            return package
+
+        self._android_app_index.refresh()
+        return self._android_app_index.resolve(app_name)
+
+    def _retry_dynamic_launch(self, app_name: str, package: str) -> bool:
+        """Invalidate stale dynamic cache once and retry a resolved launch."""
+        self._log(
+            "warning",
+            f"[launch] Dynamic package launch failed for device {self.device_id}: {app_name} -> {package}; refreshing index",
+        )
+        self._android_app_index.invalidate(package)
+        self._android_app_index.refresh()
+        refreshed_package = self._android_app_index.resolve(app_name)
+        if not refreshed_package:
+            return False
+        return self.launch_app(refreshed_package)
+
+    def _send_action_command(self, args: list, action_name: str, delay: float) -> None:
+        """Execute a checked ADB action command and sleep on success."""
+        self._run_adb_checked(args, action_name)
+        self._sleep_after_action(delay)
 
     def _handle_wait(self, action: dict) -> ActionResult:
         """处理等待"""
@@ -547,32 +742,32 @@ class ADBAdapter(DeviceAdapterBase):
 
     def tap(self, x: int, y: int) -> None:
         """点击"""
-        self._run_adb(
+        self._send_action_command(
             ["shell", "input", "tap", str(x), str(y)],
-            capture_output=True
+            action_name="tap",
+            delay=DEFAULT_TAP_DELAY,
         )
-        time.sleep(DEFAULT_TAP_DELAY)
 
     def double_tap(self, x: int, y: int) -> None:
         """双击"""
-        self._run_adb(
+        self._run_adb_checked(
             ["shell", "input", "tap", str(x), str(y)],
-            capture_output=True
+            action_name="double_tap",
         )
         time.sleep(0.05)  # 50ms 间隔
-        self._run_adb(
+        self._run_adb_checked(
             ["shell", "input", "tap", str(x), str(y)],
-            capture_output=True
+            action_name="double_tap",
         )
-        time.sleep(DEFAULT_TAP_DELAY)
+        self._sleep_after_action(DEFAULT_TAP_DELAY)
 
     def long_press(self, x: int, y: int, duration_ms: int = 3000) -> None:
         """长按"""
-        self._run_adb(
+        self._send_action_command(
             ["shell", "input", "swipe", str(x), str(y), str(x), str(y), str(duration_ms)],
-            capture_output=True
+            action_name="long_press",
+            delay=DEFAULT_TAP_DELAY,
         )
-        time.sleep(DEFAULT_TAP_DELAY)
 
     def swipe(
         self,
@@ -583,54 +778,76 @@ class ADBAdapter(DeviceAdapterBase):
         duration_ms: int = 300
     ) -> None:
         """滑动"""
-        self._run_adb(
+        self._send_action_command(
             [
                 "shell", "input", "swipe",
                 str(start_x), str(start_y),
                 str(end_x), str(end_y),
                 str(duration_ms)
             ],
-            capture_output=True
+            action_name="swipe",
+            delay=DEFAULT_SWIPE_DELAY,
         )
-        time.sleep(DEFAULT_SWIPE_DELAY)
 
     def back(self) -> None:
         """返回键"""
-        self._run_adb(
+        self._send_action_command(
             ["shell", "input", "keyevent", "4"],
-            capture_output=True
+            action_name="back",
+            delay=DEFAULT_BACK_DELAY,
         )
-        time.sleep(DEFAULT_BACK_DELAY)
 
     def home(self) -> None:
         """Home 键"""
-        self._run_adb(
+        self._send_action_command(
             ["shell", "input", "keyevent", "3"],
-            capture_output=True
+            action_name="home",
+            delay=DEFAULT_HOME_DELAY,
         )
-        time.sleep(DEFAULT_HOME_DELAY)
 
     def launch_app(self, package: str) -> bool:
         """启动应用"""
         if not package:
             return False
 
-        self._run_adb(
+        self._send_action_command(
             [
                 "shell", "monkey",
                 "-p", package,
                 "-c", "android.intent.category.LAUNCHER",
                 "1"
             ],
-            capture_output=True
+            action_name="launch_app",
+            delay=DEFAULT_LAUNCH_DELAY,
         )
-        time.sleep(DEFAULT_LAUNCH_DELAY)
         return True
 
     def type_text(self, text: str) -> None:
-        """输入文本"""
-        # 需要 ADB Keyboard 或其他输入法
-        self._run_adb(
-            ["shell", "input", "text", text.replace(" ", "%s")],
-            capture_output=True
+        """输入文本 (three-tier: ADB Keyboard → clipboard paste → adb input text)"""
+        if not text:
+            return
+
+        # Tier 1: ADB Keyboard (supports all Unicode)
+        if self._detect_adb_keyboard():
+            if self._type_via_adb_keyboard(text):
+                return
+
+        # Tier 2: Clipboard paste (non-ASCII fallback)
+        if not self._is_ascii(text):
+            if self._type_via_clipboard(text):
+                return
+            # No method available for non-ASCII
+            self._log("error", f"[type_text] Cannot input non-ASCII text without ADB Keyboard. "
+                       "Install: https://github.com/nicholasgasior/android-keyboard")
+            raise RuntimeError(
+                "Non-ASCII text input requires ADB Keyboard (com.android.adbkeyboard). "
+                "Install it on the device to enable Chinese text input."
+            )
+
+        # Tier 3: Standard adb input text (ASCII only, with proper escaping)
+        escaped = text.replace(" ", "%s")
+        self._send_action_command(
+            ["shell", f"input text {self._shell_escape(escaped)}"],
+            action_name="type_text",
+            delay=DEFAULT_KEYBOARD_SWITCH_DELAY,
         )
