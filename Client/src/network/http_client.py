@@ -26,6 +26,7 @@ class HttpClient:
         base_url: str,
         client_id: str,
         timeout: float = 30.0,
+        observe_retry_attempts: int = 1,
     ):
         """
         初始化 HTTP 客户端
@@ -38,6 +39,7 @@ class HttpClient:
         self.base_url = base_url.rstrip("/")
         self.client_id = client_id
         self.timeout = timeout
+        self.observe_retry_attempts = max(0, int(observe_retry_attempts))
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -94,7 +96,7 @@ class HttpClient:
         msg_type = data.get("type", "unknown")
         allow_retry = endpoint == "/api/v1/observe"
 
-        for attempt in range(2 if allow_retry else 1):
+        for attempt in range(self.observe_retry_attempts + 1 if allow_retry else 1):
             try:
                 session = await self._get_session()
                 logger.debug(f"[post_json] Posting to {url}: type={msg_type}, msg_id={msg_id}, attempt={attempt + 1}")
@@ -121,21 +123,21 @@ class HttpClient:
 
             except asyncio.TimeoutError:
                 logger.error(f"[post_json] Timeout posting to {url}")
-                if allow_retry and attempt == 0:
+                if allow_retry and attempt < self.observe_retry_attempts:
                     await self._reset_session()
                     logger.warning(f"[post_json] Retrying after timeout for {url}")
                     continue
                 return None
             except aiohttp.ClientError as e:
                 logger.error(f"[post_json] Client error posting to {url}: {e}")
-                if allow_retry and attempt == 0:
+                if allow_retry and attempt < self.observe_retry_attempts:
                     await self._reset_session()
                     logger.warning(f"[post_json] Retrying after client error for {url}")
                     continue
                 return None
             except Exception as e:
                 logger.error(f"[post_json] Error posting to {url}: {e}")
-                if allow_retry and attempt == 0:
+                if allow_retry and attempt < self.observe_retry_attempts:
                     await self._reset_session()
                     logger.warning(f"[post_json] Retrying after unexpected error for {url}")
                     continue

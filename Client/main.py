@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from src.config import load_client_runtime_config, merge_cli_overrides
 from src.network.websocket import WebSocketClient, ConnectionState
 from src.network.http_client import HttpClient
 from src.polling.manager import PollingManager
@@ -52,6 +53,18 @@ class DistributedClient:
         enable_hdc: bool = False,
         enable_wda: bool = False,
         log_level: str = "INFO",
+        http_base_url: Optional[str] = None,
+        polling_interval: float = 3.0,
+        adb_binary: str = "adb",
+        hdc_binary: str = "hdc",
+        wda_url: str = "http://localhost:8100",
+        wda_session_timeout: int = 300,
+        ws_max_reconnect_attempts: int = 10,
+        ws_reconnect_base_delay: float = 1.0,
+        ws_reconnect_max_delay: float = 60.0,
+        ws_send_ack_timeout: float = 10.0,
+        http_timeout: float = 30.0,
+        http_observe_retry_attempts: int = 1,
     ):
         """
         初始化分布式客户端
@@ -66,8 +79,24 @@ class DistributedClient:
         """
         self.client_id = client_id or self._generate_client_id()
         self.server_url = server_url
-        # HTTP 客户端使用相同主机但不同路径
-        self.server_base_url = server_url.replace("ws://", "http://").replace("wss://", "https://").split("/ws")[0].split("/ws/")[0]
+        self.server_base_url = (
+            http_base_url
+            or server_url.replace("ws://", "http://")
+            .replace("wss://", "https://")
+            .split("/ws")[0]
+            .split("/ws/")[0]
+        )
+        self.polling_interval = polling_interval
+        self.adb_binary = adb_binary
+        self.hdc_binary = hdc_binary
+        self.wda_url = wda_url
+        self.wda_session_timeout = wda_session_timeout
+        self.ws_max_reconnect_attempts = ws_max_reconnect_attempts
+        self.ws_reconnect_base_delay = ws_reconnect_base_delay
+        self.ws_reconnect_max_delay = ws_reconnect_max_delay
+        self.ws_send_ack_timeout = ws_send_ack_timeout
+        self.http_timeout = http_timeout
+        self.http_observe_retry_attempts = http_observe_retry_attempts
 
         # 初始化日志
         log_config = LogConfig(level=log_level)
@@ -84,6 +113,10 @@ class DistributedClient:
             on_device_found=self._on_device_found,
             on_device_lost=self._on_device_lost,
             on_polling_cycle_complete=self._on_polling_cycle_complete,
+            interval=self.polling_interval,
+            adb_binary=self.adb_binary,
+            hdc_binary=self.hdc_binary,
+            wda_url=self.wda_url,
         )
 
         # WebSocket 客户端
@@ -105,11 +138,11 @@ class DistributedClient:
 
         # 启用平台轮询
         if enable_adb:
-            self.polling_manager.enable_platform(PlatformType.ADB)
+            self.polling_manager.enable_platform(PlatformType.ADB, adb_path=self.adb_binary)
         if enable_hdc:
-            self.polling_manager.enable_platform(PlatformType.HDC)
+            self.polling_manager.enable_platform(PlatformType.HDC, hdc_path=self.hdc_binary)
         if enable_wda:
-            self.polling_manager.enable_platform(PlatformType.WDA)
+            self.polling_manager.enable_platform(PlatformType.WDA, wda_url=self.wda_url)
 
     def _generate_client_id(self) -> str:
         """生成客户端 ID"""
@@ -154,6 +187,10 @@ class DistributedClient:
             on_message=self._on_ws_message,
             on_connect=self._on_ws_connect,
             on_disconnect=self._on_ws_disconnect,
+            max_reconnect_attempts=self.ws_max_reconnect_attempts,
+            reconnect_base_delay=self.ws_reconnect_base_delay,
+            reconnect_max_delay=self.ws_reconnect_max_delay,
+            send_ack_timeout=self.ws_send_ack_timeout,
         )
 
         # 连接
@@ -174,12 +211,16 @@ class DistributedClient:
 
         # 创建适配器
         if platform == "android":
-            adapter = ADBAdapter(device_id=device_id)
+            adapter = ADBAdapter(device_id=device_id, adb_path=self.adb_binary)
         elif platform == "harmonyos":
-            adapter = HDCAdapter(device_id=device_id)
+            adapter = HDCAdapter(device_id=device_id, hdc_path=self.hdc_binary)
         elif platform == "ios":
-            wda_url = device_info.get("wda_url", "http://localhost:8100")
-            adapter = WDAAdapter(device_id=device_id, wda_url=wda_url)
+            wda_url = device_info.get("wda_url", self.wda_url)
+            adapter = WDAAdapter(
+                device_id=device_id,
+                wda_url=wda_url,
+                session_timeout=self.wda_session_timeout,
+            )
         else:
             logger.warning(f"Unknown platform: {platform}")
             return
@@ -638,12 +679,18 @@ class DistributedClient:
             on_message=self._on_ws_message,
             on_connect=self._on_ws_connect,
             on_disconnect=self._on_ws_disconnect,
+            max_reconnect_attempts=self.ws_max_reconnect_attempts,
+            reconnect_base_delay=self.ws_reconnect_base_delay,
+            reconnect_max_delay=self.ws_reconnect_max_delay,
+            send_ack_timeout=self.ws_send_ack_timeout,
         )
 
         # 初始化 HTTP 客户端
         self.http_client = HttpClient(
             base_url=self.server_base_url,
             client_id=self.client_id,
+            timeout=self.http_timeout,
+            observe_retry_attempts=self.http_observe_retry_attempts,
         )
 
         connected = await self.ws_client.connect()
@@ -691,12 +738,13 @@ class DistributedClient:
 
 async def main():
     """主函数"""
+    # 1. 解析 CLI 参数（全部使用 None 默认值，让 YAML 成为实际默认值）
     parser = argparse.ArgumentParser(description="Distributed Phone Automation Client")
     parser.add_argument(
         "--server",
         type=str,
-        default="ws://localhost:8080",
-        help="Server WebSocket URL"
+        default=None,
+        help="Server WebSocket URL (overrides config/client.yaml)"
     )
     parser.add_argument(
         "--client-id",
@@ -707,36 +755,71 @@ async def main():
     parser.add_argument(
         "--enable-adb",
         action="store_true",
-        default=True,
+        default=None,
+        dest="enable_adb",
         help="Enable ADB device support"
+    )
+    parser.add_argument(
+        "--disable-adb",
+        action="store_false",
+        default=None,
+        dest="enable_adb",
+        help="Disable ADB device support"
     )
     parser.add_argument(
         "--enable-hdc",
         action="store_true",
+        default=None,
         help="Enable HDC device support"
     )
     parser.add_argument(
         "--enable-wda",
         action="store_true",
+        default=None,
         help="Enable WDA device support"
     )
     parser.add_argument(
         "--log-level",
         type=str,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Log level"
+        default=None,
+        help="Log level (overrides config/client.yaml)"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to config/client.yaml (defaults to auto-discovered)"
     )
 
     args = parser.parse_args()
 
+    # 2. 加载 YAML 配置
+    yaml_config = load_client_runtime_config(config_path=args.config)
+
+    # 3. 应用 CLI 覆盖（CLI 优先级最高）
+    merge_cli_overrides(yaml_config, args)
+
+    # 4. 使用最终配置实例化 DistributedClient
     client = DistributedClient(
-        server_url=args.server,
+        server_url=yaml_config.server_ws_url,
         client_id=args.client_id,
-        enable_adb=args.enable_adb,
-        enable_hdc=args.enable_hdc,
-        enable_wda=args.enable_wda,
-        log_level=args.log_level,
+        enable_adb=yaml_config.adb_enabled,
+        enable_hdc=yaml_config.hdc_enabled,
+        enable_wda=yaml_config.wda_enabled,
+        log_level=yaml_config.log_level,
+        http_base_url=yaml_config.server_http_base_url,
+        polling_interval=yaml_config.polling_interval,
+        adb_binary=yaml_config.adb_binary,
+        hdc_binary=yaml_config.hdc_binary,
+        wda_url=yaml_config.wda_url,
+        wda_session_timeout=yaml_config.wda_session_timeout,
+        ws_max_reconnect_attempts=yaml_config.ws_max_reconnect_attempts,
+        ws_reconnect_base_delay=yaml_config.ws_reconnect_base_delay,
+        ws_reconnect_max_delay=yaml_config.ws_reconnect_max_delay,
+        ws_send_ack_timeout=yaml_config.ws_send_ack_timeout,
+        http_timeout=yaml_config.http_timeout,
+        http_observe_retry_attempts=yaml_config.http_observe_retry_attempts,
     )
 
     try:

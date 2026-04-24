@@ -1,10 +1,10 @@
 import axios from 'axios';
+import { browserConfig } from '../config';
 import { wsConsoleApi } from './wsConsole';
 import type { ObserveErrorDecisionPayload } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
 const api = axios.create({
-  baseURL: API_BASE_URL,
+  baseURL: browserConfig.apiBaseUrl,
   timeout: 120000,
   headers: {
     'Content-Type': 'application/json',
@@ -30,6 +30,7 @@ export interface BatchAgentTaskResponse {
     status: 'requested' | 'skipped' | 'error';
     message?: string;
     session_id?: string;
+    run_id?: string;
     task_id?: string;
     mode?: string;
   }>;
@@ -38,6 +39,8 @@ export interface BatchAgentTaskResponse {
 export interface TaskResponse {
   id: string;
   task_id: string;
+  session_id?: string;
+  run_id?: string;
   device_id: string;
   instruction: string;
   status: string;
@@ -71,6 +74,7 @@ export interface TaskDetailResponse extends TaskResponse {
 export interface AgentSessionResponse {
   exists: boolean;
   session_id?: string;
+  run_id?: string;
   device_id: string;
   platform: string;
   task_id: string;
@@ -95,6 +99,8 @@ export interface AgentSessionResponse {
 export interface DeviceSessionSnapshot {
   device_id: string;
   task_id: string | null;
+  session_id: string | null;
+  run_id: string | null;
   instruction: string | null;
   mode: 'normal' | 'cautious';
   status: string;
@@ -124,6 +130,8 @@ export interface ChatHistoryMessage {
   screenshot_path?: string;
   created_at: string;
   task_id?: string;
+  session_id?: string;
+  run_id?: string;
   step_number?: number;
   phase?: string;
   stage?: string;
@@ -155,12 +163,18 @@ function normalizeObserveErrorDecisionPayload(value: any): ObserveErrorDecisionP
     return undefined;
   }
 
-  if (!value.task_id || !value.device_id || typeof value.message !== 'string') {
+  const taskId = typeof value.task_id === 'string' && value.task_id ? String(value.task_id) : undefined;
+  const sessionId = typeof value.session_id === 'string' && value.session_id ? String(value.session_id) : undefined;
+  const runId = typeof value.run_id === 'string' && value.run_id ? String(value.run_id) : undefined;
+
+  if ((!taskId && !sessionId && !runId) || !value.device_id || typeof value.message !== 'string') {
     return undefined;
   }
 
   return {
-    task_id: String(value.task_id),
+    task_id: taskId,
+    session_id: sessionId,
+    run_id: runId,
     device_id: String(value.device_id),
     message: value.message,
     consecutive_count: Number(value.consecutive_count ?? 0),
@@ -314,9 +328,13 @@ async function getTaskDetail(_taskId: string): Promise<TaskDetailResponse | null
 }
 
 export const agentApi = {
-  async createSession(deviceId: string): Promise<{ task_id: string }> {
+  async createSession(deviceId: string): Promise<{ task_id: string; session_id: string; run_id: string }> {
     const snapshot = await this.getLatestDeviceSnapshot(deviceId);
-    return { task_id: snapshot.task_id || '' };
+    return {
+      task_id: snapshot.task_id || snapshot.session_id || '',
+      session_id: snapshot.session_id || snapshot.task_id || '',
+      run_id: snapshot.run_id || '',
+    };
   },
 
   async getSession(deviceId: string): Promise<AgentSessionResponse> {
@@ -372,6 +390,8 @@ export const agentApi = {
 
   async startTask(deviceId: string, params: {
     task_id: string;
+    session_id?: string;
+    run_id?: string;
     instruction: string;
     mode?: 'normal' | 'cautious';
     max_steps?: number;
@@ -385,6 +405,11 @@ export const agentApi = {
       params.mode,
       params.max_steps || 100,
       params.max_observe_error_retries ?? 2,
+      {
+        task_id: params.task_id || undefined,
+        session_id: params.session_id || params.task_id || undefined,
+        run_id: params.run_id || undefined,
+      },
     );
 
     // The actual task_id will arrive via WebSocket task_created.
@@ -428,6 +453,8 @@ export const agentApi = {
       return {
         device_id: deviceId,
         task_id: session.task_id || null,
+        session_id: session.session_id || null,
+        run_id: session.run_id || null,
         instruction: session.instruction || null,
         mode: getSessionMode(session),
         status: session.status || 'idle',
@@ -452,6 +479,8 @@ export const agentApi = {
         return {
           device_id: deviceId,
           task_id: null,
+          session_id: null,
+          run_id: null,
           instruction: null,
           mode: 'normal',
           status: 'offline',
@@ -550,8 +579,8 @@ export const agentApi = {
     return response.data?.data || { id: `msg_${Date.now()}`, created_at: new Date().toISOString() };
   },
 
-  async clearChatHistory(deviceId: string): Promise<{ success: boolean }> {
-    await api.delete(`/api/v1/devices/${deviceId}/chat`);
+  async clearSessionContext(deviceId: string): Promise<{ success: boolean }> {
+    await api.delete(`/api/v1/devices/${deviceId}/session-context`);
     return { success: true };
   },
 

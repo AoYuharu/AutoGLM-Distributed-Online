@@ -276,6 +276,10 @@ async def list_devices(
         memory_entry = await device_status_manager.get_entry(device.device_id)
         memory_status = memory_entry.status.value if memory_entry else "offline"
         memory_task_id = memory_entry.current_task_id if memory_entry else None
+        memory_session_id = memory_entry.current_session_id if memory_entry else None
+        memory_run_id = memory_entry.current_run_id if memory_entry else None
+        memory_session_started_at = memory_entry.session_started_at if memory_entry else None
+        memory_run_started_at = memory_entry.run_started_at if memory_entry else None
 
         # Apply status filter from memory, not DB
         if status and memory_status != status:
@@ -294,6 +298,10 @@ async def list_devices(
             status=memory_status,
             last_seen=device.last_heartbeat,
             current_task_id=memory_task_id,
+            current_session_id=memory_session_id,
+            current_run_id=memory_run_id,
+            session_started_at=memory_session_started_at,
+            run_started_at=memory_run_started_at,
             remark=device.remark,
         )
         device_list.append(device_response)

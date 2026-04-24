@@ -22,12 +22,18 @@ function normalizeObserveErrorDecisionPayload(value: any): ObserveErrorDecisionP
     return null;
   }
 
-  if (!value.task_id || !value.device_id || typeof value.message !== 'string') {
+  const taskId = typeof value.task_id === 'string' && value.task_id ? String(value.task_id) : undefined;
+  const sessionId = typeof value.session_id === 'string' && value.session_id ? String(value.session_id) : undefined;
+  const runId = typeof value.run_id === 'string' && value.run_id ? String(value.run_id) : undefined;
+
+  if ((!taskId && !sessionId && !runId) || !value.device_id || typeof value.message !== 'string') {
     return null;
   }
 
   return {
-    task_id: String(value.task_id),
+    task_id: taskId,
+    session_id: sessionId,
+    run_id: runId,
     device_id: String(value.device_id),
     message: value.message,
     consecutive_count: Number(value.consecutive_count ?? 0),
@@ -52,6 +58,9 @@ function toConversationMessage(msg: Awaited<ReturnType<typeof agentApi.getChatHi
   const observeErrorDecision = normalizeObserveErrorDecisionPayload(
     msg.observe_error_decision ?? (isObserveErrorDecisionStage(msg.stage) ? msg.data : undefined),
   );
+  const sessionId = msg.session_id || msg.task_id;
+  const runId = msg.run_id || undefined;
+  const normalizedStage = msg.stage ? (isReasonStage(msg.stage) ? 'reason' : msg.stage) : undefined;
 
   return {
     id: msg.id,
@@ -65,7 +74,9 @@ function toConversationMessage(msg: Awaited<ReturnType<typeof agentApi.getChatHi
       description: msg.action_type,
     } : undefined,
     screenshot: msg.screenshot_path,
-    taskId: msg.task_id,
+    taskId: sessionId,
+    sessionId,
+    runId,
     stepNumber: msg.step_number ?? undefined,
     progressPhase: msg.phase as ChatMessage['progressPhase'],
     progressStage: msg.stage,
@@ -84,8 +95,8 @@ function toConversationMessage(msg: Awaited<ReturnType<typeof agentApi.getChatHi
       : msg.success === false
         ? true
         : Boolean(msg.stage && ['observe_received', 'ack_timeout', 'observe_timeout', 'ack_rejected', 'observe_error_retry_resumed'].includes(msg.stage)),
-    progressKey: msg.task_id && msg.step_number != null && msg.stage
-      ? `${msg.task_id}:${msg.step_number}:${isReasonStage(msg.stage) ? 'reason' : msg.stage}`
+    progressKey: sessionId && msg.step_number != null && normalizedStage
+      ? getProgressKey(sessionId, msg.step_number, normalizedStage, runId) || undefined
       : undefined,
   };
 }
@@ -163,16 +174,11 @@ function normalizeStoreStatus(status?: string): TaskStatus {
 }
 
 function hasActiveBackendTask(taskId?: string | null, status?: string, canInterrupt?: boolean): boolean {
-  return Boolean(taskId) && (
-    Boolean(canInterrupt)
-    || status === 'pending'
-    || status === 'running'
-    || status === 'waiting_confirmation'
-  );
+  return hasActiveBackendSession(taskId, status, canInterrupt);
 }
 
 function deriveBackendTaskActive(taskId?: string | null, status?: string, canInterrupt?: boolean): boolean {
-  return hasActiveBackendTask(taskId, status, canInterrupt);
+  return hasActiveBackendSession(taskId, status, canInterrupt);
 }
 
 const AGENT_STAGE_CHAIN_TEMPLATE: AgentStageChain['nodes'] = [
@@ -399,9 +405,101 @@ function buildHistoryFromSnapshot(snapshot: Awaited<ReturnType<typeof agentApi.g
   }));
 }
 
-function getProgressKey(taskId?: string | null, stepNumber?: number | null, stage?: string | null): string | null {
-  if (!taskId || stepNumber == null) return null;
-  return `${taskId}:${stepNumber}:${stage || 'progress'}`;
+function getProgressKey(sessionId?: string | null, stepNumber?: number | null, stage?: string | null, runId?: string | null): string | null {
+  if (!sessionId || stepNumber == null) return null;
+  return `${sessionId}:${runId || ''}:${stepNumber}:${stage || 'progress'}`;
+}
+
+function getProgressKeyPrefix(sessionId?: string | null, stepNumber?: number | null, runId?: string | null): string | null {
+  if (!sessionId || stepNumber == null) {
+    return null;
+  }
+  return `${sessionId}:${runId || ''}:${stepNumber}:`;
+}
+
+function resolveMessageSessionId(message: Pick<ChatMessage, 'sessionId' | 'taskId'>): string | null {
+  return message.sessionId || message.taskId || null;
+}
+
+function resolveMessageRunId(message: Pick<ChatMessage, 'runId'>): string | null {
+  return message.runId || null;
+}
+
+function resolveObserveDecisionIdentity(payload?: Partial<ObserveErrorDecisionPayload> | null) {
+  const sessionId = payload?.session_id || payload?.task_id || null;
+  return {
+    sessionId,
+    runId: payload?.run_id || null,
+  };
+}
+
+function matchesObserveDecisionIdentity(
+  message: Pick<ChatMessage, 'sessionId' | 'taskId' | 'runId' | 'isObserveErrorDecisionCard' | 'observeErrorDecisionResolved'>,
+  identity: { sessionId?: string | null; runId?: string | null },
+): boolean {
+  const messageSessionId = resolveMessageSessionId(message);
+  if (!messageSessionId || !identity.sessionId || messageSessionId !== identity.sessionId) {
+    return false;
+  }
+
+  if (identity.runId && resolveMessageRunId(message) !== identity.runId) {
+    return false;
+  }
+
+  return Boolean(message.isObserveErrorDecisionCard && !message.observeErrorDecisionResolved);
+}
+
+function matchesProgressIdentity(
+  message: Pick<ChatMessage, 'sessionId' | 'taskId' | 'runId' | 'isProgressMessage' | 'isCompleted'>,
+  identity: { sessionId?: string | null; runId?: string | null },
+): boolean {
+  const messageSessionId = resolveMessageSessionId(message);
+  if (!messageSessionId || !identity.sessionId || messageSessionId !== identity.sessionId) {
+    return false;
+  }
+
+  if (identity.runId && resolveMessageRunId(message) !== identity.runId) {
+    return false;
+  }
+
+  return Boolean(message.isProgressMessage && !message.isCompleted);
+}
+
+function getSnapshotSessionId(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>): string | null {
+  return snapshot.session_id || snapshot.task_id || null;
+}
+
+function getSnapshotRunId(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>): string | null {
+  return snapshot.run_id || null;
+}
+
+function hasActiveBackendSession(sessionId?: string | null, status?: string, canInterrupt?: boolean): boolean {
+  return Boolean(sessionId) && (
+    Boolean(canInterrupt)
+    || status === 'pending'
+    || status === 'running'
+    || status === 'waiting_confirmation'
+  );
+}
+
+function clearProgressTrackingForIdentity(
+  progressMessageIds: Record<string, string>,
+  identity: { sessionId?: string | null; runId?: string | null },
+): Record<string, string> {
+  if (!identity.sessionId) return progressMessageIds;
+
+  return Object.fromEntries(
+    Object.entries(progressMessageIds).filter(([key]) => {
+      const [keySessionId, keyRunId] = key.split(':');
+      if (keySessionId !== identity.sessionId) {
+        return true;
+      }
+      if (identity.runId && keyRunId !== identity.runId) {
+        return true;
+      }
+      return false;
+    })
+  );
 }
 
 function getProgressStatusText(stage?: string): string {
@@ -444,11 +542,15 @@ function getProgressStatusText(stage?: string): string {
   }
 }
 
-function markObserveErrorDecisionResolved(history: ChatMessage[], taskId?: string | null, messageId?: string): ChatMessage[] {
+function markObserveErrorDecisionResolved(
+  history: ChatMessage[],
+  identity: { sessionId?: string | null; runId?: string | null },
+  messageId?: string,
+): ChatMessage[] {
   return history.map((item) => {
     const shouldResolve = messageId
       ? item.id === messageId
-      : Boolean(item.isObserveErrorDecisionCard && item.taskId && taskId && item.taskId === taskId && !item.observeErrorDecisionResolved);
+      : matchesObserveDecisionIdentity(item, identity);
 
     if (!shouldResolve) {
       return item;
@@ -461,6 +563,40 @@ function markObserveErrorDecisionResolved(history: ChatMessage[], taskId?: strin
       progressStatusText: item.progressStatusText || '已处理',
     };
   });
+}
+
+function resolveObserveDecisionPayloadSessionId(payload: ObserveErrorDecisionPayload): string | undefined {
+  return payload.session_id || payload.task_id;
+}
+
+function resolveObserveDecisionPayloadRunId(payload: ObserveErrorDecisionPayload): string | undefined {
+  return payload.run_id || undefined;
+}
+
+function resolveObserveDecisionMessageId(payload: ObserveErrorDecisionPayload): string {
+  const sessionId = resolveObserveDecisionPayloadSessionId(payload) || 'unknown-session';
+  const runId = resolveObserveDecisionPayloadRunId(payload) || 'default-run';
+  return payload.message_id || `observe-decision:${sessionId}:${runId}:${payload.step_number}`;
+}
+
+function resolveObserveDecisionProgressKey(payload: ObserveErrorDecisionPayload): string | undefined {
+  const sessionId = resolveObserveDecisionPayloadSessionId(payload);
+  if (!sessionId) {
+    return undefined;
+  }
+  return getProgressKey(sessionId, payload.step_number, 'observe_error_user_decision', resolveObserveDecisionPayloadRunId(payload)) || undefined;
+}
+
+function isSameObserveDecisionCard(
+  message: ChatMessage,
+  payload: ObserveErrorDecisionPayload,
+): boolean {
+  if (message.id === resolveObserveDecisionMessageId(payload)) {
+    return true;
+  }
+
+  return matchesObserveDecisionIdentity(message, resolveObserveDecisionIdentity(payload))
+    && message.stepNumber === payload.step_number;
 }
 
 function getPendingObserveErrorDecisionFromConversation(messages: ChatMessage[]): ObserveErrorDecisionPayload | null {
@@ -487,12 +623,16 @@ function buildObserveErrorDecisionAppliedMessage(message: WsConsoleMessage): str
 }
 
 function buildObserveErrorDecisionAppliedBubble(message: WsConsoleMessage): ChatMessage {
+  const sessionId = getTaskIdFromMessage(message) || undefined;
+  const runId = getRunIdFromMessage(message) || undefined;
   return {
     id: generateId(),
     role: 'agent',
     content: buildObserveErrorDecisionAppliedMessage(message),
     timestamp: new Date().toISOString(),
-    taskId: message.task_id,
+    taskId: sessionId,
+    sessionId,
+    runId,
     success: message.success !== false,
     error: message.success === false ? buildObserveErrorDecisionAppliedMessage(message) : undefined,
     isCompleted: true,
@@ -575,8 +715,19 @@ function normalizeStatusWaitingConfirmationPatch(message: WsConsoleMessage, curr
   };
 }
 
-function clearObserveDecisionHistoryState(history: ChatMessage[], taskId: string | null, messageId?: string): ChatMessage[] {
-  return markObserveErrorDecisionResolved(history, taskId, messageId);
+function clearObserveDecisionHistoryState(
+  history: ChatMessage[],
+  identity: { sessionId?: string | null; runId?: string | null },
+  messageId?: string,
+): ChatMessage[] {
+  return markObserveErrorDecisionResolved(history, identity, messageId);
+}
+
+function resolveStatusIdentity(message: WsConsoleMessage, currentTaskId: string | null, currentRunId?: string | null) {
+  return {
+    sessionId: getTaskIdFromMessage(message) || currentTaskId,
+    runId: getRunIdFromMessage(message) || currentRunId || null,
+  };
 }
 
 function buildObserveErrorDecisionUserMessage(decision: 'continue' | 'interrupt', advice?: string): string {
@@ -599,12 +750,16 @@ function buildObserveDecisionCardStateFromSnapshot(snapshot: Awaited<ReturnType<
 }
 
 function normalizeObserveDecisionCardMessage(payload: ObserveErrorDecisionPayload): ChatMessage {
+  const sessionId = resolveObserveDecisionPayloadSessionId(payload);
+  const runId = resolveObserveDecisionPayloadRunId(payload);
   return {
-    id: payload.message_id || generateId(),
+    id: resolveObserveDecisionMessageId(payload),
     role: 'agent',
     content: payload.message,
     timestamp: payload.created_at || new Date().toISOString(),
-    taskId: payload.task_id,
+    taskId: sessionId,
+    sessionId,
+    runId,
     stepNumber: payload.step_number,
     progressPhase: 'observe',
     progressStage: 'observe_error_user_decision',
@@ -618,7 +773,7 @@ function normalizeObserveDecisionCardMessage(payload: ObserveErrorDecisionPayloa
     observeErrorDecisionResolved: false,
     isProgressMessage: true,
     isCompleted: false,
-    progressKey: `${payload.task_id}:${payload.step_number}:observe_error_user_decision`,
+    progressKey: resolveObserveDecisionProgressKey(payload),
   };
 }
 
@@ -627,7 +782,7 @@ function ensureObserveDecisionCard(history: ChatMessage[], payload: ObserveError
     return history;
   }
 
-  const existing = history.find((item) => item.id === payload.message_id || (item.isObserveErrorDecisionCard && item.taskId === payload.task_id && item.stepNumber === payload.step_number && !item.observeErrorDecisionResolved));
+  const existing = history.find((item) => isSameObserveDecisionCard(item, payload) && !item.observeErrorDecisionResolved);
   if (existing) {
     return history.map((item) => item === existing ? mergeProgressMessage(item, normalizeObserveDecisionCardMessage(payload)) : item);
   }
@@ -696,7 +851,7 @@ function deriveStageChainFromConversation(messages: ChatMessage[], fallbackStepN
 }
 
 function deriveStageChainFromSnapshot(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, history: ChatMessage[]): AgentStageChain {
-  if (!hasActiveBackendTask(snapshot.task_id, snapshot.status, snapshot.can_interrupt)) {
+  if (!hasActiveBackendSession(getSnapshotSessionId(snapshot), snapshot.status, snapshot.can_interrupt)) {
     return createDefaultStageChain();
   }
 
@@ -766,7 +921,7 @@ function buildStatePatchForSnapshot(
       ...patch,
       currentPhase,
     }, {
-      currentTaskId: snapshot.task_id,
+      currentTaskId: getSnapshotSessionId(snapshot),
       status: normalizeStoreStatus(snapshot.status),
       canInterrupt: snapshot.can_interrupt,
       currentStepNum: snapshot.current_step,
@@ -1061,12 +1216,18 @@ function normalizeInitObserveDecisionState(snapshot: Awaited<ReturnType<typeof a
   return buildObserveDecisionCardStateFromSnapshot(snapshot, history);
 }
 
-function normalizeObserveDecisionStateAfterResolution(messageId?: string, taskId?: string | null) {
+function normalizeObserveDecisionStateAfterResolution(
+  messageId?: string,
+  sessionId?: string | null,
+  runId?: string | null,
+) {
   return {
     messageId,
-    taskId: taskId || null,
+    sessionId: sessionId || null,
+    runId: runId || null,
   };
 }
+
 
 function mergeProgressMessage(message: ChatMessage, updates: Partial<ChatMessage>): ChatMessage {
   return {
@@ -1150,15 +1311,15 @@ function upsertConversationProgress(
 
 function finalizeProgressMessages(
   history: ChatMessage[],
-  taskId: string | null,
+  identity: { sessionId?: string | null; runId?: string | null },
   status: 'completed' | 'failed' | 'interrupted',
   content?: string,
   errorType?: string,
 ): ChatMessage[] {
-  if (!taskId) return history;
+  if (!identity.sessionId) return history;
 
   return history.map((msg) => {
-    if (msg.taskId !== taskId || !msg.isProgressMessage || msg.isCompleted) {
+    if (!matchesProgressIdentity(msg, identity)) {
       return msg;
     }
 
@@ -1175,22 +1336,21 @@ function finalizeProgressMessages(
   });
 }
 
-function clearProgressTracking(progressMessageIds: Record<string, string>, taskId: string | null): Record<string, string> {
-  if (!taskId) return progressMessageIds;
-
-  return Object.fromEntries(
-    Object.entries(progressMessageIds).filter(([key]) => !key.startsWith(`${taskId}:`))
-  );
+function clearProgressTracking(
+  progressMessageIds: Record<string, string>,
+  identity: { sessionId?: string | null; runId?: string | null },
+): Record<string, string> {
+  return clearProgressTrackingForIdentity(progressMessageIds, identity);
 }
 
 function appendStatusMessageIfNeeded(
   history: ChatMessage[],
-  taskId: string | null,
+  identity: { sessionId?: string | null; runId?: string | null },
   content: string,
   status: 'completed' | 'failed' | 'interrupted',
 ): ChatMessage[] {
-  if (!taskId) return history;
-  const hasOpenProgress = history.some((msg) => msg.taskId === taskId && msg.isProgressMessage && !msg.isCompleted);
+  if (!identity.sessionId) return history;
+  const hasOpenProgress = history.some((msg) => matchesProgressIdentity(msg, identity));
   if (hasOpenProgress) {
     return history;
   }
@@ -1202,7 +1362,9 @@ function appendStatusMessageIfNeeded(
       role: 'agent',
       content,
       timestamp: new Date().toISOString(),
-      taskId,
+      taskId: identity.sessionId,
+      sessionId: identity.sessionId,
+      runId: identity.runId || undefined,
       success: status === 'completed',
       error: status === 'completed' ? undefined : content,
       errorType: status === 'failed' ? 'task_failed' : undefined,
@@ -1263,16 +1425,17 @@ function buildProgressMessageId(progressKey: string): string {
 }
 
 function getTaskIdFromMessage(message: WsConsoleMessage): string | null {
-  return message.task_id || null;
+  return message.task_id || message.session_id || message.data?.task_id || message.data?.session_id || null;
 }
 
 function getStepNumberFromMessage(message: WsConsoleMessage): number {
   return message.step_number ?? 0;
 }
 
-function shouldFinalizeOnAgentStep(message: WsConsoleMessage): boolean {
-  return message.step_number != null && Boolean(message.task_id);
+function getRunIdFromMessage(message: WsConsoleMessage): string | null {
+  return message.run_id || message.data?.run_id || null;
 }
+
 
 function finalizeProgressForStep(
   history: ChatMessage[],
@@ -1289,10 +1452,6 @@ function normalizeStatusData(data?: Record<string, any>): Record<string, any> {
   return data || {};
 }
 
-function normalizeFailureErrorType(message: WsConsoleMessage): string | undefined {
-  return message.error_type || message.data?.error_type;
-}
-
 function normalizeFailureMessage(message: WsConsoleMessage): string {
   return buildStatusFailureMessage(message.message, normalizeStatusData(message.data));
 }
@@ -1307,13 +1466,13 @@ function normalizeInterruptionMessage(message: WsConsoleMessage): string {
 
 function progressHistoryAfterStatus(
   history: ChatMessage[],
-  taskId: string | null,
+  identity: { sessionId?: string | null; runId?: string | null },
   status: 'completed' | 'failed' | 'interrupted',
   content: string,
   errorType?: string,
 ): ChatMessage[] {
-  const finalized = finalizeProgressMessages(history, taskId, status, content, errorType);
-  return appendStatusMessageIfNeeded(finalized, taskId, content, status);
+  const finalized = finalizeProgressMessages(history, identity, status, content, errorType);
+  return appendStatusMessageIfNeeded(finalized, identity, content, status);
 }
 
 function shouldSuppressStandaloneAgentStep(history: ChatMessage[], progressKey: string | null): boolean {
@@ -1352,12 +1511,6 @@ function removeProgressTracking(
   return next;
 }
 
-function removeTaskProgressTracking(
-  map: Record<string, string>,
-  taskId: string | null,
-): Record<string, string> {
-  return clearProgressTracking(map, taskId);
-}
 
 function normalizeProgressResult(message: WsConsoleMessage): string | undefined {
   return message.result || undefined;
@@ -1404,6 +1557,7 @@ function normalizeProgressKey(message: WsConsoleMessage): string | null {
     normalizeProgressTaskId(message) || undefined,
     normalizeProgressStepNumber(message),
     collapsedStage,
+    getRunIdFromMessage(message),
   );
 }
 
@@ -1441,35 +1595,37 @@ function shouldHideThinkingPanel(message: WsConsoleMessage): boolean {
 }
 
 function normalizeStatusTaskId(message: WsConsoleMessage): string | null {
-  return message.task_id || message.data?.task_id || null;
+  return getTaskIdFromMessage(message);
 }
 
 function normalizeAgentStepProgressKey(message: WsConsoleMessage): string | null {
   // Apply same reason-stage normalization so agent_step is suppressed if a reason bubble exists.
   const rawStage = message.stage || 'observe_received';
   const collapsedStage = isReasonStage(rawStage) ? 'reason' : rawStage;
-  return getProgressKey(message.task_id, message.step_number, collapsedStage);
+  return getProgressKey(getTaskIdFromMessage(message), message.step_number, collapsedStage, getRunIdFromMessage(message));
 }
 
 function getAnyStepProgressKeys(progressMessageIds: Record<string, string>, message: WsConsoleMessage): string[] {
-  const taskId = message.task_id;
+  const sessionId = getTaskIdFromMessage(message);
   const stepNumber = message.step_number;
-  if (!taskId || stepNumber == null) {
+  const runId = getRunIdFromMessage(message);
+  const prefix = getProgressKeyPrefix(sessionId, stepNumber, runId);
+  if (!prefix) {
     return [];
   }
 
-  const prefix = `${taskId}:${stepNumber}:`;
   return Object.keys(progressMessageIds).filter((key) => key.startsWith(prefix));
 }
 
 function hasAnyStepProgressMessage(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): boolean {
-  const taskId = message.task_id;
+  const sessionId = getTaskIdFromMessage(message);
   const stepNumber = message.step_number;
-  if (!taskId || stepNumber == null) {
+  const runId = getRunIdFromMessage(message);
+  const prefix = getProgressKeyPrefix(sessionId, stepNumber, runId);
+  if (!prefix) {
     return false;
   }
 
-  const prefix = `${taskId}:${stepNumber}:`;
   return state.conversationHistory.some((item) => item.progressKey?.startsWith(prefix));
 }
 
@@ -1477,13 +1633,14 @@ function markAllStepProgressCompleted(
   history: ChatMessage[],
   message: WsConsoleMessage,
 ): ChatMessage[] {
-  const taskId = message.task_id;
+  const sessionId = getTaskIdFromMessage(message);
   const stepNumber = message.step_number;
-  if (!taskId || stepNumber == null) {
+  const runId = getRunIdFromMessage(message);
+  const prefix = getProgressKeyPrefix(sessionId, stepNumber, runId);
+  if (!prefix) {
     return history;
   }
 
-  const prefix = `${taskId}:${stepNumber}:`;
   return history.map((item) => {
     if (!item.progressKey?.startsWith(prefix)) {
       return item;
@@ -1501,38 +1658,6 @@ function markAllStepProgressCompleted(
       progressStatusText: item.progressStatusText || (message.success === false ? '已失败' : '已完成'),
     });
   });
-}
-
-function removeAllStepProgressTracking(
-  progressMessageIds: Record<string, string>,
-  message: WsConsoleMessage,
-): Record<string, string> {
-  return getAnyStepProgressKeys(progressMessageIds, message).reduce<Record<string, string>>((acc, key) => {
-    const next = { ...acc };
-    delete next[key];
-    return next;
-  }, { ...progressMessageIds });
-}
-
-function latestOpenProgressMessageForStep(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): ChatMessage | undefined {
-  const taskId = message.task_id;
-  const stepNumber = message.step_number;
-  if (!taskId || stepNumber == null) {
-    return undefined;
-  }
-
-  const prefix = `${taskId}:${stepNumber}:`;
-  return [...state.conversationHistory]
-    .reverse()
-    .find((item) => item.progressKey?.startsWith(prefix) && !item.isCompleted);
-}
-
-function shouldSyncProgressScreenshotOnStep(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): boolean {
-  return Boolean(latestOpenProgressMessageForStep(state, message)?.screenshot);
-}
-
-function screenshotForStepMessage(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): string | undefined {
-  return message.screenshot || latestOpenProgressMessageForStep(state, message)?.screenshot;
 }
 
 function normalizeAgentStepAction(message: WsConsoleMessage): AgentAction | undefined {
@@ -1576,7 +1701,7 @@ function normalizeAgentStepNumber(message: WsConsoleMessage): number {
 }
 
 function normalizeAgentStepTaskId(message: WsConsoleMessage): string | null {
-  return message.task_id || null;
+  return getTaskIdFromMessage(message);
 }
 
 function normalizeStatusErrorType(message: WsConsoleMessage): string | undefined {
@@ -1703,23 +1828,25 @@ function buildStandaloneAgentStepMessage(message: WsConsoleMessage): ChatMessage
 function applyStatusToState(
   history: ChatMessage[],
   message: WsConsoleMessage,
+  currentTaskId?: string | null,
+  currentRunId?: string | null,
 ): ChatMessage[] {
-  const taskId = normalizeStatusTaskId(message);
+  const identity = resolveStatusIdentity(message, currentTaskId ?? null, currentRunId ?? null);
 
   if (message.status === 'finished' || message.status === 'completed') {
-    return progressHistoryAfterStatus(history, taskId, 'completed', normalizeCompletionMessage(message));
+    return progressHistoryAfterStatus(history, identity, 'completed', normalizeCompletionMessage(message));
   }
   if (message.status === 'error' || message.status === 'failed') {
     return progressHistoryAfterStatus(
       history,
-      taskId,
+      identity,
       'failed',
       normalizeFailureMessage(message),
       normalizeStatusErrorType(message),
     );
   }
   if (message.status === 'interrupted') {
-    return progressHistoryAfterStatus(history, taskId, 'interrupted', normalizeInterruptionMessage(message));
+    return progressHistoryAfterStatus(history, identity, 'interrupted', normalizeInterruptionMessage(message));
   }
 
   return history;
@@ -1728,9 +1855,12 @@ function applyStatusToState(
 function updateProgressMapForStatus(
   progressMessageIds: Record<string, string>,
   message: WsConsoleMessage,
+  currentTaskId?: string | null,
+  currentRunId?: string | null,
 ): Record<string, string> {
   if (message.status === 'finished' || message.status === 'completed' || message.status === 'error' || message.status === 'failed' || message.status === 'interrupted') {
-    return removeTaskProgressTracking(progressMessageIds, normalizeStatusTaskId(message));
+    const identity = resolveStatusIdentity(message, currentTaskId ?? null, currentRunId ?? null);
+    return clearProgressTracking(progressMessageIds, identity);
   }
   return progressMessageIds;
 }
@@ -1923,9 +2053,11 @@ function appendStandaloneStepInState(
 function applyStatusInState(
   state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
   message: WsConsoleMessage,
+  currentTaskId?: string | null,
+  currentRunId?: string | null,
 ): { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> } {
-  const conversationHistory = ensureStatusMessage(applyStatusToState(state.conversationHistory, message), message);
-  const progressMessageIds = updateProgressMapForStatus(state.progressMessageIds, message);
+  const conversationHistory = ensureStatusMessage(applyStatusToState(state.conversationHistory, message, currentTaskId, currentRunId), message);
+  const progressMessageIds = updateProgressMapForStatus(state.progressMessageIds, message, currentTaskId, currentRunId);
   return { conversationHistory, progressMessageIds };
 }
 
@@ -1996,6 +2128,17 @@ function updateProgressMessageWithStep(message: WsConsoleMessage): Partial<ChatM
 
 function shouldUseExistingProgressMessage(state: { conversationHistory: ChatMessage[] }, message: WsConsoleMessage): boolean {
   return hasAnyStepProgressMessage(state, message);
+}
+
+function removeAllStepProgressTracking(
+  progressMessageIds: Record<string, string>,
+  message: WsConsoleMessage,
+): Record<string, string> {
+  return getAnyStepProgressKeys(progressMessageIds, message).reduce<Record<string, string>>((acc, key) => {
+    const next = { ...acc };
+    delete next[key];
+    return next;
+  }, { ...progressMessageIds });
 }
 
 function removeStepProgressTracking(
@@ -2194,7 +2337,7 @@ function shouldSetCurrentTaskIdFromStatus(message: WsConsoleMessage): boolean {
 }
 
 function normalizeMessageTaskId(message: WsConsoleMessage): string | null {
-  return message.task_id || message.data?.task_id || null;
+  return getTaskIdFromMessage(message);
 }
 
 function normalizeMessageErrorType(message: WsConsoleMessage): string | undefined {
@@ -2333,9 +2476,24 @@ function normalizeTaskCreatedState() {
   };
 }
 
+function normalizeSoftCloseSessionState() {
+  return {
+    isLocked: false,
+    controllerId: null,
+    pendingAction: null,
+    error: null,
+    isSessionHydrating: false,
+    ...resetTransientProgressState(),
+    waitingForConfirm: false,
+    waitingConfirmPhase: null,
+    ...normalizeEndSessionObserveDecisionState(),
+  };
+}
+
 function normalizeEndSessionState() {
   return {
     currentTaskId: null,
+    currentInstruction: null,
     isRunning: false,
     isLocked: false,
     controllerId: null,
@@ -2344,13 +2502,219 @@ function normalizeEndSessionState() {
     status: 'pending' as const,
     history: [],
     conversationHistory: [],
+    displayConversationHistory: [],
     currentScreenshot: null,
     currentApp: '未知',
     canInterrupt: false,
     canResume: false,
+    isSessionHydrating: false,
     progressMessageIds: resetProgressMap(),
     ...resetTransientProgressState(),
+    ...normalizeEndSessionObserveDecisionState(),
   };
+}
+
+function buildSessionHydratingPatch(isSessionHydrating: boolean) {
+  return { isSessionHydrating };
+}
+
+function shouldReuseHydratedSession(state: Pick<AgentState, 'currentDeviceId' | 'conversationHistory' | 'currentScreenshot'>, deviceId: string) {
+  return state.currentDeviceId === deviceId && (
+    state.conversationHistory.length > 0
+    || Boolean(state.currentScreenshot)
+  );
+}
+
+function buildInitSessionStartPatch(
+  state: Pick<AgentState, 'currentDeviceId' | 'conversationHistory' | 'currentScreenshot' | 'displayConversationHistory' | 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase' | 'mode'>,
+  deviceId: string,
+  mode: AgentMode,
+): Partial<AgentState> {
+  if (shouldReuseHydratedSession(state, deviceId)) {
+    return buildStatePatchFromCurrent(state, {
+      currentDeviceId: deviceId,
+      mode: state.mode,
+      error: null,
+      isLocked: true,
+      controllerId: wsConsoleApi.getConsoleId(),
+      ...buildSessionHydratingPatch(true),
+    });
+  }
+
+  return buildResetStatePatch(state, {
+    currentDeviceId: deviceId,
+    currentTaskId: null,
+    currentInstruction: null,
+    mode,
+    isRunning: false,
+    isLocked: true,
+    controllerId: wsConsoleApi.getConsoleId(),
+    currentStep: null,
+    history: [],
+    pendingAction: null,
+    status: 'pending',
+    currentStepNum: 0,
+    maxSteps: 100,
+    error: null,
+    conversationHistory: [],
+    displayConversationHistory: [],
+    currentScreenshot: null,
+    currentApp: '未知',
+    waitingForConfirm: false,
+    waitingConfirmPhase: null,
+    maxObserveErrorRetries: 2,
+    canInterrupt: false,
+    canResume: false,
+    progressMessageIds: normalizeResetProgressTracking(),
+    ...buildSessionHydratingPatch(true),
+    ...normalizeEndSessionObserveDecisionState(),
+  });
+}
+
+function buildInitSessionErrorPatch(
+  state: Pick<AgentState, 'currentDeviceId' | 'conversationHistory' | 'currentScreenshot' | 'displayConversationHistory' | 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+  deviceId: string,
+  mode: AgentMode,
+  error: unknown,
+): Partial<AgentState> {
+  const errorMessage = error instanceof Error ? error.message : 'Failed to initialize session';
+
+  if (shouldReuseHydratedSession(state, deviceId)) {
+    return buildStatePatchFromCurrent(state, {
+      currentDeviceId: deviceId,
+      mode,
+      error: errorMessage,
+      isLocked: true,
+      controllerId: wsConsoleApi.getConsoleId(),
+      ...buildSessionHydratingPatch(false),
+    });
+  }
+
+  return buildResetStatePatch(state, {
+    currentDeviceId: deviceId,
+    currentTaskId: null,
+    currentInstruction: null,
+    mode,
+    isRunning: false,
+    isLocked: true,
+    controllerId: wsConsoleApi.getConsoleId(),
+    currentStep: null,
+    history: [],
+    pendingAction: null,
+    status: 'pending',
+    currentStepNum: 0,
+    maxSteps: 100,
+    error: errorMessage,
+    conversationHistory: [],
+    displayConversationHistory: [],
+    currentScreenshot: null,
+    currentApp: '未知',
+    waitingForConfirm: false,
+    waitingConfirmPhase: null,
+    maxObserveErrorRetries: 2,
+    canInterrupt: false,
+    canResume: false,
+    progressMessageIds: normalizeResetProgressTracking(),
+    ...buildSessionHydratingPatch(false),
+    ...normalizeEndSessionObserveDecisionState(),
+  });
+}
+
+function cleanupWsBinding(deviceId: string | null, wsCallback: ((msg: WsConsoleMessage) => void) | null) {
+  if (deviceId) {
+    wsConsoleApi.unsubscribe(deviceId);
+  }
+
+  if (wsCallback) {
+    wsConsoleApi.removeCallback(wsCallback);
+  }
+}
+
+function buildSoftCloseSessionPatch(
+  state: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+) {
+  return buildStatePatchFromCurrent(state, normalizeSoftCloseSessionState());
+}
+
+function buildHardEndSessionPatch(
+  state: Pick<AgentState, 'currentTaskId' | 'status' | 'canInterrupt' | 'currentStepNum' | 'currentPhase'>,
+) {
+  return buildResetStatePatch(state, normalizeEndSessionState());
+}
+
+function buildHydratedSessionSuccessPatch(
+  snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>,
+  hydratedHistory: ChatMessage[],
+  mode: AgentMode,
+) {
+  const history = buildHistoryFromSnapshot(snapshot);
+  const currentStep = getCurrentStepFromHistory(history);
+  const normalizedStatus = normalizeStoreStatus(snapshot.status);
+  const sessionId = getSnapshotSessionId(snapshot);
+  const runId = getSnapshotRunId(snapshot);
+  const isRunning = hasActiveBackendSession(sessionId, snapshot.status, snapshot.can_interrupt);
+  const transientState = transientStateFromConversation(hydratedHistory);
+
+  return {
+    currentDeviceId: snapshot.device_id ?? null,
+    currentTaskId: sessionId,
+    currentSessionId: sessionId,
+    currentRunId: runId,
+    currentInstruction: snapshot.instruction,
+    mode: sessionId ? snapshot.mode : mode,
+    isRunning,
+    isLocked: true,
+    controllerId: wsConsoleApi.getConsoleId(),
+    currentStep,
+    history,
+    pendingAction: null,
+    status: normalizedStatus,
+    currentStepNum: snapshot.current_step,
+    maxSteps: snapshot.max_steps,
+    maxObserveErrorRetries: snapshot.max_observe_error_retries ?? 2,
+    error: null,
+    isSessionHydrating: false,
+    ...buildSnapshotConversationStatePatch(snapshot, hydratedHistory),
+    currentScreenshot: snapshot.current_screenshot || latestScreenshotFromConversation(hydratedHistory),
+    currentApp: snapshot.current_app || '未知',
+    waitingForConfirm: false,
+    waitingConfirmPhase: null,
+    canInterrupt: snapshot.can_interrupt,
+    canResume: snapshot.can_resume,
+    progressMessageIds: progressTrackingFromConversation(hydratedHistory),
+    ...normalizeInitObserveDecisionState(snapshot, hydratedHistory),
+    ...transientState,
+  } satisfies Partial<AgentState>;
+}
+
+function buildInitSnapshotHistory(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, savedHistory: ChatMessage[]) {
+  const restoredHistory = mergeRestoredConversation(
+    snapshot.chat_history.map(toConversationMessage),
+    savedHistory,
+  );
+  return normalizeConversationAfterSnapshot(snapshot, restoredHistory);
+}
+
+function normalizeInitSessionMode(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, mode: AgentMode) {
+  return getSnapshotSessionId(snapshot) ? snapshot.mode : mode;
+}
+
+function buildInitSessionSnapshotPatch(snapshot: Awaited<ReturnType<typeof agentApi.getLatestDeviceSnapshot>>, hydratedHistory: ChatMessage[], mode: AgentMode) {
+  return {
+    ...buildHydratedSessionSuccessPatch(snapshot, hydratedHistory, normalizeInitSessionMode(snapshot, mode)),
+    currentDeviceId: snapshot.device_id ?? null,
+  };
+}
+
+function buildInitSessionTargetDevicePatch(deviceId: string, patch: Partial<AgentState>) {
+  return {
+    ...patch,
+    currentDeviceId: deviceId,
+  };
+}
+
+function sameDeviceHydrationState(deviceId: string, currentDeviceId: string | null) {
+  return currentDeviceId === deviceId;
 }
 
 function normalizeInitSessionState(savedHistory: ChatMessage[]) {
@@ -2596,9 +2960,12 @@ function normalizeAgentStepConversationState(
 function normalizeAgentStatusConversationState(
   state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
   message: WsConsoleMessage,
+  currentTaskId?: string | null,
+  currentRunId?: string | null,
 ) {
-  return applyStatusInState(state, message);
+  return applyStatusInState(state, message, currentTaskId, currentRunId);
 }
+
 
 function normalizeProgressCurrentTaskId(message: WsConsoleMessage, currentTaskId: string | null): string | null {
   return updateCurrentTaskIdFromMessage(normalizeProgressTaskId(message), currentTaskId);
@@ -2924,17 +3291,23 @@ function normalizeTaskIdMatchesProgress(taskId: string | null, progressKey: stri
   return Boolean(taskId && normalizeTaskIdFromProgressKey(progressKey) === taskId);
 }
 
-function normalizeFilteredProgressMap(progressMessageIds: Record<string, string>, taskId: string | null): Record<string, string> {
-  return removeTaskProgressTracking(progressMessageIds, taskId);
+function normalizeFilteredProgressMap(
+  progressMessageIds: Record<string, string>,
+  identity: { sessionId?: string | null; runId?: string | null },
+): Record<string, string> {
+  return clearProgressTracking(progressMessageIds, identity);
 }
 
 function normalizeTerminalConversationState(
   state: { conversationHistory: ChatMessage[]; progressMessageIds: Record<string, string> },
   message: WsConsoleMessage,
+  currentTaskId?: string | null,
+  currentRunId?: string | null,
 ) {
+  const identity = resolveStatusIdentity(message, currentTaskId ?? null, currentRunId ?? null);
   return {
     conversationHistory: normalizeTerminalStatusHistory(state.conversationHistory, message),
-    progressMessageIds: normalizeFilteredProgressMap(state.progressMessageIds, normalizeStatusTaskId(message)),
+    progressMessageIds: normalizeFilteredProgressMap(state.progressMessageIds, identity),
   };
 }
 
@@ -3301,7 +3674,7 @@ function normalizeStepShouldUpdateCurrentTaskId(message: WsConsoleMessage): bool
 }
 
 function normalizeTaskCreatedTaskId(message: WsConsoleMessage): string | undefined {
-  return message.task_id;
+  return getTaskIdFromMessage(message) || undefined;
 }
 
 function normalizeTaskCreatedRunning(): boolean {
@@ -3681,7 +4054,7 @@ function normalizeShouldSetCurrentTaskIdFromAgentStep(message: WsConsoleMessage)
 
 function normalizeTaskCreatedStatePatch(message: WsConsoleMessage) {
   return {
-    currentTaskId: message.task_id,
+    currentTaskId: getTaskIdFromMessage(message),
     isRunning: true,
     status: 'running' as const,
     ...normalizeTaskCreatedBaseState(),
@@ -4018,10 +4391,6 @@ async function saveMessageToAPI(
 }
 
 export const agentStoreLegacyCompatRegistry = {
-  shouldFinalizeOnAgentStep,
-  normalizeFailureErrorType,
-  shouldSyncProgressScreenshotOnStep,
-  screenshotForStepMessage,
   normalizeStatusReason,
   normalizeStatusFinalReasoning,
   upsertProgressIntoHistory,
@@ -4269,6 +4638,8 @@ interface AgentState {
   currentDeviceId: string | null;
   progressMessageIds: Record<string, string>;
   currentTaskId: string | null;
+  currentSessionId: string | null;  // persistent session identifier (task_id alias)
+  currentRunId: string | null;        // per-auto-run identifier
   currentInstruction: string | null; // 当前任务指令
   mode: AgentMode;
   isRunning: boolean;
@@ -4291,6 +4662,7 @@ interface AgentState {
 
   // Error handling
   error: string | null;
+  isSessionHydrating: boolean;
 
   // 对话历史（气泡式对话）
   conversationHistory: ChatMessage[];
@@ -4324,6 +4696,7 @@ interface AgentState {
 
   // Actions
   initSession: (deviceId: string, mode?: AgentMode) => void;
+  softCloseSession: () => void;
   endSession: () => void;
   setMode: (mode: AgentMode) => void;
   setMaxParseRetries: (retries: number) => void;
@@ -4385,6 +4758,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   currentDeviceId: null,
   progressMessageIds: {},
   currentTaskId: null,
+  currentSessionId: null,
+  currentRunId: null,
   currentInstruction: null,
   mode: 'normal',
   isRunning: false,
@@ -4399,6 +4774,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   maxParseRetries: 2,
   maxObserveErrorRetries: 2,
   error: null,
+  isSessionHydrating: false,
   conversationHistory: [],
   displayConversationHistory: [],
   currentScreenshot: null,
@@ -4417,11 +4793,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   stageChain: createDefaultStageChain(),
 
   initSession: async (deviceId, mode = 'normal') => {
+    const state = get();
     const wsCallback = useAgentStore.getState()._handleWsMessage;
 
-    if (wsCallback) {
-      wsConsoleApi.removeCallback(wsCallback);
-    }
+    cleanupWsBinding(state.currentDeviceId, wsCallback);
+
+    set((currentState) => buildInitSessionTargetDevicePatch(deviceId, buildInitSessionStartPatch(currentState, deviceId, mode)));
 
     wsConsoleApi.connect();
     wsConsoleApi.subscribe(deviceId);
@@ -4430,121 +4807,41 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     try {
       const snapshot = await agentApi.getLatestDeviceSnapshot(deviceId);
       const savedHistory = await loadConversationHistoryFromAPI(deviceId, snapshot.task_id);
-      const restoredHistory = mergeRestoredConversation(
-        snapshot.chat_history.map(toConversationMessage),
-        savedHistory,
-      );
-      const hydratedHistory = normalizeConversationAfterSnapshot(snapshot, restoredHistory);
-      const history = buildHistoryFromSnapshot(snapshot);
-      const currentStep = getCurrentStepFromHistory(history);
-      const normalizedStatus = normalizeStoreStatus(snapshot.status);
-      const isRunning = hasActiveBackendTask(snapshot.task_id, snapshot.status, snapshot.can_interrupt);
-      const transientState = transientStateFromConversation(hydratedHistory);
+      const hydratedHistory = buildInitSnapshotHistory(snapshot, savedHistory);
 
-      set({
-        currentDeviceId: deviceId,
-        currentTaskId: snapshot.task_id,
-        currentInstruction: snapshot.instruction,
-        mode: snapshot.task_id ? snapshot.mode : mode,
-        isRunning,
-        isLocked: true,
-        controllerId: wsConsoleApi.getConsoleId(),
-        currentStep,
-        history,
-        pendingAction: null,
-        status: normalizedStatus,
-        currentStepNum: snapshot.current_step,
-        maxSteps: snapshot.max_steps,
-        maxObserveErrorRetries: snapshot.max_observe_error_retries ?? 2,
-        error: null,
-        ...buildSnapshotConversationStatePatch(snapshot, hydratedHistory),
-        currentScreenshot: snapshot.current_screenshot || latestScreenshotFromConversation(hydratedHistory),
-        currentApp: snapshot.current_app || '未知',
-        waitingForConfirm: false,
-        waitingConfirmPhase: null,
-        canInterrupt: snapshot.can_interrupt,
-        canResume: snapshot.can_resume,
-        progressMessageIds: progressTrackingFromConversation(hydratedHistory),
-        ...normalizeInitObserveDecisionState(snapshot, hydratedHistory),
-        ...transientState,
-      });
+      if (!sameDeviceHydrationState(deviceId, get().currentDeviceId)) {
+        return;
+      }
+
+      set((currentState) => buildInitSessionSnapshotPatch(snapshot, hydratedHistory, currentState.mode));
     } catch (error: any) {
       console.error('Failed to initialize agent session:', error);
-      set({
-        currentDeviceId: deviceId,
-        currentTaskId: null,
-        currentInstruction: null,
-        mode,
-        isRunning: false,
-        isLocked: true,
-        controllerId: wsConsoleApi.getConsoleId(),
-        currentStep: null,
-        history: [],
-        pendingAction: null,
-        status: 'pending',
-        currentStepNum: 0,
-        maxSteps: 100,
-        error: error.message || 'Failed to initialize session',
-        conversationHistory: [],
-        displayConversationHistory: [],
-        currentScreenshot: null,
-        currentApp: '未知',
-        currentPhase: null,
-        thinkingContent: '',
-        isThinking: false,
-        waitingForConfirm: false,
-        waitingConfirmPhase: null,
-        maxObserveErrorRetries: 2,
-        ...normalizeEndSessionObserveDecisionState(),
-        canInterrupt: false,
-        canResume: false,
-        isBackendTaskActive: false,
-        stageChain: createDefaultStageChain(),
-        progressMessageIds: normalizeResetProgressTracking(),
-      });
+
+      if (!sameDeviceHydrationState(deviceId, get().currentDeviceId)) {
+        return;
+      }
+
+      set((currentState) => buildInitSessionTargetDevicePatch(deviceId, buildInitSessionErrorPatch(currentState, deviceId, mode, error)));
     }
+  },
+
+  softCloseSession: () => {
+    const state = get();
+    const wsCallback = useAgentStore.getState()._handleWsMessage;
+
+    cleanupWsBinding(state.currentDeviceId, wsCallback);
+    set((currentState) => buildSoftCloseSessionPatch(currentState));
   },
 
   endSession: () => {
     const state = get();
-
-    // Unsubscribe and disconnect WebSocket
-    if (state.currentDeviceId) {
-      wsConsoleApi.unsubscribe(state.currentDeviceId);
-    }
-
-    // Remove callback using the same reference we added
     const wsCallback = useAgentStore.getState()._handleWsMessage;
-    if (wsCallback) {
-      wsConsoleApi.removeCallback(wsCallback);
-    }
 
-    set({
+    cleanupWsBinding(state.currentDeviceId, wsCallback);
+    set((currentState) => ({
       currentDeviceId: null,
-      currentTaskId: null,
-      currentInstruction: null,
-      isRunning: false,
-      isLocked: false,
-      controllerId: null,
-      currentStep: null,
-      pendingAction: null,
-      status: 'pending',
-      history: [],
-      conversationHistory: [],
-      displayConversationHistory: [],
-      currentScreenshot: null,
-      currentApp: '未知',
-      currentPhase: null,
-      thinkingContent: '',
-      isThinking: false,
-      waitingForConfirm: false,
-      waitingConfirmPhase: null,
-      canInterrupt: false,
-      canResume: false,
-      isBackendTaskActive: false,
-      stageChain: createDefaultStageChain(),
-      progressMessageIds: normalizeResetProgressTracking(),
-    });
+      ...buildHardEndSessionPatch(currentState),
+    }));
   },
 
   setMode: (mode) => {
@@ -4630,10 +4927,17 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         if (message.device_id === deviceId) {
           agentStoreLogger.info('[handleTaskCreated] Task created via WebSocket', {
             taskId: message.task_id,
+            sessionId: message.session_id,
+            runId: message.run_id,
             deviceId: message.device_id,
           });
+          // session_id = task_id alias; run_id is new per-run identifier
+          const sessionId = message.session_id || message.task_id;
+          const runId = message.run_id || null;
           set((currentState) => buildStatePatchFromCurrent(currentState, {
-            currentTaskId: message.task_id,
+            currentTaskId: message.task_id || sessionId,
+            currentSessionId: sessionId,
+            currentRunId: runId,
             isRunning: true,
             status: 'running',
             currentStepNum: 0,
@@ -4653,11 +4957,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       case 'observe_error_decision_applied':
         if (message.device_id === deviceId) {
           const pendingDecision = state.pendingObserveErrorDecision;
-          const taskId = pendingDecision?.task_id || state.currentTaskId;
+          const pendingIdentity = resolveObserveDecisionIdentity(pendingDecision ?? null);
+          const sessionId = pendingIdentity.sessionId || state.currentSessionId || state.currentTaskId;
+          const runId = pendingIdentity.runId || state.currentRunId;
           const decisionCardMessageId = pendingDecision?.message_id;
           const appliedBubble = buildObserveErrorDecisionAppliedBubble({
             ...message,
-            task_id: taskId || undefined,
+            task_id: sessionId || undefined,
+            session_id: sessionId || undefined,
+            run_id: runId || undefined,
           });
           const appliedSuccessfully = isObserveDecisionAppliedSuccess(message);
 
@@ -4667,12 +4975,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             if (appliedSuccessfully) {
               conversationHistory = clearObserveDecisionHistoryState(
                 conversationHistory,
-                taskId,
+                { sessionId, runId },
                 decisionCardMessageId,
               );
             }
 
-                return buildConversationAndDerivedPatch(currentState, conversationHistory, {
+            return buildConversationAndDerivedPatch(currentState, conversationHistory, {
               ...(appliedSuccessfully
                 ? buildObserveDecisionStatePatchFromHistory(conversationHistory)
                 : {
@@ -4775,7 +5083,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const state = get();
     if (state.currentDeviceId) {
       try {
-        await agentApi.clearChatHistory(state.currentDeviceId);
+        await agentApi.clearSessionContext(state.currentDeviceId);
       } catch (e) {
         console.error('Failed to clear chat history on server:', e);
       }
@@ -4827,7 +5135,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       agentStoreLogger.debug('[sendCommand] Session created', { session });
 
       const result = await agentApi.startTask(state.currentDeviceId, {
-        task_id: state.currentTaskId || '',
+        task_id: state.currentTaskId || session.task_id || '',
+        session_id: state.currentSessionId || session.session_id || undefined,
+        run_id: state.currentRunId || session.run_id || undefined,
         instruction: command,
         mode: state.mode,
         max_steps: state.maxSteps,
@@ -4920,7 +5230,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     state.upsertProgressMessage(message);
 
     agentStoreLogger.debug('[handleAgentProgress] Progress processed', {
-      taskId: message.task_id,
+      taskId: getTaskIdFromMessage(message),
       stepNumber: message.step_number,
       phase: message.phase,
       stage: message.stage,
@@ -4979,12 +5289,17 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         progressMessageIds: state.progressMessageIds,
       },
       message,
+      state.currentSessionId ?? state.currentTaskId,
+      state.currentRunId,
     );
 
     if (status === 'finished' || status === 'completed') {
       state.setCurrentStep(null);
       set((currentState) => buildConversationAndDerivedPatch(currentState, conversationPatch.conversationHistory, {
         ...normalizeStatusCompletedState(message, state.currentTaskId),
+        // Keep session, clear run - session persists for next run
+        currentSessionId: message.session_id || currentState.currentSessionId,
+        currentRunId: null,
         progressMessageIds: conversationPatch.progressMessageIds,
         ...clearObserveDecisionSubmissionState(),
         ...updateStoreTransientForStatus(message),
@@ -4997,6 +5312,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       state.setCurrentStep(null);
       set((currentState) => buildConversationAndDerivedPatch(currentState, conversationPatch.conversationHistory, {
         ...normalizeStatusFailedState(message, state.currentTaskId),
+        currentSessionId: message.session_id || currentState.currentSessionId,
+        currentRunId: null,
         error: normalizeFailureMessage(message),
         progressMessageIds: conversationPatch.progressMessageIds,
         ...clearObserveDecisionSubmissionState(),
@@ -5009,6 +5326,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       state.setCurrentStep(null);
       set((currentState) => buildConversationAndDerivedPatch(currentState, conversationPatch.conversationHistory, {
         ...normalizeStatusInterruptedState(message, state.currentTaskId),
+        currentSessionId: message.session_id || currentState.currentSessionId,
+        currentRunId: null,
         progressMessageIds: conversationPatch.progressMessageIds,
         ...clearObserveDecisionSubmissionState(),
         ...updateStoreTransientForStatus(message),
@@ -5021,6 +5340,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       set((currentState) => buildConversationAndDerivedPatch(currentState, conversationPatch.conversationHistory, {
         ...normalizeStatusStateWithObserveDecision(message, state.currentTaskId, state.canInterrupt),
         currentTaskId: normalizeAgentStatusCurrentTaskId(message, state.currentTaskId),
+        // Capture or update session/run IDs from agent_status message
+        currentSessionId: message.session_id || currentState.currentSessionId,
+        currentRunId: message.run_id || currentState.currentRunId,
         progressMessageIds: conversationPatch.progressMessageIds,
         ...updateStoreTransientForStatus(message),
       }));
@@ -5129,7 +5451,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const phaseToConfirm = state.waitingConfirmPhase;
     agentStoreLogger.info('[confirmPhase] Sending phase confirmation', { approved, deviceId: state.currentDeviceId, phase: phaseToConfirm });
 
-    wsConsoleApi.sendConfirmPhase(state.currentDeviceId, approved);
+    wsConsoleApi.sendConfirmPhase(state.currentDeviceId, approved, {
+      session_id: state.currentSessionId || undefined,
+      run_id: state.currentRunId || undefined,
+      task_id: state.currentTaskId || undefined,
+    });
 
     set((currentState) => buildStatePatchFromCurrent(currentState, {
       pendingAction: null,
@@ -5174,7 +5500,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const userMessage = buildObserveErrorDecisionUserMessage(decision, trimmedAdvice || undefined);
     state.addUserMessage(userMessage);
 
-    wsConsoleApi.sendObserveErrorDecision(state.currentDeviceId, decision, trimmedAdvice);
+    wsConsoleApi.sendObserveErrorDecision(state.currentDeviceId, decision, trimmedAdvice, {
+      session_id: state.currentSessionId || undefined,
+      run_id: state.currentRunId || undefined,
+      task_id: state.currentTaskId || undefined,
+    });
 
     if (decision === 'interrupt') {
       set((currentState) => buildStatePatchFromCurrent(currentState, {
@@ -5198,10 +5528,14 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
   resolveObserveErrorDecisionCard: (messageId?: string) => {
     const state = get();
-    const resolution = normalizeObserveDecisionStateAfterResolution(messageId, state.currentTaskId);
+    const resolution = normalizeObserveDecisionStateAfterResolution(
+      messageId,
+      state.currentSessionId ?? state.currentTaskId,
+      state.currentRunId,
+    );
     const conversationHistory = clearObserveDecisionHistoryState(
       state.conversationHistory,
-      resolution.taskId,
+      { sessionId: resolution.sessionId, runId: resolution.runId },
       resolution.messageId,
     );
 
@@ -5219,7 +5553,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
     try {
       // Send interrupt via WebSocket
-      wsConsoleApi.sendInterruptTask(state.currentDeviceId, state.currentTaskId || '');
+      wsConsoleApi.sendInterruptTask(state.currentDeviceId, {
+        session_id: state.currentSessionId || undefined,
+        run_id: state.currentRunId || undefined,
+        task_id: state.currentTaskId || undefined,
+      });
 
       // 添加中断消息
       state.addAgentMessage('用户中断了任务执行');

@@ -14,7 +14,9 @@ export interface Device {
   status: DeviceStatus;
   connection: 'usb' | 'wifi';
   last_seen: string;
-  current_task_id?: string;
+  current_task_id?: string;  // deprecated: use current_session_id
+  current_session_id?: string;
+  current_run_id?: string;
   current_app?: string;
   remark?: string;  // 设备备注
 }
@@ -36,7 +38,9 @@ export interface ChatMessage {
   screenshot?: string;  // 对应的截图
   rawContent?: string;  // AI原始输出
   isParseError?: boolean;  // 是否为解析错误
-  taskId?: string;
+  taskId?: string;  // deprecated: use sessionId
+  sessionId?: string;
+  runId?: string;
   stepNumber?: number;
   progressKey?: string;
   progressPhase?: 'reason' | 'act' | 'observe';
@@ -126,7 +130,9 @@ export interface PendingAction {
 }
 
 export interface ObserveErrorDecisionPayload {
-  task_id: string;
+  task_id?: string; // deprecated compatibility alias for session_id
+  session_id?: string;
+  run_id?: string;
   device_id: string;
   message: string;
   consecutive_count: number;
@@ -146,7 +152,7 @@ export interface LogEntry {
   id: string;
   timestamp: string;
   device_id: string;
-  task_id?: string;
+  task_id?: string;  // deprecated: use session_id
   type: string;
   level: LogLevel;
   message: string;
@@ -224,21 +230,21 @@ export interface DeviceStatusMessage extends WSMessage {
   status: DeviceStatus;
   data: {
     previous_status: DeviceStatus;
-    current_task_id?: string;
+    current_task_id?: string;  // deprecated: use current_session_id
     device_info?: Partial<Device>;
   };
 }
 
 export interface AgentStepMessage extends WSMessage {
   type: 'agent_reasoning' | 'agent_pending_action' | 'agent_action_result';
-  task_id: string;
+  task_id: string;  // deprecated: use session_id
   device_id: string;
   step: AgentStep;
 }
 
 export interface TaskUpdateMessage extends WSMessage {
   type: 'task_update';
-  task_id: string;
+  task_id: string;  // deprecated: use session_id
   device_id: string;
   status: TaskStatus;
   progress: {
@@ -252,7 +258,7 @@ export interface TaskUpdateMessage extends WSMessage {
 
 export interface TaskResultMessage extends WSMessage {
   type: 'task_result';
-  task_id: string;
+  task_id: string;  // deprecated: use session_id
   device_id: string;
   status: 'completed' | 'failed' | 'interrupted';
   result: Task['result'];

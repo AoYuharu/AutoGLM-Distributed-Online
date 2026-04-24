@@ -32,7 +32,9 @@ export interface BatchTaskExecution {
   startTime?: string;
   endTime?: string;
   error?: string;
-  taskId?: string;
+  taskId?: string;  // deprecated alias for sessionId
+  sessionId?: string;  // 持久会话ID
+  runId?: string;  // 每次自动运行ID
   instruction?: string;
   statusMessage?: string;
 }
@@ -382,7 +384,7 @@ export const useBatchStore = create<BatchState>((set, get) => ({
   },
 
   _handleTaskCreated: (message: WsConsoleMessage) => {
-    const { device_id, task_id } = message;
+    const { device_id, task_id, session_id, run_id } = message;
     if (!device_id) {
       return;
     }
@@ -392,12 +394,18 @@ export const useBatchStore = create<BatchState>((set, get) => ({
       return;
     }
 
+    batchStoreLogger.debug(
+      `[batch] task_created: device=${device_id}, task_id=${task_id}, session=${session_id}, run=${run_id}`
+    );
+
     set((currentState) => ({
       ...updateExecutionState(currentState, device_id, {
         taskId: task_id,
+        sessionId: session_id || task_id,
+        runId: run_id,
         status: 'running',
         currentStep: 0,
-        statusMessage: '已收到 task_created，任务开始运行',
+        statusMessage: '已收到 task_created，运行开始',
       }),
     }));
   },
@@ -461,6 +469,9 @@ export const useBatchStore = create<BatchState>((set, get) => ({
 
   _handleAgentStatus: (message: WsConsoleMessage) => {
     const { device_id, status, message: statusMessage, step_number, max_steps, task_id } = message;
+    const data = message.data || {};
+    const session_id = message.session_id || data.session_id;
+    const run_id = message.run_id || data.run_id;
     if (!device_id || !status) {
       return;
     }
@@ -472,7 +483,9 @@ export const useBatchStore = create<BatchState>((set, get) => ({
 
     let mappedStatus: BatchTaskStatus | null = null;
     if (status === 'pending') {
-      mappedStatus = state.executions[device_id].taskId ? 'running' : 'starting';
+      mappedStatus = (state.executions[device_id].sessionId || state.executions[device_id].runId)
+        ? 'running'
+        : 'starting';
     } else if (status === 'running') {
       mappedStatus = 'running';
     } else if (status === 'finished' || status === 'completed') {
@@ -490,6 +503,8 @@ export const useBatchStore = create<BatchState>((set, get) => ({
     const currentExecution = state.executions[device_id];
     const patch: Partial<BatchTaskExecution> = {
       taskId: task_id || currentExecution.taskId,
+      sessionId: session_id || currentExecution.sessionId,
+      runId: run_id || currentExecution.runId,
       status: mappedStatus,
       statusMessage,
       error: mappedStatus === 'failed' ? statusMessage : currentExecution.error,

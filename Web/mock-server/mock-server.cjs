@@ -3,12 +3,57 @@
  * 完整模拟后端服务器，支持所有 WebSocket 消息交互
  */
 
+const fs = require('fs');
+const path = require('path');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const url = require('url');
+const { parse } = require('yaml');
 
-const PORT = 8888;
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
+const SHARED_CONFIG_PATH = path.resolve(REPO_ROOT, 'config', 'server-web.yaml');
+const DEFAULT_PORT = 8888;
 const WS_CONSOLE_PATH = '/ws/console';
+
+function asRecord(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function readString(value, fallback) {
+  return typeof value === 'string' && value.trim() ? value.trim() : fallback;
+}
+
+function readNumber(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function loadMockServerConfig() {
+  if (!fs.existsSync(SHARED_CONFIG_PATH)) {
+    return {
+      host: 'localhost',
+      port: DEFAULT_PORT,
+    };
+  }
+
+  try {
+    const raw = fs.readFileSync(SHARED_CONFIG_PATH, 'utf-8');
+    const data = asRecord(parse(raw) ?? {});
+    const web = asRecord(data.web);
+    const mockServer = asRecord(web.mock_server);
+    return {
+      host: readString(mockServer.host, 'localhost'),
+      port: readNumber(mockServer.port, DEFAULT_PORT),
+    };
+  } catch {
+    return {
+      host: 'localhost',
+      port: DEFAULT_PORT,
+    };
+  }
+}
+
+const mockServerConfig = loadMockServerConfig();
+const PORT = mockServerConfig.port;
 
 // Store received messages for verification
 const serverState = {
@@ -403,9 +448,9 @@ httpServer.reset = () => {
 };
 httpServer.clients = clients;
 
-httpServer.listen(PORT, () => {
-  console.log(`[Mock Server] Running on http://localhost:${PORT}`);
-  console.log(`[Mock Server] WebSocket on ws://localhost:${PORT}${WS_CONSOLE_PATH}`);
+httpServer.listen(PORT, mockServerConfig.host, () => {
+  console.log(`[Mock Server] Running on http://${mockServerConfig.host}:${PORT}`);
+  console.log(`[Mock Server] WebSocket on ws://${mockServerConfig.host}:${PORT}${WS_CONSOLE_PATH}`);
 });
 
 module.exports = httpServer;

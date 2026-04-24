@@ -38,26 +38,67 @@ class WebSocketReActCallback:
 
     async def on_task_complete(self, event: ReActTaskEvent) -> None:
         """广播任务完成"""
+        session_id = event.session_id or event.task_id
         await self._ws_hub.broadcast_agent_status(
             device_id=event.device_id,
-            session_id=event.task_id,
+            session_id=session_id,
             status="completed",
             message=event.message,
             data={
                 "task_id": event.task_id,
+                "session_id": session_id,
+                "run_id": event.run_id,
                 "final_reasoning": event.final_reasoning,
             },
         )
 
     async def on_task_failed(self, event: ReActTaskEvent) -> None:
-        """广播任务失败"""
+        """广播任务失败（仅当 event.status == 'failed' 时调用）"""
+        # Guard: on_task_failed should only be called for actual failures, not interruptions.
+        # The scheduler now routes interruptions through on_task_interrupted.
+        # If event.status is "interrupted", redirect.
+        session_id = event.session_id or event.task_id
+        if event.status == "interrupted":
+            await self._ws_hub.broadcast_agent_status(
+                device_id=event.device_id,
+                session_id=session_id,
+                status="interrupted",
+                message=event.message,
+                data={
+                    "task_id": event.task_id,
+                    "session_id": session_id,
+                    "run_id": event.run_id,
+                    "error_type": event.error_type,
+                    "final_reasoning": event.final_reasoning,
+                },
+            )
+            return
         await self._ws_hub.broadcast_agent_status(
             device_id=event.device_id,
-            session_id=event.task_id,
+            session_id=session_id,
             status="failed",
             message=event.message,
             data={
                 "task_id": event.task_id,
+                "session_id": session_id,
+                "run_id": event.run_id,
+                "error_type": event.error_type,
+                "final_reasoning": event.final_reasoning,
+            },
+        )
+
+    async def on_task_interrupted(self, event: ReActTaskEvent) -> None:
+        """广播任务中断（用户主动中断或设备断开）。确保发送 status=interrupted。"""
+        session_id = event.session_id or event.task_id
+        await self._ws_hub.broadcast_agent_status(
+            device_id=event.device_id,
+            session_id=session_id,
+            status="interrupted",
+            message=event.message,
+            data={
+                "task_id": event.task_id,
+                "session_id": session_id,
+                "run_id": event.run_id,
                 "error_type": event.error_type,
                 "final_reasoning": event.final_reasoning,
             },

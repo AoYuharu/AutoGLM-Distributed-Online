@@ -1,4 +1,5 @@
 import asyncio
+import base64
 
 import pytest
 
@@ -382,3 +383,100 @@ async def test_ensure_bootstrap_observation_maps_observe_error_to_failed_observe
     assert progress_calls[-1]["error_type"] == ReActErrorType.OBSERVE_ERROR.value
     assert progress_calls[-1]["phase"] == "observe"
     assert progress_calls[-1]["step_number"] == 0
+
+
+def test_complete_reason_snapshots_before_action_screenshot_and_path():
+    task = _make_task("device-1", "task-1")
+    task.restore_initial_observe("before-image", "initial observation", screenshot_path="screenshots/bootstrap.png")
+
+    task.complete_reason("reasoning", {"action": "tap"})
+
+    record = task.react_records[-1]
+    assert record.before_action_screenshot == "before-image"
+    assert record.before_action_screenshot_path == "screenshots/bootstrap.png"
+
+
+@pytest.mark.asyncio
+async def test_set_observe_result_marks_screenshot_unchanged_true_and_stores_path(scheduler_instance: ReActScheduler):
+    task = _make_task("device-1", "task-1")
+    task.restore_initial_observe("", "", screenshot_path="screenshots/bootstrap.png")
+    task.initial_screenshot = "data:image/png;base64," + base64.b64encode(b"same-image").decode()
+    task.complete_reason("reasoning", {"action": "tap"})
+    _register_task(scheduler_instance, task)
+
+    await scheduler_instance.set_observe_result(
+        "device-1",
+        "data:image/png;base64," + base64.b64encode(b"same-image").decode(),
+        "observe ok",
+        step_number=1,
+        screenshot_path="screenshots/step_1.png",
+        success=True,
+    )
+
+    record = task.react_records[-1]
+    assert record.screenshot_path == "screenshots/step_1.png"
+    assert record.screenshot_unchanged is True
+    assert record.observation == "observe ok"
+    assert record.success is True
+
+
+@pytest.mark.asyncio
+async def test_set_observe_result_marks_screenshot_unchanged_false_for_different_images(scheduler_instance: ReActScheduler):
+    task = _make_task("device-1", "task-1")
+    task.initial_screenshot = base64.b64encode(b"before-image").decode()
+    task.complete_reason("reasoning", {"action": "tap"})
+    _register_task(scheduler_instance, task)
+
+    await scheduler_instance.set_observe_result(
+        "device-1",
+        base64.b64encode(b"after-image").decode(),
+        "observe changed",
+        step_number=1,
+        success=True,
+    )
+
+    assert task.react_records[-1].screenshot_unchanged is False
+
+
+@pytest.mark.asyncio
+async def test_set_observe_result_step_zero_does_not_compute_unchanged(scheduler_instance: ReActScheduler):
+    task = _make_task("device-1", "task-1")
+    task.initial_screenshot = base64.b64encode(b"bootstrap-before").decode()
+    _register_task(scheduler_instance, task)
+
+    await scheduler_instance.set_observe_result(
+        "device-1",
+        base64.b64encode(b"bootstrap-before").decode(),
+        "bootstrap observe",
+        step_number=0,
+        success=True,
+    )
+
+    assert task.initial_screenshot == base64.b64encode(b"bootstrap-before").decode()
+    assert task.react_records == []
+
+
+@pytest.mark.asyncio
+async def test_set_observe_result_invalid_or_missing_image_keeps_unchanged_unknown(scheduler_instance: ReActScheduler):
+    task = _make_task("device-1", "task-1")
+    task.initial_screenshot = "not-valid-base64"
+    task.complete_reason("reasoning", {"action": "tap"})
+    _register_task(scheduler_instance, task)
+
+    await scheduler_instance.set_observe_result(
+        "device-1",
+        "",
+        "observe missing screenshot",
+        step_number=1,
+        success=True,
+    )
+    assert task.react_records[-1].screenshot_unchanged is None
+
+    await scheduler_instance.set_observe_result(
+        "device-1",
+        "still-not-valid-base64",
+        "observe invalid screenshot",
+        step_number=1,
+        success=True,
+    )
+    assert task.react_records[-1].screenshot_unchanged is None

@@ -15,7 +15,7 @@ const { Content } = Layout;
 
 const App: React.FC = () => {
   const { viewMode, theme: currentTheme } = useAppStore();
-  const { initSession, currentDeviceId, endSession } = useAgentStore();
+  const { initSession, currentDeviceId, softCloseSession } = useAgentStore();
   const { fetchDevices } = useDeviceStore();
 
   const [agentWindowVisible, setAgentWindowVisible] = useState(false);
@@ -89,7 +89,7 @@ const App: React.FC = () => {
   };
 
   const handleCloseAgentWindow = () => {
-    endSession();
+    softCloseSession();
     setAgentWindowVisible(false);
   };
 

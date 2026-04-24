@@ -7,6 +7,7 @@ Contains:
 - GET /api/v1/devices/{device_id}/chat: Get chat history from file storage
 - POST /api/v1/devices/{device_id}/chat: Add chat message to file storage
 - DELETE /api/v1/devices/{device_id}/chat: Clear chat history from file storage
+- DELETE /api/v1/devices/{device_id}/session-context: Clear session context (memory + file)
 - GET /api/v1/devices/{device_id}/history: Get ReAct records
 - POST /api/v1/devices/{device_id}/interrupt: Interrupt device task
 """
@@ -56,6 +57,8 @@ def _build_chat_message_response(message: dict):
         "screenshot_path": message.get("screenshot_path"),
         "created_at": message.get("created_at"),
         "task_id": message.get("task_id"),
+        "session_id": message.get("session_id"),
+        "run_id": message.get("run_id"),
         "step_number": message.get("step_number"),
         "phase": message.get("phase"),
         "stage": message.get("stage"),
@@ -187,9 +190,21 @@ async def get_device_task_session(
         if screenshots:
             latest_screenshot = f"screenshots/{screenshots[-1]}"
 
+        # Get session metadata from scheduler's session registry
+        session_meta = scheduler._device_sessions.get(device_id, {})
+        session_run_count = session_meta.get("run_count", 1)
+        session_started_at_iso = None
+        if session_meta.get("session_started_at"):
+            session_started_at_iso = datetime.fromtimestamp(session_meta["session_started_at"]).isoformat()
+        run_started_at_iso = None
+        if active_task.run_started_at:
+            run_started_at_iso = datetime.fromtimestamp(active_task.run_started_at).isoformat()
+
         return DeviceTaskSessionResponse(
             device_id=device_id,
             task_id=active_task.task_id,
+            session_id=active_task.session_id or active_task.task_id,
+            run_id=active_task.run_id,
             status=active_task.status.value,
             instruction=active_task.instruction,
             current_step=active_task.current_step,
@@ -202,13 +217,25 @@ async def get_device_task_session(
             latest_screenshot=latest_screenshot,
             interruptible=True,
             latest_error_reason=active_task.get_latest_error_reason(),
+            session_started_at=session_started_at_iso,
+            run_started_at=run_started_at_iso,
+            session_run_count=session_run_count,
             chat_history=[_build_chat_message_response(msg) for msg in chat_history[-50:]],
         )
 
-    # No active task, return idle state
+    # No active task, return idle state — include session metadata if session exists
+    session_meta = scheduler._device_sessions.get(device_id, {})
+    idle_session_id = session_meta.get("session_id")
+    idle_session_started_at_iso = None
+    if session_meta.get("session_started_at"):
+        idle_session_started_at_iso = datetime.fromtimestamp(session_meta["session_started_at"]).isoformat()
+    idle_session_run_count = session_meta.get("run_count", 0)
+
     return DeviceTaskSessionResponse(
         device_id=device_id,
         task_id=None,
+        session_id=idle_session_id,
+        run_id=None,
         status="idle",
         instruction=None,
         current_step=0,
@@ -221,6 +248,9 @@ async def get_device_task_session(
         latest_screenshot=None,
         interruptible=False,
         latest_error_reason=None,
+        session_started_at=idle_session_started_at_iso,
+        run_started_at=None,
+        session_run_count=idle_session_run_count,
         chat_history=[],
     )
 
@@ -290,6 +320,20 @@ async def add_chat_message(
         message="Chat message stored",
         data={"id": message["id"], "created_at": message["created_at"]},
     )
+
+
+@router.delete("/devices/{device_id}/session-context", response_model=ApiResponse)
+async def clear_session_context_endpoint(
+    device_id: str,
+    db: Session = Depends(get_db),
+):
+    """Clear session context (memory + file) for a device. Used by user-initiated 'clear context' button."""
+    device = db.execute(select(Device).where(Device.device_id == device_id)).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    scheduler.clear_session_context(device_id)
+    return ApiResponse(success=True, message="Session context cleared")
 
 
 @router.delete("/devices/{device_id}/chat", response_model=ApiResponse)

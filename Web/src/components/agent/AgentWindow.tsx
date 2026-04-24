@@ -346,21 +346,20 @@ const renderCompactStageChain = (stageChain: AgentStageChain) => {
 const getRunningTagLabel = (isBackendTaskActive: boolean) => (isBackendTaskActive ? '执行中' : '空闲');
 const getRunningTagColor = (isBackendTaskActive: boolean) => (isBackendTaskActive ? 'processing' : 'default');
 const getBackendBusyWarning = (isBackendTaskActive: boolean) => (
-  isBackendTaskActive ? '设备正在执行后端任务，无法发送新命令' : null
+  isBackendTaskActive ? '设备正在执行自动运行，无法发送新命令' : null
 );
-const shouldRenderMessageBubble = (message: ChatMessage) => !message.isTransportProgress;
 const getEmptyConversationHint = () => '在下方输入框中输入自然语言命令，Agent将帮你执行';
 const getWaitingLockPlaceholder = () => '等待主控权，其他控制台正在操作...';
 const getReadyPlaceholder = () => '输入自然语言命令，让Agent帮你执行...';
 const getBusyPlaceholder = (isBackendTaskActive: boolean, deviceStatus?: string) => (
   isBackendTaskActive
-    ? '后端任务执行中，请等待当前任务结束...'
+    ? '自动运行执行中，请等待当前运行结束...'
     : deviceStatus !== 'idle'
       ? `设备${deviceStatus === 'busy' ? '忙碌中' : deviceStatus}，请等待...`
       : '设备忙碌中，请等待...'
 );
 const getBackendRecoveryTagText = (isBackendTaskActive: boolean) => (
-  isBackendTaskActive ? '后端任务进行中' : ''
+  isBackendTaskActive ? '自动运行进行中' : ''
 );
 const getWaitConfirmTitle = (phase?: 'reason' | 'act' | 'observe' | null) => {
   const label = phase === 'reason' ? '思考' : phase === 'act' ? '动作' : '观察';
@@ -393,7 +392,7 @@ const getUnlockWarningText = () => '主控权被其他控制台占用，请等�
 const getInterruptButtonText = () => '中断';
 const getSendButtonText = () => '发送';
 const getObserveErrorTitle = () => 'Observe 错误处理';
-const getClearConversationTitle = () => '清空对话';
+const getClearConversationTitle = () => '清空会话上下文（AI记忆）';
 const getFullscreenTooltip = (isFullscreen: boolean) => (isFullscreen ? '退出全屏' : '全屏');
 const getCloseTooltip = () => '关闭';
 const getCurrentScreenshotTooltip = () => '当前截图';
@@ -401,13 +400,13 @@ const getHistoryScreenshotTooltip = (index: number) => `Step ${index + 1}`;
 const getHistoryScreenshotAlt = (index: number) => `Step ${index + 1}`;
 const getCurrentScreenshotAlt = () => 'Current';
 const getScreenshotAlt = () => 'Screenshot';
-const getObserveDecisionContinueText = () => '继续任务';
-const getObserveDecisionInterruptText = () => '中断任务';
+const getObserveDecisionContinueText = () => '继续运行';
+const getObserveDecisionInterruptText = () => '中断运行';
 const getObserveDecisionResolvedText = () => '已处理';
 const getObserveDecisionPendingText = () => '等待决策';
 const getObserveDecisionResolveText = () => '标记已处理';
 const getObserveDecisionAdvicePlaceholder = () => '可选：给 AI 一条继续尝试的建议';
-const getPendingInterruptText = () => '停止任务';
+const getPendingInterruptText = () => '停止运行';
 const getPendingContinueText = () => '继续执行';
 const getPendingConfirmText = () => '确认执行';
 const getPendingRejectText = () => '拒绝';
@@ -427,6 +426,10 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
   const [screenshotModalOpen, setScreenshotModalOpen] = useState(false);
   const [selectedScreenshotIndex, setSelectedScreenshotIndex] = useState(-1); // -1 means current
   const conversationRef = useRef<HTMLDivElement>(null);
+  const hasAutoScrolledRef = useRef(false);
+  const shouldAutoFollowRef = useRef(true);
+  const previousDeviceIdRef = useRef(deviceId);
+  const AUTO_SCROLL_BOTTOM_THRESHOLD = 48;
 
   const device = useDeviceStore((state) => state.getDeviceById(deviceId));
   const {
@@ -464,6 +467,7 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
     observeDecisionState,
     submitObserveErrorDecision,
     resolveObserveErrorDecisionCard,
+    isSessionHydrating,
   } = useAgentStore();
   const resetObserveDecisionAdvice = () => setObserveDecisionAdvice('');
 
@@ -473,7 +477,30 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
     timestamp: ChatMessage['timestamp'];
   };
 
-  const visibleConversationHistory = displayConversationHistory.filter(shouldRenderMessageBubble);
+  const visibleConversationHistory = displayConversationHistory;
+  const autoFollowSignal = `${deviceId}:${visibleConversationHistory.length}:${pendingAction ? 'pending' : 'idle'}:${isSessionHydrating ? 'hydrating' : 'ready'}`;
+
+  const scrollToConversationBottom = () => {
+    if (!conversationRef.current) {
+      return;
+    }
+
+    conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
+  };
+
+  const isNearConversationBottom = () => {
+    const container = conversationRef.current;
+    if (!container) {
+      return true;
+    }
+
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    return distanceFromBottom <= AUTO_SCROLL_BOTTOM_THRESHOLD;
+  };
+
+  const handleConversationScroll = () => {
+    shouldAutoFollowRef.current = isNearConversationBottom();
+  };
 
   // Get all screenshots from conversation history
   const allScreenshots: ConversationScreenshotEntry[] = conversationHistory
@@ -497,12 +524,40 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
   const displayScreenshot = getDisplayScreenshot();
   const hasMultipleScreenshots = allScreenshots.length > 0;
 
-  // Auto-scroll to bottom of conversation
   useEffect(() => {
-    if (conversationRef.current) {
-      conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
+    if (previousDeviceIdRef.current !== deviceId) {
+      previousDeviceIdRef.current = deviceId;
+      hasAutoScrolledRef.current = false;
     }
-  }, [visibleConversationHistory, pendingAction]);
+  }, [deviceId]);
+
+  // Auto-scroll only on initial open/restore and while user stays near the bottom.
+  useEffect(() => {
+    const shouldScroll = !hasAutoScrolledRef.current || shouldAutoFollowRef.current;
+    if (!shouldScroll) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      scrollToConversationBottom();
+      hasAutoScrolledRef.current = true;
+      shouldAutoFollowRef.current = true;
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [autoFollowSignal]);
+
+  useEffect(() => {
+    if (isSessionHydrating) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      shouldAutoFollowRef.current = isNearConversationBottom();
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [isSessionHydrating, autoFollowSignal]);
 
   useEffect(() => {
     if (observeDecisionState === 'pending') {
@@ -1125,6 +1180,8 @@ export const AgentWindow: React.FC<AgentWindowProps> = ({ deviceId, onClose }) =
           {/* Conversation history - 可滚动区域 */}
           <div
             ref={conversationRef}
+            data-testid="agent-conversation"
+            onScroll={handleConversationScroll}
             className="overflow-y-auto p-4 bg-gray-50 dark:bg-gray-900"
             style={{ flex: '1 1 auto', minHeight: 0, maxHeight: 'calc(100% - 100px)' }}
           >

@@ -78,6 +78,10 @@ class _SessionTask:
     max_steps = 10
     max_observe_error_retries = 2
     consecutive_observe_error_count = 0
+    session_id = "task-session"
+    run_id = "run_test123"
+    session_started_at = 1713484800.0  # 2026-04-19 00:00:00
+    run_started_at = 1713484801.0
 
     def is_waiting_observe_error_decision(self):
         return False

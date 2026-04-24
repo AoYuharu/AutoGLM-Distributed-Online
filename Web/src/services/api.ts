@@ -2,6 +2,7 @@
  * API Service - connects frontend to backend
  */
 import axios from 'axios';
+import { browserConfig } from '../config';
 import type { DeviceArtifacts } from '../types';
 
 declare module 'axios' {
@@ -12,11 +13,8 @@ declare module 'axios' {
   }
 }
 
-// Use relative path to go through Vite proxy in dev, fallback to localhost:8000 in prod
-const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
-
 const api = axios.create({
-  baseURL: API_BASE_URL,
+  baseURL: browserConfig.apiBaseUrl,
   timeout: 10000,
   headers: {
     'Content-Type': 'application/json',
@@ -153,6 +151,14 @@ export const taskApi = {
   },
 };
 
+function resolveServerUrl(pathname: string): string {
+  if (!browserConfig.apiBaseUrl) {
+    return pathname;
+  }
+
+  return new URL(pathname, `${browserConfig.serverPublicBaseUrl}/`).toString();
+}
+
 // ============= Log / Artifact APIs =============
 
 export interface DeviceHistoryResponse {
@@ -182,14 +188,16 @@ export const logApi = {
   },
 
   getArtifactFileUrl: (deviceId: string, path: string): string => (
-    `/api/v1/devices/${deviceId}/artifacts/file?path=${encodeURIComponent(path)}`
+    resolveServerUrl(`/api/v1/devices/${deviceId}/artifacts/file?path=${encodeURIComponent(path)}`)
   ),
 
   getRawDownloadUrl: (downloadPath: string | null | undefined): string | null => {
     if (!downloadPath) {
       return null;
     }
-    return downloadPath.startsWith('/') ? downloadPath : `/${downloadPath}`;
+    return downloadPath.startsWith('/')
+      ? resolveServerUrl(downloadPath)
+      : downloadPath;
   },
 };
 

@@ -130,6 +130,7 @@ export const DeviceCard: React.FC<DeviceCardProps> = ({
 
   return (
     <Card
+      data-device-id={device.device_id}
       className={clsx(
         'relative transition-all duration-200 cursor-pointer hover:shadow-md',
         selected && 'ring-2 ring-blue-500'
@@ -297,12 +298,24 @@ export const DeviceCard: React.FC<DeviceCardProps> = ({
           )}
         </div>
 
-        {/* Current task */}
-        {device.status === 'busy' && device.current_task_id && (
+        {/* Current session/run info */}
+        {device.status === 'busy' && (
           <div className="mt-2 pt-2 border-t border-gray-100 dark:border-gray-700">
-            <div className="text-xs text-gray-500">
-              当前任务: <span className="text-yellow-600">{device.current_task_id}</span>
-            </div>
+            {device.current_session_id && (
+              <div className="text-xs text-gray-500">
+                当前会话: <span className="text-yellow-600">{device.current_session_id}</span>
+              </div>
+            )}
+            {device.current_run_id && (
+              <div className="text-xs text-gray-500">
+                当前运行: <span className="text-yellow-600">{device.current_run_id}</span>
+              </div>
+            )}
+            {!device.current_session_id && !device.current_run_id && device.current_task_id && (
+              <div className="text-xs text-gray-500">
+                当前运行: <span className="text-yellow-600">{device.current_task_id}</span>
+              </div>
+            )}
           </div>
         )}
       </div>

@@ -27,6 +27,10 @@ class DummyHub:
     async def broadcast_to_web_consoles(self, message: dict, subscribed_only: bool = False) -> bool:
         return True
 
+    async def broadcast_agent_progress(self, **kwargs) -> None:
+        # Accepts any kwargs for session/run identity compatibility
+        pass
+
 
 @pytest.mark.asyncio
 async def test_ack_then_observe_closes_same_round(monkeypatch):

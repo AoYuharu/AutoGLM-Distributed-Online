@@ -30,6 +30,8 @@ class ReActTaskEvent:
     message: str
     final_reasoning: Optional[str]
     error_type: Optional[str] = None  # ReActErrorType value
+    session_id: Optional[str] = None  # 持久会话ID（task_id的别名/升级）
+    run_id: Optional[str] = None  # 当前运行ID（每次自动运行新建）
 
 
 class ReActCallback(Protocol):
@@ -45,6 +47,10 @@ class ReActCallback(Protocol):
 
     async def on_task_failed(self, event: ReActTaskEvent) -> None:
         """任务失败回调"""
+        ...
+
+    async def on_task_interrupted(self, event: ReActTaskEvent) -> None:
+        """任务中断回调（用户主动中断或设备断开）"""
         ...
 
     async def on_phase_start(

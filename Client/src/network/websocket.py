@@ -49,6 +49,9 @@ class WebSocketClient:
         on_disconnect: Optional[Callable[[], None]] = None,
         on_reconnect_failed: Optional[Callable[[], None]] = None,
         max_reconnect_attempts: int = 10,
+        reconnect_base_delay: float = 1.0,
+        reconnect_max_delay: float = 60.0,
+        send_ack_timeout: float = 10.0,
     ):
         """
         初始化 WebSocket 客户端
@@ -71,6 +74,9 @@ class WebSocketClient:
         self.on_disconnect = on_disconnect
         self.on_reconnect_failed = on_reconnect_failed
         self.max_reconnect_attempts = max_reconnect_attempts
+        self.reconnect_base_delay = reconnect_base_delay
+        self.reconnect_max_delay = reconnect_max_delay
+        self.send_ack_timeout = send_ack_timeout
 
         self._state = ConnectionState.DISCONNECTED
         self._websocket = None
@@ -168,7 +174,7 @@ class WebSocketClient:
         self,
         message: dict,
         wait_ack: bool = True,
-        timeout: float = 10.0
+        timeout: Optional[float] = None
     ) -> bool:
         """
         发送消息
@@ -184,6 +190,9 @@ class WebSocketClient:
         if self._state != ConnectionState.CONNECTED or not self._websocket:
             logger.warning(f"[send_message] Cannot send message, not connected (state: {self._state})")
             return False
+
+        if timeout is None:
+            timeout = self.send_ack_timeout
 
         start_time = time.time()
         try:
@@ -285,8 +294,8 @@ class WebSocketClient:
 
         # 计算延迟：min(base * 2^attempt + jitter, max_delay)
         delay = min(
-            self.RECONNECT_BASE_DELAY * (2 ** (self._reconnect_attempts - 1)),
-            self.RECONNECT_MAX_DELAY
+            self.reconnect_base_delay * (2 ** (self._reconnect_attempts - 1)),
+            self.reconnect_max_delay
         )
         # 添加 jitter (0-1秒)
         jitter = random.uniform(0, 1)

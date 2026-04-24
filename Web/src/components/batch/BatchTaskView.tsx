@@ -148,7 +148,7 @@ export const BatchTaskView: React.FC = () => {
     });
 
     message.success(
-      `已向 ${selectedDevices.length} 台设备提交启动请求，等待 task_created 回填任务信息`
+      `已向 ${selectedDevices.length} 台设备提交启动请求，等待 run 创建回填 session/run 信息`
     );
   };
 
@@ -209,13 +209,13 @@ export const BatchTaskView: React.FC = () => {
     status: string,
     currentStep: number,
     maxSteps: number,
-    hasTaskId: boolean
+    hasSessionOrRun: boolean
   ) => {
-    if (status === 'starting' && !hasTaskId) {
-      return '等待 task_created';
+    if (status === 'starting' && !hasSessionOrRun) {
+      return '等待 run 创建';
     }
 
-    if (!hasTaskId && status === 'pending') {
+    if (!hasSessionOrRun && status === 'pending') {
       return '等待启动';
     }
 
@@ -360,7 +360,7 @@ export const BatchTaskView: React.FC = () => {
                   <Radio value="default">
                     <span>跟随会话设置（保留服务端默认行为）</span>
                     <span className="text-xs text-gray-500 ml-2">
-                      不主动改写 create_task 的默认 mode
+                      不主动改写 run 的默认 mode
                     </span>
                   </Radio>
                   <Radio value="force_normal">
@@ -438,8 +438,7 @@ export const BatchTaskView: React.FC = () => {
           {!hasExecutions && (
             <div className="text-center py-12 space-y-4">
               <div className="text-sm text-gray-500">
-                当前还没有执行项。点击“开始执行”后，会先按设备提交 create_task，再等待
-                task_created 回填真实 taskId。
+                当前还没有执行项。点击"开始执行"后，会先按设备创建 run，并等待 session/run 信息回填。
               </div>
               <Button
                 type="primary"
@@ -473,8 +472,11 @@ export const BatchTaskView: React.FC = () => {
                           <Tag color={getStatusTagColor(execution.status)}>
                             {getStatusText(execution.status)}
                           </Tag>
-                          {execution.taskId && (
-                            <Tag color="geekblue">taskId: {execution.taskId}</Tag>
+                          {execution.sessionId && (
+                            <Tag color="geekblue">session: {execution.sessionId}</Tag>
+                          )}
+                          {execution.runId && (
+                            <Tag color="purple">run: {execution.runId}</Tag>
                           )}
                         </div>
                         <Progress
@@ -496,7 +498,7 @@ export const BatchTaskView: React.FC = () => {
                             execution.status,
                             execution.currentStep,
                             execution.maxSteps,
-                            !!execution.taskId
+                            Boolean(execution.sessionId || execution.runId || execution.taskId)
                           )}
                         </div>
                       </div>

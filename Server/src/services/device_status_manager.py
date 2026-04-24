@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional
 import asyncio
+import uuid
 
 import structlog
 
@@ -32,8 +33,25 @@ class DeviceStatusEntry:
     device_id: str
     status: DeviceStatus = DeviceStatus.OFFLINE
     last_update: datetime = field(default_factory=datetime.utcnow)
-    current_task_id: Optional[str] = None
+    current_task_id: Optional[str] = None  # deprecated alias of current_session_id
+
+    # Session + Run identity (replaces current_task_id as primary model)
+    current_session_id: Optional[str] = None  # persistent session identifier
+    current_run_id: Optional[str] = None     # per-auto-run identifier
+    session_started_at: Optional[datetime] = None
+    run_started_at: Optional[datetime] = None
+
     version_code: int = 0
+
+    @property
+    def effective_session_id(self) -> Optional[str]:
+        """Primary session identifier (session_id takes precedence over deprecated task_id)."""
+        return self.current_session_id or self.current_task_id
+
+    @property
+    def effective_task_id(self) -> Optional[str]:
+        """Deprecated alias. Prefer effective_session_id."""
+        return self.effective_session_id
 
 
 class DeviceStatusManager:
@@ -63,6 +81,10 @@ class DeviceStatusManager:
         task_id: Optional[str] = None,
         *,
         clear_task: bool = False,
+        session_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        session_started_at: Optional[datetime] = None,
+        run_started_at: Optional[datetime] = None,
     ):
         async with self._lock:
             if device_id not in self._devices:
@@ -72,8 +94,21 @@ class DeviceStatusManager:
             entry.last_update = datetime.utcnow()
             if clear_task:
                 entry.current_task_id = None
-            elif task_id is not None:
-                entry.current_task_id = task_id
+                entry.current_session_id = None
+                entry.current_run_id = None
+                entry.session_started_at = None
+                entry.run_started_at = None
+            else:
+                if task_id is not None:
+                    entry.current_task_id = task_id
+                if session_id is not None:
+                    entry.current_session_id = session_id
+                if run_id is not None:
+                    entry.current_run_id = run_id
+                if session_started_at is not None:
+                    entry.session_started_at = session_started_at
+                if run_started_at is not None:
+                    entry.run_started_at = run_started_at
 
             logger.debug(
                 "Device status updated",
@@ -112,11 +147,11 @@ class DeviceStatusManager:
                 return 0
             return self._devices[device_id].version_code
 
-    async def set_busy(self, device_id: str, task_id: str):
-        await self.update_status(device_id, DeviceStatus.BUSY, task_id)
-        logger.info("Device set busy", device_id=device_id, task_id=task_id)
+    async def set_busy(self, device_id: str, task_id: str, session_id: Optional[str] = None, run_id: Optional[str] = None):
+        await self.update_status(device_id, DeviceStatus.BUSY, task_id, session_id=session_id, run_id=run_id, session_started_at=datetime.utcnow(), run_started_at=datetime.utcnow())
+        logger.info("Device set busy", device_id=device_id, task_id=task_id, session_id=session_id, run_id=run_id)
 
-    async def try_acquire_task(self, device_id: str, task_id: str) -> bool:
+    async def try_acquire_task(self, device_id: str, task_id: str, session_id: Optional[str] = None, run_id: Optional[str] = None) -> bool:
         async with self._lock:
             entry = self._devices.get(device_id)
             if entry is None:
@@ -130,8 +165,12 @@ class DeviceStatusManager:
 
             entry.status = DeviceStatus.BUSY
             entry.current_task_id = task_id
+            entry.current_session_id = session_id or task_id
+            entry.current_run_id = run_id
+            entry.session_started_at = datetime.utcnow()
+            entry.run_started_at = datetime.utcnow()
             entry.last_update = datetime.utcnow()
-            logger.info("Device acquired for task", device_id=device_id, task_id=task_id)
+            logger.info("Device acquired for task", device_id=device_id, task_id=task_id, session_id=session_id, run_id=run_id)
             return True
 
     async def set_idle(self, device_id: str):

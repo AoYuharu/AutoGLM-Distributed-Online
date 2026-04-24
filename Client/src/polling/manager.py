@@ -36,6 +36,9 @@ class PollingManager:
         on_device_lost: Optional[Callable[[str], None]] = None,
         on_polling_cycle_complete: Optional[Callable[[dict, dict], None]] = None,
         interval: float = 3.0,
+        adb_binary: str = "adb",
+        hdc_binary: str = "hdc",
+        wda_url: str = "http://localhost:8100",
         logger: Optional[logging.Logger] = None,
     ):
         """
@@ -52,6 +55,9 @@ class PollingManager:
         self.on_device_lost = on_device_lost
         self.on_polling_cycle_complete = on_polling_cycle_complete
         self.interval = interval
+        self.adb_binary = adb_binary
+        self.hdc_binary = hdc_binary
+        self.wda_url = wda_url
         self._logger = logger or _logger
 
         # 统一轮询器
@@ -101,7 +107,7 @@ class PollingManager:
     def _register_platform_lister(self, platform: PlatformType, **kwargs) -> None:
         """注册平台的设备列表函数"""
         if platform == PlatformType.ADB:
-            adb_path = kwargs.get("adb_path", "adb")
+            adb_path = kwargs.get("adb_path", self.adb_binary)
             # 临时创建 poller 来获取 _list_devices 方法
             temp_poller = ADBPolling(
                 on_device_found=lambda *args: None,
@@ -112,7 +118,7 @@ class PollingManager:
             self._unified_polling.register_platform(platform, temp_poller._list_devices)
 
         elif platform == PlatformType.HDC:
-            hdc_path = kwargs.get("hdc_path", "hdc")
+            hdc_path = kwargs.get("hdc_path", self.hdc_binary)
             temp_poller = HDCPolling(
                 on_device_found=lambda *args: None,
                 on_device_lost=lambda *args: None,
@@ -122,7 +128,7 @@ class PollingManager:
             self._unified_polling.register_platform(platform, temp_poller._list_devices)
 
         elif platform == PlatformType.WDA:
-            wda_url = kwargs.get("wda_url", "http://localhost:8100")
+            wda_url = kwargs.get("wda_url", self.wda_url)
             temp_poller = WDAPolling(
                 on_device_found=lambda *args: None,
                 on_device_lost=lambda *args: None,

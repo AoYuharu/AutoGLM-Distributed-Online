@@ -475,7 +475,7 @@ class WebSocketHub:
             data=canonical_message.get("data") or {"task_id": task_id},
         )
 
-    async def broadcast_agent_step(self, task_id: str, device_id: str, step: dict, step_type: str = "agent_step"):
+    async def broadcast_agent_step(self, task_id: str, device_id: str, step: dict, step_type: str = "agent_step", session_id: str = "", run_id: str = ""):
         """Broadcast agent step to all Web Consoles (broadcast mode, no subscription required)."""
         result = step.get("result")
         if result is None:
@@ -494,6 +494,16 @@ class WebSocketHub:
             "error": step.get("error"),
             "error_type": step.get("error_type"),
         }
+        # Include session/run identity for run-bound tracking
+        if session_id:
+            message["session_id"] = session_id
+        if run_id:
+            message["run_id"] = run_id
+        # Also extract from step dict if caller passed them via kwargs
+        if not session_id and step.get("session_id"):
+            message["session_id"] = step.get("session_id")
+        if not run_id and step.get("run_id"):
+            message["run_id"] = step.get("run_id")
         await self.broadcast_to_web_consoles(message)
         logger.info(f"[broadcast_agent_step] Broadcast to all consoles: device={device_id}, task={task_id}, step={step.get('step_number')}")
 
@@ -610,6 +620,8 @@ class WebSocketHub:
             "status": status,
             "message": message,
             "task_id": data.get("task_id", session_id or ""),
+            "session_id": session_id or data.get("session_id") or "",
+            "run_id": data.get("run_id") or "",
             "data": data,
             "timestamp": datetime.utcnow().isoformat(),
         }

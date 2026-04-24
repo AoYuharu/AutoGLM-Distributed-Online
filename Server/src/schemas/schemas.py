@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Optional, List, Any, Dict
 from pydantic import BaseModel, Field, model_serializer
 
+from src.config import settings
+
 
 # ============= Client Schemas =============
 
@@ -46,6 +48,10 @@ class DeviceStatusUpdate(BaseModel):
     status: str = Field(..., pattern="^(idle|busy|offline|error)$")
     device_info: Optional[DeviceInfo] = None
     current_task_id: Optional[str] = None
+    current_session_id: Optional[str] = None
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[datetime] = None
+    run_started_at: Optional[datetime] = None
 
 
 class DeviceRemarkUpdate(BaseModel):
@@ -67,6 +73,10 @@ class DeviceResponse(BaseModel):
     connection: Optional[str] = "usb"
     last_seen: Optional[datetime] = None
     current_task_id: Optional[str] = None
+    current_session_id: Optional[str] = None
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[datetime] = None
+    run_started_at: Optional[datetime] = None
     remark: Optional[str] = None  # 设备备注
 
     # Add computed field for API response
@@ -159,7 +169,11 @@ class TaskCreate(BaseModel):
     instruction: str = Field(..., min_length=1)
     mode: str = Field("normal", pattern="^(cautious|normal)$")
     max_steps: int = Field(100, ge=1, le=1000)
-    max_observe_error_retries: int = Field(2, ge=0, le=20)
+    max_observe_error_retries: int = Field(
+        settings.REACT_MAX_OBSERVE_ERROR_RETRIES,
+        ge=0,
+        le=20,
+    )
     priority: int = Field(1, ge=1, le=10)
 
 
@@ -217,6 +231,8 @@ class ChatMessageResponse(BaseModel):
     screenshot_path: Optional[str] = None
     created_at: datetime
     task_id: Optional[str] = None
+    session_id: Optional[str] = None
+    run_id: Optional[str] = None
     step_number: Optional[int] = None
     phase: Optional[str] = None
     stage: Optional[str] = None
@@ -238,6 +254,8 @@ class DeviceTaskSessionResponse(BaseModel):
     """Schema for web agent window hydration per device"""
     device_id: str
     task_id: Optional[str] = None
+    session_id: Optional[str] = None
+    run_id: Optional[str] = None
     status: Optional[str] = None
     instruction: Optional[str] = None
     current_step: int = 0
@@ -250,6 +268,9 @@ class DeviceTaskSessionResponse(BaseModel):
     latest_screenshot: Optional[str] = None
     interruptible: bool = False
     latest_error_reason: Optional[str] = None
+    session_started_at: Optional[datetime] = None
+    run_started_at: Optional[datetime] = None
+    session_run_count: int = 0
     chat_history: List[ChatMessageResponse] = Field(default_factory=list)
 
 
@@ -257,6 +278,8 @@ class DeviceChatHistoryResponse(BaseModel):
     """Schema for persisted/synthesized chat history hydration"""
     device_id: str
     task_id: Optional[str] = None
+    session_id: Optional[str] = None
+    run_id: Optional[str] = None
     messages: List[ChatMessageResponse] = Field(default_factory=list)
     total: int = 0
 
@@ -406,8 +429,20 @@ class DeviceInfoPayload(BaseModel):
     screen_size: Optional[List[int]] = None
     capabilities: Optional[Dict[str, Any]] = None
     current_task_id: Optional[str] = None
+    current_session_id: Optional[str] = None
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[datetime] = None
+    run_started_at: Optional[datetime] = None
     previous_status: Optional[str] = None
     updated_at: Optional[str] = None
+
+    @property
+    def effective_current_session_id(self) -> Optional[str]:
+        return self.current_session_id or self.current_task_id
+
+    @property
+    def effective_current_task_id(self) -> Optional[str]:
+        return self.current_task_id or self.current_session_id
 
     def get_device_name(self) -> Optional[str]:
         """Get device name from either field"""
@@ -439,6 +474,12 @@ class ObserveResultPayload(BaseModel):
     success: bool = True
     error: Optional[str] = None
     version: Optional[int] = None
+    session_id: Optional[str] = None
+    run_id: Optional[str] = None
+
+    @property
+    def effective_session_id(self) -> str:
+        return self.session_id or self.task_id
 
 
 class ObserveResultMessage(BaseModel):

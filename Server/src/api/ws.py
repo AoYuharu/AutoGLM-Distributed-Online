@@ -12,10 +12,12 @@ Web Console (Server -> Web):
 """
 
 import json
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 import structlog
 
+from src.config import settings
 from src.services.websocket import ws_hub
 from src.services.device_status_manager import device_status_manager, DeviceStatus
 from src.logging_config import get_ws_console_logger
@@ -239,7 +241,12 @@ async def handle_console_message(console_id: str, message: dict):
         instruction = message.get("instruction")
         mode = message.get("mode", "normal")
         max_steps = message.get("max_steps", 100)
-        max_observe_error_retries = message.get("max_observe_error_retries", 2)
+        max_observe_error_retries = message.get(
+            "max_observe_error_retries",
+            settings.REACT_MAX_OBSERVE_ERROR_RETRIES,
+        )
+        # session_id is optional; scheduler creates/persists session on first call
+        incoming_session_id = message.get("session_id")
 
         ws_console_logger.info(
             f"[ws_console_create_task] Creating task: console={console_id}, device={device_id}, "
@@ -267,8 +274,13 @@ async def handle_console_message(console_id: str, message: dict):
             import uuid
             from src.services.react_scheduler import scheduler
 
-            task_id = f"task_{uuid.uuid4().hex[:12]}"
-            acquired = await device_status_manager.try_acquire_task(device_id, task_id)
+            session_id_for_run = incoming_session_id or f"session_{uuid.uuid4().hex[:12]}"
+            task_id = session_id_for_run  # deprecated compatibility alias; task_id must mirror session_id
+            acquired = await device_status_manager.try_acquire_task(
+                device_id,
+                task_id,
+                session_id=session_id_for_run,
+            )
             if not acquired:
                 entry = await device_status_manager.get_entry(device_id)
                 current_status = entry.status.value if entry else "unknown"
@@ -281,16 +293,32 @@ async def handle_console_message(console_id: str, message: dict):
                     )
                 return
 
-            scheduler.submit_task(
+            submitted = scheduler.submit_task(
                 device_id=device_id,
                 task_id=task_id,
                 instruction=instruction,
                 mode=mode,
                 max_steps=max_steps,
                 max_observe_error_retries=max_observe_error_retries,
+                session_id=incoming_session_id,
             )
+            # 调度器为本次运行生成了实际的 session_id 和 run_id
+            actual_session_id = submitted.session_id or task_id
+            actual_run_id = submitted.run_id
 
-            ws_console_logger.info(f"[ws_console_create_task] Task created: {task_id}")
+            # 更新设备状态：填充 run_id（session_id 已在 try_acquire 时设置）
+            entry = await device_status_manager.get_entry(device_id)
+            if entry:
+                await device_status_manager.update_status(
+                    device_id,
+                    entry.status,
+                    run_id=actual_run_id,
+                    run_started_at=datetime.utcnow(),
+                )
+
+            ws_console_logger.info(
+                f"[ws_console_create_task] Run started: task={task_id}, session={actual_session_id}, run={actual_run_id}"
+            )
             logger.info(
                 "Console task created",
                 console_id=console_id,
@@ -305,6 +333,8 @@ async def handle_console_message(console_id: str, message: dict):
                     {
                         "type": "task_created",
                         "task_id": task_id,
+                        "session_id": actual_session_id,
+                        "run_id": actual_run_id,
                         "device_id": device_id,
                         "status": "pending",
                     }
@@ -319,9 +349,24 @@ async def handle_console_message(console_id: str, message: dict):
     elif msg_type == "interrupt_task":
         device_id = message.get("device_id")
         task_id = message.get("task_id")
+        session_id = message.get("session_id")
+        run_id = message.get("run_id")
+
+        # 尝试从活跃任务获取实际的 session/run id 用于响应
+        actual_session_id = session_id
+        actual_run_id = run_id
+        try:
+            from src.services.react_scheduler import scheduler
+            active = scheduler._device_tasks.get(device_id)
+            if active:
+                actual_session_id = active.session_id or active.task_id
+                actual_run_id = active.run_id
+        except Exception:
+            pass
 
         ws_console_logger.info(
-            f"[ws_console_interrupt_task] Interrupting task: device={device_id}, task_id={task_id}"
+            f"[ws_console_interrupt_task] Interrupting: device={device_id}, task_id={task_id}, "
+            f"session={actual_session_id}, run={actual_run_id}"
         )
 
         try:
@@ -334,6 +379,8 @@ async def handle_console_message(console_id: str, message: dict):
                     {
                         "type": "task_interrupted",
                         "task_id": task_id,
+                        "session_id": actual_session_id,
+                        "run_id": actual_run_id,
                         "device_id": device_id,
                     }
                 )
@@ -347,8 +394,13 @@ async def handle_console_message(console_id: str, message: dict):
     elif msg_type == "confirm_phase":
         device_id = message.get("device_id")
         approved = message.get("approved", False)
+        session_id = message.get("session_id")
+        run_id = message.get("run_id")
 
-        ws_console_logger.info(f"[ws_console_confirm_phase] device={device_id}, approved={approved}")
+        ws_console_logger.info(
+            f"[ws_console_confirm_phase] device={device_id}, approved={approved}, "
+            f"session={session_id}, run={run_id}"
+        )
 
         from src.services.react_scheduler import scheduler
 
@@ -356,16 +408,25 @@ async def handle_console_message(console_id: str, message: dict):
 
         if console_id in ws_hub._web_consoles:
             await ws_hub._web_consoles[console_id].send_json(
-                {"type": "phase_confirmed", "device_id": device_id, "approved": approved}
+                {
+                    "type": "phase_confirmed",
+                    "device_id": device_id,
+                    "approved": approved,
+                    "session_id": session_id,
+                    "run_id": run_id,
+                }
             )
 
     elif msg_type == "observe_error_decision":
         device_id = message.get("device_id")
         decision = message.get("decision")
         advice = message.get("advice", "")
+        session_id = message.get("session_id")
+        run_id = message.get("run_id")
 
         ws_console_logger.info(
-            f"[ws_console_observe_error_decision] console={console_id}, device={device_id}, decision={decision}"
+            f"[ws_console_observe_error_decision] console={console_id}, device={device_id}, "
+            f"decision={decision}, session={session_id}, run={run_id}"
         )
 
         if not device_id or decision not in {"continue", "interrupt"}:
@@ -385,6 +446,8 @@ async def handle_console_message(console_id: str, message: dict):
                     "device_id": device_id,
                     "decision": decision,
                     "advice": advice,
+                    "session_id": session_id,
+                    "run_id": run_id,
                     "success": handled,
                 }
             )

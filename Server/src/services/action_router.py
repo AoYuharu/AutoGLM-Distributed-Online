@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 
 import structlog
 
+from src.config import settings
 from src.logging_config import get_network_logger, get_ws_console_logger
 
 logger = structlog.get_logger()
@@ -43,6 +44,8 @@ class PendingAction:
     action_id: str
     sent_msg_id: str = ""
     task_id: str = ""
+    session_id: str = ""  # persistent session identifier (task_id alias)
+    run_id: str = ""      # per-auto-run identifier
     device_id: str = ""
     round_version: int = 0
     action: dict = field(default_factory=dict)
@@ -51,8 +54,8 @@ class PendingAction:
     status: ActionStatus = ActionStatus.PENDING
     created_at: float = field(default_factory=time.time)
     last_update: float = field(default_factory=time.time)
-    timeout_seconds: float = 15.0
-    observe_timeout_seconds: float = 30.0
+    timeout_seconds: float = settings.REACT_ACK_TIMEOUT
+    observe_timeout_seconds: float = settings.REACT_OBSERVE_TIMEOUT
     ack_received: bool = False
     observe_received: bool = False
     result: Optional[dict] = None
@@ -207,6 +210,8 @@ class ActionRouter:
             stage=stage,
             message=message,
             version=pending.round_version,
+            session_id=pending.session_id or pending.task_id,
+            run_id=pending.run_id,
             **data,
         )
 
@@ -604,8 +609,10 @@ class ActionRouter:
         reasoning: str = "",
         step_number: int = 0,
         round_version: Optional[int] = None,
-        ack_timeout_seconds: float = 15.0,
-        observe_timeout_seconds: float = 30.0,
+        ack_timeout_seconds: float = settings.REACT_ACK_TIMEOUT,
+        observe_timeout_seconds: float = settings.REACT_OBSERVE_TIMEOUT,
+        session_id: str = "",
+        run_id: str = "",
     ) -> PendingAction:
         if round_version is None:
             raise ValueError("round_version is required for send_action")
@@ -634,6 +641,8 @@ class ActionRouter:
             step_number=step_number,
             timeout_seconds=ack_timeout_seconds,
             observe_timeout_seconds=observe_timeout_seconds,
+            session_id=session_id,
+            run_id=run_id,
         )
 
         self._pending_actions[action_id] = pending
@@ -870,28 +879,39 @@ class ActionRouter:
         self._finalize_pending(pending, result)
         return True
 
-    async def cancel_action(self, task_id: str, device_id: str) -> bool:
+    async def cancel_action(self, task_id: str, device_id: str, session_id: str = "", run_id: str = "") -> bool:
+        """Cancel pending actions. If session_id/run_id provided, only cancel matching run."""
         for action_id, pending in list(self._pending_actions.items()):
-            if pending.task_id == task_id and pending.device_id == device_id:
-                if pending.status in {ActionStatus.PENDING, ActionStatus.ACKNOWLEDGED}:
-                    pending.status = ActionStatus.CANCELLED
-                    pending.error = "Action cancelled"
-                    pending.last_update = time.time()
-                    await self._emit_cancelled_progress(pending)
-                    result = self._build_result(
-                        pending,
-                        success=False,
-                        error="Action cancelled",
-                        error_type="cancelled",
-                    )
-                    self._finalize_pending(pending, result)
-                    logger.info(
-                        "Action cancelled",
-                        action_id=action_id,
-                        task_id=task_id,
-                        device_id=device_id,
-                    )
-                    return True
+            task_match = pending.task_id == task_id
+            device_match = pending.device_id == device_id
+            if not task_match or not device_match:
+                continue
+            # Run-bound cancellation: also check session_id/run_id when provided
+            if run_id and pending.run_id and pending.run_id != run_id:
+                continue
+            if session_id and pending.session_id and pending.session_id != session_id:
+                continue
+            if pending.status in {ActionStatus.PENDING, ActionStatus.ACKNOWLEDGED}:
+                pending.status = ActionStatus.CANCELLED
+                pending.error = "Action cancelled"
+                pending.last_update = time.time()
+                await self._emit_cancelled_progress(pending)
+                result = self._build_result(
+                    pending,
+                    success=False,
+                    error="Action cancelled",
+                    error_type="cancelled",
+                )
+                self._finalize_pending(pending, result)
+                logger.info(
+                    "Action cancelled",
+                    action_id=action_id,
+                    task_id=task_id,
+                    device_id=device_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+                return True
         return False
 
     def _find_pending_action(self, task_id: str, step_number: int) -> Optional[PendingAction]:
@@ -949,8 +969,10 @@ class ActionRouter:
         reasoning: str = "",
         step_number: int = 0,
         round_version: Optional[int] = None,
-        ack_timeout_seconds: float = 15.0,
-        observe_timeout_seconds: float = 30.0,
+        ack_timeout_seconds: float = settings.REACT_ACK_TIMEOUT,
+        observe_timeout_seconds: float = settings.REACT_OBSERVE_TIMEOUT,
+        session_id: str = "",
+        run_id: str = "",
     ) -> dict:
         if round_version is None:
             raise ValueError("round_version is required for execute_action")
@@ -973,6 +995,8 @@ class ActionRouter:
             round_version=round_version,
             ack_timeout_seconds=ack_timeout_seconds,
             observe_timeout_seconds=observe_timeout_seconds,
+            session_id=session_id,
+            run_id=run_id,
         )
 
         if pending.status == ActionStatus.CANCELLED and pending.error == "Device not connected":

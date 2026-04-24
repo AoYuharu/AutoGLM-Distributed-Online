@@ -16,6 +16,8 @@ from typing_extensions import Literal
 
 from pydantic import BaseModel, Field
 
+from src.config import settings
+
 
 class MessageType(str, Enum):
     DEVICE_REGISTER = "device_register"
@@ -65,6 +67,650 @@ class ObserveResultPayload(BaseModel):
     success: bool
     error: Optional[str] = None
     version: Optional[int] = None
+    session_id: Optional[str] = None
+    run_id: Optional[str] = None
+
+    @property
+    def effective_session_id(self) -> str:
+        return self.session_id or self.task_id
+
+
+class SessionScopedPayload(BaseModel):
+    task_id: str
+    session_id: Optional[str] = None
+    run_id: Optional[str] = None
+
+    @property
+    def effective_session_id(self) -> str:
+        return self.session_id or self.task_id
+
+
+class ActionCmdPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    action: dict = Field(default_factory=dict)
+    reasoning: str = ""
+
+
+class RequestScreenshotPayload(SessionScopedPayload):
+    type: Literal["request_screenshot"] = "request_screenshot"
+    device_id: str
+    step_number: int = 0
+    phase: str = "observe"
+    purpose: str = "bootstrap"
+
+
+class AgentEventPayload(SessionScopedPayload):
+    device_id: str
+    event_type: str
+    data: dict = Field(default_factory=dict)
+
+
+class TaskUpdatePayload(SessionScopedPayload):
+    device_id: str
+    status: str
+    step: int = 0
+    progress: dict = Field(default_factory=dict)
+
+
+class DeviceBusyPayload(SessionScopedPayload):
+    device_id: str
+    current_session_id: Optional[str] = None
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+
+    @property
+    def effective_current_session_id(self) -> Optional[str]:
+        return self.current_session_id or self.session_id or self.task_id
+
+
+class InterruptPayload(SessionScopedPayload):
+    device_id: str
+
+
+class ConfirmPhasePayload(SessionScopedPayload):
+    device_id: str
+    approved: bool
+
+
+class ObserveErrorDecisionPayload(SessionScopedPayload):
+    device_id: str
+    decision: str
+    advice: Optional[str] = None
+
+
+class TaskCreatedPayload(SessionScopedPayload):
+    device_id: str
+    status: str = "pending"
+    instruction: Optional[str] = None
+    mode: Optional[str] = None
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    session_run_count: Optional[int] = None
+
+    @property
+    def effective_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class AgentStatusPayload(SessionScopedPayload):
+    device_id: str
+    status: str
+    message: str
+    data: dict = Field(default_factory=dict)
+
+
+class AgentProgressPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    phase: str
+    stage: str
+    message: str
+    version: Optional[int] = None
+    data: dict = Field(default_factory=dict)
+
+
+class AgentStepPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    reasoning: str = ""
+    action: dict = Field(default_factory=dict)
+    result: str = ""
+    screenshot: Optional[str] = None
+    success: bool = True
+    error: Optional[str] = None
+    error_type: Optional[str] = None
+
+
+class DeviceSyncEntry(BaseModel):
+    device_id: str
+    status: str
+    last_update: str
+    current_task_id: Optional[str] = None
+    current_session_id: Optional[str] = None
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+
+
+class DeviceSyncPayload(BaseModel):
+    devices: list[DeviceSyncEntry] = Field(default_factory=list)
+
+
+class DeviceStatusBroadcastPayload(BaseModel):
+    device_id: str
+    status: str
+    current_task_id: Optional[str] = None
+    current_session_id: Optional[str] = None
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    timestamp: Optional[str] = None
+
+    @property
+    def effective_current_session_id(self) -> Optional[str]:
+        return self.current_session_id or self.current_task_id
+
+    @property
+    def effective_current_task_id(self) -> Optional[str]:
+        return self.current_task_id or self.current_session_id
+
+
+class LegacyTaskPayload(SessionScopedPayload):
+    device_id: str
+    instruction: Optional[str] = None
+    mode: Optional[str] = None
+    max_steps: Optional[int] = None
+    max_observe_error_retries: Optional[int] = None
+
+    @property
+    def effective_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class RunScopedPayload(SessionScopedPayload):
+    device_id: str
+    run_started_at: Optional[str] = None
+
+
+class SessionStatePayload(SessionScopedPayload):
+    device_id: str
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    session_run_count: Optional[int] = None
+
+
+class TransportCorrelationPayload(SessionScopedPayload):
+    device_id: str
+    version: Optional[int] = None
+    ref_msg_id: Optional[str] = None
+
+
+class ObserveDecisionAppliedPayload(SessionScopedPayload):
+    device_id: str
+    decision: str
+    advice: Optional[str] = None
+    success: bool
+
+
+class PhaseConfirmedPayload(SessionScopedPayload):
+    device_id: str
+    approved: bool
+
+
+class TaskInterruptedPayload(SessionScopedPayload):
+    device_id: str
+    reason: Optional[str] = None
+    data: dict = Field(default_factory=dict)
+
+
+class SessionSnapshotPayload(SessionScopedPayload):
+    device_id: str
+    status: Optional[str] = None
+    instruction: Optional[str] = None
+    current_step: int = 0
+    max_steps: int = 0
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    session_run_count: Optional[int] = None
+
+    @property
+    def effective_current_session_id(self) -> str:
+        return self.session_id or self.task_id
+
+
+class ChatHistoryEntryPayload(SessionScopedPayload):
+    id: str
+    role: str
+    content: str
+    created_at: str
+    step_number: Optional[int] = None
+    phase: Optional[str] = None
+    stage: Optional[str] = None
+    data: Optional[dict] = None
+
+    @property
+    def effective_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class ObserveRouterPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    version: Optional[int] = None
+    result: Optional[str] = None
+    success: Optional[bool] = None
+    screenshot: Optional[str] = None
+    error: Optional[str] = None
+
+    @property
+    def effective_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class ActionRouterPayload(SessionScopedPayload):
+    device_id: str
+    action: dict = Field(default_factory=dict)
+    reasoning: str = ""
+    step_number: int = 0
+    round_version: Optional[int] = None
+
+    @property
+    def effective_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class SchedulerTaskPayload(SessionScopedPayload):
+    device_id: str
+    instruction: str
+    mode: str = "normal"
+    max_steps: int = 100
+    max_observe_error_retries: int = settings.REACT_MAX_OBSERVE_ERROR_RETRIES
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    session_run_count: Optional[int] = None
+
+    @property
+    def effective_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class SessionAliasPayload(SessionScopedPayload):
+    @property
+    def task_compat_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class SessionRunEnvelope(SessionScopedPayload):
+    device_id: str
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    session_run_count: Optional[int] = None
+
+    @property
+    def effective_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class CompatibilityTaskPayload(SessionScopedPayload):
+    device_id: str
+
+    @property
+    def task_alias(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class SessionRunMessage(SessionScopedPayload):
+    device_id: str
+    data: dict = Field(default_factory=dict)
+
+    @property
+    def task_alias(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class PayloadWithSessionRun(SessionScopedPayload):
+    device_id: str
+    data: dict = Field(default_factory=dict)
+
+    @property
+    def task_alias(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class SessionCompatPayload(SessionScopedPayload):
+    device_id: str
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class RunBoundaryPayload(SessionScopedPayload):
+    device_id: str
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    session_run_count: Optional[int] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class DeviceProgressPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    phase: str
+    stage: str
+    message: str
+    version: Optional[int] = None
+    success: Optional[bool] = None
+    error: Optional[str] = None
+    error_type: Optional[str] = None
+    data: dict = Field(default_factory=dict)
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class DeviceStatusTransportPayload(BaseModel):
+    device_id: str
+    status: str
+    current_task_id: Optional[str] = None
+    current_session_id: Optional[str] = None
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    timestamp: Optional[str] = None
+
+    @property
+    def compat_task_id(self) -> Optional[str]:
+        return self.current_task_id or self.current_session_id
+
+
+class ObserveTransportPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    screenshot: Optional[str] = None
+    result: str = ""
+    success: bool = True
+    error: Optional[str] = None
+    version: Optional[int] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class ActionTransportPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    action: dict = Field(default_factory=dict)
+    reasoning: str = ""
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class ScreenshotRequestTransportPayload(SessionScopedPayload):
+    type: Literal["request_screenshot"] = "request_screenshot"
+    device_id: str
+    step_number: int = 0
+    phase: str = "observe"
+    purpose: str = "bootstrap"
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class TaskLifecyclePayload(SessionScopedPayload):
+    device_id: str
+    status: str
+    message: Optional[str] = None
+    data: dict = Field(default_factory=dict)
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class ObserveErrorLifecyclePayload(SessionScopedPayload):
+    device_id: str
+    decision: str
+    advice: Optional[str] = None
+    success: Optional[bool] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class PhaseLifecyclePayload(SessionScopedPayload):
+    device_id: str
+    approved: bool
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class TaskCreationPayload(SessionScopedPayload):
+    device_id: str
+    instruction: Optional[str] = None
+    mode: Optional[str] = None
+    status: str = "pending"
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    session_run_count: Optional[int] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class DeviceSyncTransportPayload(BaseModel):
+    devices: list[dict] = Field(default_factory=list)
+
+
+class DeviceTransportPayload(BaseModel):
+    device_id: str
+    status: str
+    current_task_id: Optional[str] = None
+    current_session_id: Optional[str] = None
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    timestamp: Optional[str] = None
+
+    @property
+    def compat_task_id(self) -> Optional[str]:
+        return self.current_task_id or self.current_session_id
+
+
+class ObserveCompatPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    result: str
+    success: bool
+    screenshot: Optional[str] = None
+    error: Optional[str] = None
+    version: Optional[int] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class ActionCompatPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    action: dict = Field(default_factory=dict)
+    reasoning: str = ""
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class BootstrapRequestPayload(SessionScopedPayload):
+    type: Literal["request_screenshot"] = "request_screenshot"
+    device_id: str
+    step_number: int = 0
+    phase: str = "observe"
+    purpose: str = "bootstrap"
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class CanonicalStatusPayload(SessionScopedPayload):
+    device_id: str
+    status: str
+    message: str
+    data: dict = Field(default_factory=dict)
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class CanonicalProgressPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    phase: str
+    stage: str
+    message: str
+    version: Optional[int] = None
+    data: dict = Field(default_factory=dict)
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class CanonicalStepPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    reasoning: str = ""
+    action: dict = Field(default_factory=dict)
+    result: str = ""
+    screenshot: Optional[str] = None
+    success: bool = True
+    error: Optional[str] = None
+    error_type: Optional[str] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class DeviceMetadataPayload(BaseModel):
+    device_id: str
+    current_task_id: Optional[str] = None
+    current_session_id: Optional[str] = None
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+
+    @property
+    def compat_task_id(self) -> Optional[str]:
+        return self.current_task_id or self.current_session_id
+
+
+class SchedulerObservePayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    version: Optional[int] = None
+    screenshot: Optional[str] = None
+    result: str = ""
+    success: bool = True
+    error: Optional[str] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class SchedulerActionPayload(SessionScopedPayload):
+    device_id: str
+    step_number: int
+    action: dict = Field(default_factory=dict)
+    reasoning: str = ""
+    round_version: Optional[int] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class SessionRunStatePayload(SessionScopedPayload):
+    device_id: str
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    session_run_count: Optional[int] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class RunAwareObserveDecisionPayload(SessionScopedPayload):
+    device_id: str
+    decision: str
+    advice: Optional[str] = None
+    success: Optional[bool] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class RunAwarePhasePayload(SessionScopedPayload):
+    device_id: str
+    approved: bool
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class RunAwareTaskPayload(SessionScopedPayload):
+    device_id: str
+    instruction: Optional[str] = None
+    mode: Optional[str] = None
+    max_steps: Optional[int] = None
+    max_observe_error_retries: Optional[int] = None
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
+    session_run_count: Optional[int] = None
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class SessionCompatTransportPayload(SessionScopedPayload):
+    device_id: str
+
+    @property
+    def compat_task_id(self) -> str:
+        return self.task_id or self.effective_session_id
+
+
+class RunAwareDevicePayload(BaseModel):
+    device_id: str
+    status: str
+    current_task_id: Optional[str] = None
+    current_session_id: Optional[str] = None
+    current_run_id: Optional[str] = None
+    session_started_at: Optional[str] = None
+    run_started_at: Optional[str] = None
 
 
 class ActionPayload(BaseModel):

@@ -14,6 +14,7 @@
 
 import { wsConsoleLogger } from '../hooks/useLogger';
 import { useDeviceStore } from '../stores/deviceStore';
+import { browserConfig } from '../config';
 import type { Device, ObserveErrorDecisionPayload } from '../types';
 
 // Message types from Server -> Web
@@ -44,6 +45,8 @@ export interface WsConsoleMessage {
     | 'observe_error_decision_applied'
     | 'pong';
   task_id?: string;
+  session_id?: string;
+  run_id?: string;
   device_id?: string;
   step_number?: number;
   max_steps?: number;
@@ -62,6 +65,8 @@ export interface WsConsoleMessage {
   data?: Record<string, any>;
   payload?: {
     task_id?: string;
+    session_id?: string;
+    run_id?: string;
     status?: string;
     [key: string]: unknown;
   };
@@ -89,6 +94,8 @@ export interface WsConsoleSendMessage {
   max_steps?: number;
   max_observe_error_retries?: number;
   task_id?: string;
+  session_id?: string;
+  run_id?: string;
   decision?: 'continue' | 'interrupt';
   advice?: string;
 }
@@ -107,11 +114,7 @@ class WsConsoleService {
 
   // Get WebSocket URL based on current location
   private getWsUrl(): string {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host;
-    // Use relative path to Server
-    const serverHost = import.meta.env.VITE_API_URL?.replace(/^http:\/\//, '') || host;
-    return `${protocol}//${serverHost}/ws/console?console_id=${this.consoleId}`;
+    return `${browserConfig.wsConsoleUrl}?console_id=${this.consoleId}`;
   }
 
   /**
@@ -377,11 +380,29 @@ class WsConsoleService {
   /**
    * Send phase confirmation to server
    */
-  sendConfirmPhase(deviceId: string, approved: boolean): void {
+  sendConfirmPhase(
+    deviceId: string,
+    approved: boolean,
+    identifiers?: { session_id?: string | null; run_id?: string | null; task_id?: string | null },
+  ): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      const message: WsConsoleSendMessage = { type: 'confirm_phase', device_id: deviceId, approved };
+      const message: WsConsoleSendMessage = {
+        type: 'confirm_phase',
+        device_id: deviceId,
+        approved,
+        session_id: identifiers?.session_id || undefined,
+        run_id: identifiers?.run_id || undefined,
+        task_id: identifiers?.task_id || undefined,
+      };
       this.ws.send(JSON.stringify(message));
-      wsConsoleLogger.debug('[sendConfirmPhase] Phase confirmation sent', { deviceId, approved, consoleId: this.consoleId });
+      wsConsoleLogger.debug('[sendConfirmPhase] Phase confirmation sent', {
+        deviceId,
+        approved,
+        sessionId: identifiers?.session_id,
+        runId: identifiers?.run_id,
+        taskId: identifiers?.task_id,
+        consoleId: this.consoleId,
+      });
     } else {
       wsConsoleLogger.warn('[sendConfirmPhase] Cannot send confirm phase, not connected');
     }
@@ -396,6 +417,7 @@ class WsConsoleService {
     mode?: string,
     maxSteps: number = 100,
     maxObserveErrorRetries: number = 2,
+    identifiers?: { session_id?: string | null; run_id?: string | null; task_id?: string | null },
   ): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       const message: WsConsoleSendMessage = {
@@ -404,6 +426,9 @@ class WsConsoleService {
         instruction,
         max_steps: maxSteps,
         max_observe_error_retries: maxObserveErrorRetries,
+        task_id: identifiers?.task_id || undefined,
+        session_id: identifiers?.session_id || undefined,
+        run_id: identifiers?.run_id || undefined,
       };
 
       if (mode) {
@@ -427,27 +452,46 @@ class WsConsoleService {
   /**
    * Send interrupt_task message to server
    */
-  sendInterruptTask(deviceId: string, taskId: string): void {
+  sendInterruptTask(
+    deviceId: string,
+    identifiers?: { session_id?: string | null; run_id?: string | null; task_id?: string | null },
+  ): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       const message: WsConsoleSendMessage = {
         type: 'interrupt_task',
         device_id: deviceId,
-        task_id: taskId,
+        task_id: identifiers?.task_id || undefined,
+        session_id: identifiers?.session_id || undefined,
+        run_id: identifiers?.run_id || undefined,
       };
       this.ws.send(JSON.stringify(message));
-      wsConsoleLogger.debug('[sendInterruptTask] Interrupt task sent', { deviceId, taskId, consoleId: this.consoleId });
+      wsConsoleLogger.debug('[sendInterruptTask] Interrupt run sent', {
+        deviceId,
+        sessionId: identifiers?.session_id,
+        runId: identifiers?.run_id,
+        taskId: identifiers?.task_id,
+        consoleId: this.consoleId,
+      });
     } else {
       wsConsoleLogger.warn('[sendInterruptTask] Cannot send interrupt task, not connected');
     }
   }
 
-  sendObserveErrorDecision(deviceId: string, decision: 'continue' | 'interrupt', advice: string = ''): void {
+  sendObserveErrorDecision(
+    deviceId: string,
+    decision: 'continue' | 'interrupt',
+    advice: string = '',
+    identifiers?: { session_id?: string | null; run_id?: string | null; task_id?: string | null },
+  ): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       const message: WsConsoleSendMessage = {
         type: 'observe_error_decision',
         device_id: deviceId,
         decision,
         advice,
+        session_id: identifiers?.session_id || undefined,
+        run_id: identifiers?.run_id || undefined,
+        task_id: identifiers?.task_id || undefined,
       };
       this.ws.send(JSON.stringify(message));
       wsConsoleLogger.debug('[sendObserveErrorDecision] Observe-error decision sent', {
